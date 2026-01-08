@@ -1,10 +1,10 @@
-from mcp.server.fastmcp import FastMCP
+# CHANGED: Import from the 'fastmcp' framework, not the raw SDK
+from fastmcp import FastMCP
 import requests
 import time
 import os
 
 # --- CONFIGURATION ---
-# Read secrets from Environment Variables
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
 
@@ -127,10 +127,9 @@ def get_top_folders(hub_id: str, project_id: str) -> str:
         return f"Failed to get top folders: {str(e)}"
 
 if __name__ == "__main__":
-    # CRITICAL FIX: DigitalOcean tells us which PORT to use via Environment Variable.
-    # If we ignore this, the app will crash.
+    # Get the PORT from DigitalOcean (default to 8080 if local)
     port = int(os.environ.get("PORT", 8080))
     print(f"Starting Server on port {port}...")
     
-    # Run in HTTP mode
+    # This .run() command NOW supports 'host' because we imported the right library
     mcp.run(transport="http", host="0.0.0.0", port=port)
