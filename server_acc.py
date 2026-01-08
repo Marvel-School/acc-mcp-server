@@ -1,137 +1,143 @@
-# CHANGED: Import from the 'fastmcp' framework, not the raw SDK
-from fastmcp import FastMCP
-import requests
-import time
 import os
+import shutil
+import fnmatch
+import time
+from mcp.server.fastmcp import FastMCP
 
-# --- CONFIGURATION ---
-APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
-APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
+# Initialize the MCP server
+mcp = FastMCP("FileSystem-v2")
 
-# Initialize Server
-mcp = FastMCP("Autodesk ACC Agent")
+# CONFIGURATION
+# ---------------------------------------------------------
+# Set this to the folder you want the LLM to manage. 
+# SECURITY WARNING: Only allow access to a safe sandbox folder!
+WORKING_DIRECTORY = os.path.abspath("./my_sandbox_files")
 
-# Global token storage
-token_cache = {"access_token": None, "expires_at": 0}
+# Ensure the directory exists
+if not os.path.exists(WORKING_DIRECTORY):
+    os.makedirs(WORKING_DIRECTORY)
 
-def get_token():
-    """Helper to get a valid Autodesk Access Token."""
-    global token_cache
+# HELPER: Security Check
+# ---------------------------------------------------------
+def validate_path(rel_path: str) -> str:
+    """
+    Resolves a path and ensures it is inside the WORKING_DIRECTORY.
+    Raises ValueError if the path attempts to escape (e.g. ../../etc/passwd).
+    """
+    # Remove leading slash to treat it as relative to working dir
+    clean_rel = rel_path.lstrip(os.sep)
+    abs_path = os.path.abspath(os.path.join(WORKING_DIRECTORY, clean_rel))
     
-    # Validation
-    if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
-        raise ValueError("Error: APS_CLIENT_ID and APS_CLIENT_SECRET environment variables are missing.")
-
-    if time.time() < token_cache["expires_at"]:
-        return token_cache["access_token"]
+    if not abs_path.startswith(WORKING_DIRECTORY):
+        raise ValueError(f"Access denied: Path '{rel_path}' is outside the working directory.")
     
-    # Request new token
-    url = "https://developer.api.autodesk.com/authentication/v2/token"
-    auth = requests.auth.HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
-    data = {"grant_type": "client_credentials", "scope": "data:read"}
-    
-    try:
-        resp = requests.post(url, auth=auth, data=data)
-        resp.raise_for_status()
-        result = resp.json()
-        token_cache["access_token"] = result["access_token"]
-        token_cache["expires_at"] = time.time() + result["expires_in"] - 60
-        return result["access_token"]
-    except Exception as e:
-        print(f"Auth Error: {e}")
-        raise e
+    return abs_path
 
-# --- TOOLS ---
+# TOOLS
+# ---------------------------------------------------------
 
 @mcp.tool()
-def list_hubs() -> str:
-    """Lists all Autodesk Hubs (Company Accounts) the bot has access to."""
+def list_directory(path: str = ".") -> str:
+    """
+    Lists files and directories in the specified path. 
+    Appends [DIR] to directory names for clarity.
+    """
     try:
-        token = get_token()
-        url = "https://developer.api.autodesk.com/project/v1/hubs"
-        headers = {"Authorization": f"Bearer {token}"}
-        
-        resp = requests.get(url, headers=headers)
-        if resp.status_code != 200:
-            return f"Error fetching hubs: {resp.text}"
-        
-        data = resp.json()
-        output = "Found Hubs:\n"
-        for hub in data.get("data", []):
-            name = hub["attributes"]["name"]
-            hub_id = hub["id"]
-            output += f"- {name} (ID: {hub_id})\n"
-        return output
+        safe_path = validate_path(path)
+        items = os.listdir(safe_path)
+        formatted_items = []
+        for item in items:
+            full_item_path = os.path.join(safe_path, item)
+            if os.path.isdir(full_item_path):
+                formatted_items.append(f"[DIR] {item}")
+            else:
+                formatted_items.append(item)
+        return "\n".join(sorted(formatted_items)) or "(Empty Directory)"
     except Exception as e:
-        return f"Failed to list hubs: {str(e)}"
+        return f"Error listing directory: {str(e)}"
 
 @mcp.tool()
-def list_projects(hub_id: str) -> str:
-    """Lists all projects within a specific Hub ID."""
+def read_file(path: str) -> str:
+    """Reads the full content of a file."""
     try:
-        token = get_token()
-        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
-        headers = {"Authorization": f"Bearer {token}"}
-        
-        resp = requests.get(url, headers=headers)
-        data = resp.json()
-        
-        output = f"Projects in Hub {hub_id}:\n"
-        for proj in data.get("data", []):
-            name = proj["attributes"]["name"]
-            proj_id = proj["id"]
-            output += f"- {name} (ID: {proj_id})\n"
-        return output
+        safe_path = validate_path(path)
+        if not os.path.isfile(safe_path):
+            return f"Error: '{path}' is not a file."
+            
+        with open(safe_path, 'r', encoding='utf-8') as f:
+            return f.read()
     except Exception as e:
-        return f"Failed to list projects: {str(e)}"
+        return f"Error reading file: {str(e)}"
 
 @mcp.tool()
-def list_folder_contents(project_id: str, folder_id: str) -> str:
-    """Lists files and subfolders in a specific folder."""
+def write_file(path: str, content: str) -> str:
+    """Writes content to a file. Overwrites existing files."""
     try:
-        token = get_token()
-        url = f"https://developer.api.autodesk.com/data/v1/projects/{project_id}/folders/{folder_id}/contents"
-        headers = {"Authorization": f"Bearer {token}"}
-        
-        resp = requests.get(url, headers=headers)
-        data = resp.json()
-        
-        output = f"Contents of folder {folder_id}:\n"
-        for item in data.get("data", []):
-            name = item["attributes"]["displayName"]
-            item_type = item["type"]  # 'items' (file) or 'folders'
-            item_id = item["id"]
-            output += f"- [{item_type}] {name} (ID: {item_id})\n"
-        return output
+        safe_path = validate_path(path)
+        with open(safe_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return f"Successfully wrote to {path}"
     except Exception as e:
-        return f"Failed to list folder contents: {str(e)}"
+        return f"Error writing file: {str(e)}"
 
 @mcp.tool()
-def get_top_folders(hub_id: str, project_id: str) -> str:
-    """Gets the top-level folders (Project Files, etc) for a project."""
+def search_files(pattern: str) -> str:
+    """
+    Recursively searches for files matching a pattern (e.g., '*.py', 'notes.txt').
+    Returns a list of relative paths.
+    """
+    matches = []
     try:
-        token = get_token()
-        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders"
-        headers = {"Authorization": f"Bearer {token}"}
+        for root, dirnames, filenames in os.walk(WORKING_DIRECTORY):
+            for filename in fnmatch.filter(filenames, pattern):
+                # Calculate path relative to the working directory
+                abs_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(abs_path, WORKING_DIRECTORY)
+                matches.append(rel_path)
         
-        resp = requests.get(url, headers=headers)
-        data = resp.json()
-        
-        output = "Top Level Folders:\n"
-        for folder in data.get("data", []):
-            name = folder["attributes"]["displayName"]
-            folder_id = folder["id"]
-            output += f"- {name} (ID: {folder_id})\n"
-        return output
+        if not matches:
+            return "No files found matching that pattern."
+        return "\n".join(matches)
     except Exception as e:
-        return f"Failed to get top folders: {str(e)}"
+        return f"Error searching files: {str(e)}"
 
+@mcp.tool()
+def get_file_info(path: str) -> str:
+    """
+    Returns metadata about a file: size, creation time, and last modified time.
+    """
+    try:
+        safe_path = validate_path(path)
+        if not os.path.exists(safe_path):
+            return "File does not exist."
+            
+        stats = os.stat(safe_path)
+        size_kb = round(stats.st_size / 1024, 2)
+        created = time.ctime(stats.st_ctime)
+        modified = time.ctime(stats.st_mtime)
+        
+        return (f"File: {path}\n"
+                f"Size: {size_kb} KB\n"
+                f"Created: {created}\n"
+                f"Modified: {modified}")
+    except Exception as e:
+        return f"Error getting info: {str(e)}"
+
+@mcp.tool()
+def move_file(source: str, destination: str) -> str:
+    """Moves or renames a file from source to destination."""
+    try:
+        safe_src = validate_path(source)
+        safe_dest = validate_path(destination)
+        
+        if not os.path.exists(safe_src):
+            return f"Error: Source '{source}' does not exist."
+            
+        shutil.move(safe_src, safe_dest)
+        return f"Successfully moved '{source}' to '{destination}'"
+    except Exception as e:
+        return f"Error moving file: {str(e)}"
+
+# RUN THE SERVER
 if __name__ == "__main__":
-    # Get the PORT from DigitalOcean (default to 8080 if local)
-    port = int(os.environ.get("PORT", 8080))
-    print(f"Starting Server on port {port}...")
-    
-    # This .run() command NOW supports 'host' because we imported the right library
-    mcp.run(transport="http", host="0.0.0.0", port=port)
-
-    # Note: this is version 1.0 and so far this works as expected!
+    mcp.run()
