@@ -4,7 +4,7 @@ import time
 import os
 
 # --- CONFIGURATION ---
-# We read secrets from Environment Variables (secure for Cloud)
+# Read secrets from Environment Variables
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
 
@@ -18,6 +18,7 @@ def get_token():
     """Helper to get a valid Autodesk Access Token."""
     global token_cache
     
+    # Validation
     if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
         raise ValueError("Error: APS_CLIENT_ID and APS_CLIENT_SECRET environment variables are missing.")
 
@@ -126,10 +127,10 @@ def get_top_folders(hub_id: str, project_id: str) -> str:
         return f"Failed to get top folders: {str(e)}"
 
 if __name__ == "__main__":
-    # IMPORTANT: DigitalOcean sets a 'PORT' variable. We must listen on it.
-    # If it's missing (local testing), we default to 8000.
-    port = int(os.environ.get("PORT", 8000))
+    # CRITICAL FIX: DigitalOcean tells us which PORT to use via Environment Variable.
+    # If we ignore this, the app will crash.
+    port = int(os.environ.get("PORT", 8080))
     print(f"Starting Server on port {port}...")
     
-    # Run in HTTP mode for the cloud
+    # Run in HTTP mode
     mcp.run(transport="http", host="0.0.0.0", port=port)
