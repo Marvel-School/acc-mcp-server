@@ -15,7 +15,10 @@ WORKING_DIRECTORY = os.path.abspath("./my_sandbox_files")
 
 # Ensure the directory exists
 if not os.path.exists(WORKING_DIRECTORY):
-    os.makedirs(WORKING_DIRECTORY)
+    try:
+        os.makedirs(WORKING_DIRECTORY)
+    except OSError as e:
+        print(f"Warning: Could not create directory {WORKING_DIRECTORY}: {e}")
 
 # HELPER: Security Check
 # ---------------------------------------------------------
@@ -140,4 +143,14 @@ def move_file(source: str, destination: str) -> str:
 
 # RUN THE SERVER
 if __name__ == "__main__":
-    mcp.run()
+    import uvicorn
+    
+    # 1. READ PORT: DigitalOcean provides the PORT env var.
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting MCP Server on 0.0.0.0:{port}...")
+
+    # 2. RUN WITH UVICORN:
+    # We must bind to "0.0.0.0" so the external world can reach the container.
+    # Note: Even if SSE is "deprecated" in your specific client context, 
+    # we MUST run a web server (SSE mode) to satisfy DigitalOcean's readiness check.
+    mcp.run(transport='sse', host='0.0.0.0', port=port)
