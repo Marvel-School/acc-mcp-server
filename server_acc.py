@@ -2,18 +2,17 @@ import os
 import shutil
 import fnmatch
 import time
-from mcp.server.fastmcp import FastMCP
+import uvicorn
+# CHANGE 1: Use the robust 'fastmcp' library, not the basic 'mcp.server' one
+from fastmcp import FastMCP
 
 # Initialize the MCP server
 mcp = FastMCP("FileSystem-v2")
 
 # CONFIGURATION
 # ---------------------------------------------------------
-# Set this to the folder you want the LLM to manage. 
-# SECURITY WARNING: Only allow access to a safe sandbox folder!
 WORKING_DIRECTORY = os.path.abspath("./my_sandbox_files")
 
-# Ensure the directory exists
 if not os.path.exists(WORKING_DIRECTORY):
     try:
         os.makedirs(WORKING_DIRECTORY)
@@ -23,17 +22,10 @@ if not os.path.exists(WORKING_DIRECTORY):
 # HELPER: Security Check
 # ---------------------------------------------------------
 def validate_path(rel_path: str) -> str:
-    """
-    Resolves a path and ensures it is inside the WORKING_DIRECTORY.
-    Raises ValueError if the path attempts to escape (e.g. ../../etc/passwd).
-    """
-    # Remove leading slash to treat it as relative to working dir
     clean_rel = rel_path.lstrip(os.sep)
     abs_path = os.path.abspath(os.path.join(WORKING_DIRECTORY, clean_rel))
-    
     if not abs_path.startswith(WORKING_DIRECTORY):
         raise ValueError(f"Access denied: Path '{rel_path}' is outside the working directory.")
-    
     return abs_path
 
 # TOOLS
@@ -41,10 +33,7 @@ def validate_path(rel_path: str) -> str:
 
 @mcp.tool()
 def list_directory(path: str = ".") -> str:
-    """
-    Lists files and directories in the specified path. 
-    Appends [DIR] to directory names for clarity.
-    """
+    """Lists files and directories. Appends [DIR] to directory names."""
     try:
         safe_path = validate_path(path)
         items = os.listdir(safe_path)
@@ -66,7 +55,6 @@ def read_file(path: str) -> str:
         safe_path = validate_path(path)
         if not os.path.isfile(safe_path):
             return f"Error: '{path}' is not a file."
-            
         with open(safe_path, 'r', encoding='utf-8') as f:
             return f.read()
     except Exception as e:
@@ -85,19 +73,14 @@ def write_file(path: str, content: str) -> str:
 
 @mcp.tool()
 def search_files(pattern: str) -> str:
-    """
-    Recursively searches for files matching a pattern (e.g., '*.py', 'notes.txt').
-    Returns a list of relative paths.
-    """
+    """Recursively searches for files matching a pattern (e.g., '*.py')."""
     matches = []
     try:
         for root, dirnames, filenames in os.walk(WORKING_DIRECTORY):
             for filename in fnmatch.filter(filenames, pattern):
-                # Calculate path relative to the working directory
                 abs_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(abs_path, WORKING_DIRECTORY)
                 matches.append(rel_path)
-        
         if not matches:
             return "No files found matching that pattern."
         return "\n".join(matches)
@@ -106,36 +89,27 @@ def search_files(pattern: str) -> str:
 
 @mcp.tool()
 def get_file_info(path: str) -> str:
-    """
-    Returns metadata about a file: size, creation time, and last modified time.
-    """
+    """Returns metadata about a file: size, creation time, modified time."""
     try:
         safe_path = validate_path(path)
         if not os.path.exists(safe_path):
             return "File does not exist."
-            
         stats = os.stat(safe_path)
-        size_kb = round(stats.st_size / 1024, 2)
-        created = time.ctime(stats.st_ctime)
-        modified = time.ctime(stats.st_mtime)
-        
         return (f"File: {path}\n"
-                f"Size: {size_kb} KB\n"
-                f"Created: {created}\n"
-                f"Modified: {modified}")
+                f"Size: {round(stats.st_size / 1024, 2)} KB\n"
+                f"Created: {time.ctime(stats.st_ctime)}\n"
+                f"Modified: {time.ctime(stats.st_mtime)}")
     except Exception as e:
         return f"Error getting info: {str(e)}"
 
 @mcp.tool()
 def move_file(source: str, destination: str) -> str:
-    """Moves or renames a file from source to destination."""
+    """Moves or renames a file."""
     try:
         safe_src = validate_path(source)
         safe_dest = validate_path(destination)
-        
         if not os.path.exists(safe_src):
             return f"Error: Source '{source}' does not exist."
-            
         shutil.move(safe_src, safe_dest)
         return f"Successfully moved '{source}' to '{destination}'"
     except Exception as e:
@@ -143,14 +117,10 @@ def move_file(source: str, destination: str) -> str:
 
 # RUN THE SERVER
 if __name__ == "__main__":
-    import uvicorn
-    
-    # 1. READ PORT: DigitalOcean provides the PORT env var.
     port = int(os.environ.get("PORT", 8080))
     print(f"Starting MCP Server on 0.0.0.0:{port}...")
-
-    # 2. RUN WITH UVICORN:
-    # We must bind to "0.0.0.0" so the external world can reach the container.
-    # Note: Even if SSE is "deprecated" in your specific client context, 
-    # we MUST run a web server (SSE mode) to satisfy DigitalOcean's readiness check.
-    mcp.run(transport='sse', host='0.0.0.0', port=port)
+    
+    # CHANGE 2: Create the ASGI app explicitly and run with Uvicorn
+    # This bypasses the 'mcp.run()' issues and gives us full control over the port.
+    server_app = mcp.http_app()
+    uvicorn.run(server_app, host="0.0.0.0", port=port)
