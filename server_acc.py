@@ -133,3 +133,5 @@ if __name__ == "__main__":
     
     # This .run() command NOW supports 'host' because we imported the right library
     mcp.run(transport="http", host="0.0.0.0", port=port)
+
+    # Note: this is version 1.0 and so far this works as expected!
