@@ -1,4 +1,4 @@
-name: Build and deploy Python app to Azure Web App - autodesk-agent-prod
+name: Build and Deploy Docker App
 
 on:
   push:
@@ -7,54 +7,29 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python version
-        uses: actions/setup-python@v5
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
         with:
-          python-version: '3.11'
+          registry: ${{ secrets.REGISTRY_LOGIN_SERVER }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      - name: Install dependencies to Root
+      - name: Build and Push Docker image
         run: |
-          # Installeer libraries DIRECT in de huidige map (.)
-          # Dit voorkomt alle 'ModuleNotFoundError' problemen
-          pip install -r requirements.txt --target .
+          # Build image with 'latest' tag
+          docker build . -t ${{ secrets.REGISTRY_LOGIN_SERVER }}/autodesk-agent:latest
+          # Push to your private Azure Registry
+          docker push ${{ secrets.REGISTRY_LOGIN_SERVER }}/autodesk-agent:latest
 
-      - name: Zip artifact for deployment
-        run: |
-          # Maak één zip bestand van ALLES
-          zip -r release.zip . -x ".git/*" ".github/*" "__pycache__/*"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-app
-          path: release.zip
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: python-app
-
-      - name: Login to Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_5138E87FF470405C8EC7A1B35A2262A5 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_798A0733D96F488AA055E29FD4661906 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_E765E42D66964E79BA73DCC623DB5E6E }}
-
-      - name: 'Deploy to Azure Web App'
+      - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'autodesk-agent-prod'
-          slot-name: 'Production'
-          package: release.zip  # <--- CRUCIAAL: We sturen de ZIP direct
+          app-name: 'autodesk-agent-prod'  # Ensure this matches your Web App name
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          images: '${{ secrets.REGISTRY_LOGIN_SERVER }}/autodesk-agent:latest'
