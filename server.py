@@ -1,9 +1,22 @@
-# server_stable.py
+
+
+import sys
 import os
+
+# --- AZURE FIX: Voeg de map met libraries toe ---
+# Wanneer we deployen via GitHub, komen de libraries in deze map terecht.
+# We voegen hem handmatig toe aan het zoekpad van Python.
+site_packages = os.path.join(os.path.dirname(__file__), ".python_packages", "lib", "site-packages")
+if os.path.exists(site_packages):
+    sys.path.append(site_packages)
+# -----------------------------------------------
+
 import time
 import requests
-import uvicorn
+import traceback
+from urllib.parse import quote
 from fastmcp import FastMCP
+from typing import Optional
 
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
