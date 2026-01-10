@@ -85,6 +85,25 @@ def make_api_request(url: str):
     except Exception as e:
         return f"Request Fout: {str(e)}"
 
+# --- TOOL 0: HUBS (RESTORED) ---
+@mcp.tool()
+def list_hubs() -> str:
+    """
+    Toont alle beschikbare Autodesk Hubs.
+    Handig om handmatig een Account ID te vinden.
+    """
+    url = "https://developer.api.autodesk.com/project/v1/hubs"
+    data = make_api_request(url)
+    if isinstance(data, str): return data
+
+    output = "Gevonden Hubs:\n"
+    for hub in data.get("data", []):
+        name = hub['attributes']['name']
+        hub_id = hub['id']
+        clean_acc_id = clean_id(hub_id)
+        output += f"- {name}\n  Hub ID: {hub_id}\n  Account ID (voor Admin): {clean_acc_id}\n"
+    return output
+
 # --- TOOL 1: PROJECTEN (DATA MANAGEMENT) ---
 @mcp.tool()
 def list_projects_dm(hub_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 10) -> str:
@@ -181,13 +200,24 @@ def get_download_url(project_id: str, version_id: str) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- TOOL 3: ADMIN API ---
+# --- TOOL 3: ADMIN API (UPDATED SMART) ---
 @mcp.tool()
-def get_account_projects_admin(account_id: str, name_filter: Optional[str] = None, limit: int = 10) -> str:
+def get_account_projects_admin(account_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 10) -> str:
     """
     (Admin API) Lijst projecten met admin details.
-    Sneller dan Data Management voor grote lijsten.
+    SMART: Als account_id ontbreekt, zoekt hij deze automatisch op.
     """
+    # 1. AUTO-DETECT ID als deze ontbreekt
+    if not account_id:
+        hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(hubs_data, str) or not hubs_data.get("data"):
+            return "Kan geen Account/Hub ID vinden om als standaard te gebruiken."
+        
+        # De Hub ID (bv. "b.1234...") omzetten naar Account ID ("1234...")
+        raw_hub_id = hubs_data["data"][0]["id"]
+        account_id = clean_id(raw_hub_id)
+
+    # 2. ORIGINELE LOGICA
     c_id = clean_id(account_id)
     url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects"
     
@@ -203,7 +233,7 @@ def get_account_projects_admin(account_id: str, name_filter: Optional[str] = Non
     count = len(results)
     display = results[:limit]
 
-    output = f"Admin Projecten (Gevonden: {count}):\n"
+    output = f"Admin Projecten (Gevonden: {count}) voor Account {c_id}:\n"
     for proj in display:
         name = proj.get("name", "Onbekend")
         p_id = proj.get("id")
