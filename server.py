@@ -145,7 +145,7 @@ def list_projects_dm(hub_id: Optional[str] = None, name_filter: Optional[str] = 
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- TOOL 1.5: TOP FOLDERS (NEW FIX) ---
+# --- TOOL 1.5: TOP FOLDERS ---
 @mcp.tool()
 def get_top_folders(project_id: str) -> str:
     """
@@ -153,29 +153,19 @@ def get_top_folders(project_id: str) -> str:
     Gebruik dit als je nog geen specifieke folder_id hebt.
     """
     try:
-        # 1. Hub ID automatisch ophalen
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
-        if isinstance(hubs_data, str) or not hubs_data.get("data"): 
-            return "Geen Hubs gevonden."
+        if isinstance(hubs_data, str) or not hubs_data.get("data"): return "Geen Hubs gevonden."
         hub_id = hubs_data["data"][0]["id"]
-
-        # 2. Project ID fixen (moet 'b.' prefix hebben)
         p_id = ensure_b_prefix(project_id)
-
-        # 3. API Call
         url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{p_id}/topFolders"
         data = make_api_request(url)
-        
         if isinstance(data, str): return data
-        
         items = data.get("data", [])
         output = f"Hoofdmappen voor project {p_id}:\n"
-        
         for item in items:
             name = item["attributes"]["displayName"]
             folder_id = item["id"]
             output += f"- 📁 {name} (ID: {folder_id})\n"
-            
         return output
     except Exception as e:
         return f"Error: {str(e)}"
@@ -204,6 +194,51 @@ def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> st
     if len(items) > limit:
         output += "\n... (Lijst ingekort voor snelheid.)"
     return output
+
+# --- TOOL 2.5: FILE DETAILS (NEW) ---
+@mcp.tool()
+def get_file_details(project_id: str, item_id: str) -> str:
+    """
+    Haalt details op van een bestand (Item ID).
+    Geeft ook de Version ID terug die nodig is voor downloads.
+    """
+    try:
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        p_id = ensure_b_prefix(project_id)
+        encoded_item_id = encode_urn(item_id)
+        
+        # 1. Item details ophalen (zoekt naar de 'tip' versie)
+        url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encoded_item_id}"
+        resp = requests.get(url, headers=headers)
+        
+        if resp.status_code != 200: return f"Fout: {resp.status_code} {resp.text}"
+        
+        json_resp = resp.json()
+        try:
+            # Hier vinden we de link naar de laatste versie (tip)
+            tip_id = json_resp["data"]["relationships"]["tip"]["data"]["id"]
+        except KeyError:
+             return "Fout: Kan geen actieve versie vinden voor dit item."
+        
+        # 2. Versie details ophalen
+        encoded_tip_id = encode_urn(tip_id)
+        v_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encoded_tip_id}"
+        v_resp = requests.get(v_url, headers=headers)
+        
+        if v_resp.status_code != 200: return f"Fout versie: {v_resp.status_code}"
+             
+        attrs = v_resp.json().get("data", {}).get("attributes", {})
+        
+        return (
+            f"📄 **Bestandsdetails**\n"
+            f"- **Naam:** {attrs.get('displayName')}\n"
+            f"- **Versie:** v{attrs.get('versionNumber')}\n"
+            f"- **Latest Version ID (Nodig voor download):** {tip_id}\n"
+            f"- **Grootte:** {attrs.get('storageSize')} bytes\n"
+        )
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 @mcp.tool()
 def get_download_url(project_id: str, version_id: str) -> str:
@@ -242,26 +277,20 @@ def get_account_projects_admin(account_id: Optional[str] = None, name_filter: Op
     (Admin API) Lijst projecten met admin details.
     SMART: Als account_id ontbreekt, zoekt hij deze automatisch op.
     """
-    # 1. AUTO-DETECT ID als deze ontbreekt
     if not account_id:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs_data, str) or not hubs_data.get("data"):
             return "Kan geen Account/Hub ID vinden om als standaard te gebruiken."
-        
-        # De Hub ID (bv. "b.1234...") omzetten naar Account ID ("1234...")
         raw_hub_id = hubs_data["data"][0]["id"]
         account_id = clean_id(raw_hub_id)
 
-    # 2. ORIGINELE LOGICA
     c_id = clean_id(account_id)
     url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects"
     
     data = make_api_request(url)
     if isinstance(data, str): return data
-
     results = data if isinstance(data, list) else data.get("results", [])
     
-    # Filteren & Limiteren
     if name_filter:
         results = [p for p in results if name_filter.lower() in p.get("name", "").lower()]
     
@@ -287,19 +316,16 @@ def list_assets(project_id: str, limit: int = 10) -> str:
     
     data = make_api_request(url)
     if isinstance(data, str): return data
-
     results = data.get("results", [])
     if not results: return "Geen assets gevonden."
 
     display = results[:limit]
     output = f"Assets in project {c_id} (Top {len(display)}):\n"
-
     for asset in display:
         ref = asset.get("clientAssetId", "Geen Ref")
         cat = asset.get("category", {}).get("name", "-")
         status = asset.get("status", {}).get("name", "Unknown")
         output += f"- [{cat}] {ref} | Status: {status}\n"
-        
     if len(results) > limit:
         output += "\n... (Gebruik specifiekere filters in de toekomst)"
     return output
@@ -318,28 +344,22 @@ def list_issues(project_id: str, status_filter: str = "open", limit: int = 10) -
     
     data = make_api_request(url)
     if isinstance(data, str): return data
-
     results = data.get("results", [])
     if not results and "data" in data: results = data["data"]
 
-    # Filter op status
     if status_filter != "all":
         results = [i for i in results if i.get("attributes", i).get("status", "").lower() == status_filter]
 
     display = results[:limit]
-    
     output = f"Gevonden: {len(results)} '{status_filter}' issues (Toon {len(display)}):\n"
-    
     for issue in display:
         attrs = issue.get("attributes", issue)
         title = attrs.get("title", "Geen Titel")
         status = attrs.get("status", "Unknown")
         ident = attrs.get("identifier", "No ID")
         output += f"- #{ident}: {title} [{status}]\n"
-        
     if len(results) > limit:
         output += "\n... (Meer issues gevonden. Vraag om details.)"
-        
     return output
 
 # --- TOOL 6: DATA CONNECTOR ---
@@ -351,7 +371,6 @@ def get_data_connector_status(account_id: str) -> str:
     
     data = make_api_request(url)
     if isinstance(data, str): return data
-
     results = data.get("data", [])
     if not results: return "Geen data connector requests gevonden."
 
