@@ -6,27 +6,27 @@ from urllib.parse import quote
 from fastmcp import FastMCP
 from typing import Optional
 
-# --- CONFIGURATIE ---
+# --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Initialiseer FastMCP
+# Initialize FastMCP
 mcp = FastMCP("Autodesk ACC Agent")
 
-# Globale token cache
+# Global token cache
 token_cache = {"access_token": None, "expires_at": 0}
 
 # Base URLs
 BASE_URL_DM = "https://developer.api.autodesk.com"
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
 
-# --- HELPER: AUTHENTICATIE ---
+# --- HELPER: AUTHENTICATION ---
 def get_token():
-    """Haalt een Autodesk Token op met alle benodigde rechten."""
+    """Retrieves an Autodesk Token with Read & Write permissions."""
     global token_cache
     if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
-        raise ValueError("Fout: APS_CLIENT_ID en APS_CLIENT_SECRET ontbreken.")
+        raise ValueError("Error: APS_CLIENT_ID and APS_CLIENT_SECRET are missing.")
 
     if time.time() < token_cache["expires_at"]:
         return token_cache["access_token"]
@@ -34,10 +34,10 @@ def get_token():
     url = "https://developer.api.autodesk.com/authentication/v2/token"
     auth = requests.auth.HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
     
-    # Scopes voor Admin, Docs, Issues en Assets
+    # UPDATED SCOPES: Added data:write and account:write
     data = {
         "grant_type": "client_credentials", 
-        "scope": "data:read account:read bucket:read"
+        "scope": "data:read data:write account:read account:write bucket:read"
     }
 
     try:
@@ -48,73 +48,69 @@ def get_token():
         token_cache["expires_at"] = time.time() + result["expires_in"] - 60
         return result["access_token"]
     except Exception as e:
-        print(f"Auth Fout: {e}")
+        print(f"Auth Error: {e}")
         raise e
 
 # --- HELPER: ID CLEANING ---
 def clean_id(id_str: str) -> str:
-    """Verwijdert 'b.' prefix (Nodig voor Admin/Assets/Issues)."""
+    """Removes 'b.' prefix (Required for Admin/Assets/Issues/Write Tools)."""
     if not id_str: return ""
     return id_str.replace("b.", "")
 
 def ensure_b_prefix(id_str: str) -> str:
-    """Zorgt voor 'b.' prefix (Nodig voor Files/Docs)."""
+    """Ensures 'b.' prefix exists (Required for Files/Docs)."""
     if not id_str: return ""
     return id_str if id_str.startswith("b.") else f"b.{id_str}"
 
 def encode_urn(urn: str) -> str:
-    """URL Encode voor bestandsversies."""
+    """URL Encode for file versions."""
     if not urn: return ""
     return quote(urn, safe='')
 
 # --- HELPER: API REQUEST ---
 def make_api_request(url: str):
-    """Voert de request uit en checkt op fouten."""
+    """Executes GET request and checks for errors."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         resp = requests.get(url, headers=headers)
         
         if resp.status_code == 403:
-            return "Fout 403: Geen toegang. Check of de App is toegevoegd in ACC Admin."
+            return "Error 403: Access Denied. Check if App is added in ACC Admin."
         if resp.status_code == 404:
-            return "Fout 404: Niet gevonden. Check de ID's."
+            return "Error 404: Not Found. Check IDs."
         
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        return f"Request Fout: {str(e)}"
+        return f"Request Error: {str(e)}"
 
-# --- TOOL 0: HUBS (RESTORED) ---
+# ==========================================
+# READ TOOLS (Information Retrieval)
+# ==========================================
+
 @mcp.tool()
 def list_hubs() -> str:
-    """
-    Toont alle beschikbare Autodesk Hubs.
-    Handig om handmatig een Account ID te vinden.
-    """
+    """Lists all available Autodesk Hubs."""
     url = "https://developer.api.autodesk.com/project/v1/hubs"
     data = make_api_request(url)
     if isinstance(data, str): return data
 
-    output = "Gevonden Hubs:\n"
+    output = "Found Hubs:\n"
     for hub in data.get("data", []):
         name = hub['attributes']['name']
         hub_id = hub['id']
         clean_acc_id = clean_id(hub_id)
-        output += f"- {name}\n  Hub ID: {hub_id}\n  Account ID (voor Admin): {clean_acc_id}\n"
+        output += f"- {name}\n  Hub ID: {hub_id}\n  Account ID (for Admin): {clean_acc_id}\n"
     return output
 
-# --- TOOL 1: PROJECTEN (DATA MANAGEMENT) ---
 @mcp.tool()
 def list_projects_dm(hub_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 10) -> str:
-    """
-    Haalt projecten op via Data Management.
-    Gebruik 'name_filter' om specifiek te zoeken (sneller).
-    """
+    """Lists projects via Data Management (Docs)."""
     try:
         if not hub_id:
             hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
-            if isinstance(hubs_data, str) or not hubs_data.get("data"): return "Geen Hubs gevonden."
+            if isinstance(hubs_data, str) or not hubs_data.get("data"): return "No Hubs found."
             hub_id = hubs_data["data"][0]["id"]
 
         url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
@@ -123,45 +119,39 @@ def list_projects_dm(hub_id: Optional[str] = None, name_filter: Optional[str] = 
 
         all_projects = data.get("data", [])
         
-        # 1. Filteren
         if name_filter:
             lower_filter = name_filter.lower()
             filtered = [p for p in all_projects if lower_filter in p['attributes']['name'].lower()]
         else:
             filtered = all_projects
 
-        # 2. Limiteren (Snelheidswinst!)
         display = filtered[:limit]
         count = len(filtered)
 
-        output = f"Gevonden: {count} projecten in Hub {hub_id} (Toon top {len(display)}):\n"
+        output = f"Found: {count} projects in Hub {hub_id} (Showing top {len(display)}):\n"
         for proj in display:
             output += f"- {proj['attributes']['name']} (ID: {proj['id']})\n"
             
         if count > limit:
-            output += f"\n... (en nog {count - limit} projecten. Gebruik 'name_filter' om specifieker te zoeken.)"
+            output += f"\n... (and {count - limit} more. Use 'name_filter' to refine.)"
             
         return output
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- TOOL 1.5: TOP FOLDERS ---
 @mcp.tool()
 def get_top_folders(project_id: str) -> str:
-    """
-    Haalt de hoofdmappen (Top Folders) van een project op.
-    Gebruik dit als je nog geen specifieke folder_id hebt.
-    """
+    """Gets the root folders (Top Folders) of a project."""
     try:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
-        if isinstance(hubs_data, str) or not hubs_data.get("data"): return "Geen Hubs gevonden."
+        if isinstance(hubs_data, str) or not hubs_data.get("data"): return "No Hubs found."
         hub_id = hubs_data["data"][0]["id"]
         p_id = ensure_b_prefix(project_id)
         url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{p_id}/topFolders"
         data = make_api_request(url)
         if isinstance(data, str): return data
         items = data.get("data", [])
-        output = f"Hoofdmappen voor project {p_id}:\n"
+        output = f"Root folders for project {p_id}:\n"
         for item in items:
             name = item["attributes"]["displayName"]
             folder_id = item["id"]
@@ -170,10 +160,9 @@ def get_top_folders(project_id: str) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- TOOL 2: BESTANDEN (FILES) ---
 @mcp.tool()
 def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> str:
-    """Toont bestanden in een map. Limiet standaard op 20 om snelheid te houden."""
+    """Lists contents of a specific folder."""
     p_id = ensure_b_prefix(project_id)
     url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/folders/{folder_id}/contents"
     
@@ -183,22 +172,21 @@ def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> st
     items = data.get("data", [])
     display = items[:limit]
     
-    output = f"Inhoud map {folder_id} (Top {len(display)} van {len(items)}):\n"
+    output = f"Contents of folder {folder_id} (Top {len(display)} of {len(items)}):\n"
     for item in display:
         name = item["attributes"]["displayName"]
-        item_type = item["type"] # items:autodesk.bim360:File of Folder
+        item_type = item["type"]
         item_id = item["id"]
         icon = "📁" if "Folder" in item_type else "📄"
         output += f"- {icon} {name} (ID: {item_id})\n"
         
     if len(items) > limit:
-        output += "\n... (Lijst ingekort voor snelheid.)"
+        output += "\n... (List truncated for speed.)"
     return output
 
-# --- TOOL 2.5: FILE DETAILS ---
 @mcp.tool()
 def get_file_details(project_id: str, item_id: str) -> str:
-    """Haalt details op van een bestand (Item ID)."""
+    """Gets details of a file (Metadata only)."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
@@ -207,47 +195,45 @@ def get_file_details(project_id: str, item_id: str) -> str:
         
         url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encoded_item_id}"
         resp = requests.get(url, headers=headers)
-        if resp.status_code != 200: return f"Fout: {resp.status_code} {resp.text}"
+        if resp.status_code != 200: return f"Error: {resp.status_code} {resp.text}"
         
         json_resp = resp.json()
         try:
             tip_id = json_resp["data"]["relationships"]["tip"]["data"]["id"]
         except KeyError:
-             return "Fout: Kan geen actieve versie vinden."
+             return "Error: Cannot find active version."
         
         encoded_tip_id = encode_urn(tip_id)
         v_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encoded_tip_id}"
         v_resp = requests.get(v_url, headers=headers)
-        if v_resp.status_code != 200: return f"Fout versie: {v_resp.status_code}"
+        if v_resp.status_code != 200: return f"Version Error: {v_resp.status_code}"
              
         attrs = v_resp.json().get("data", {}).get("attributes", {})
         
         return (
-            f"📄 **Bestandsdetails**\n"
-            f"- **Naam:** {attrs.get('displayName')}\n"
-            f"- **Versie:** v{attrs.get('versionNumber')}\n"
+            f"📄 **File Details**\n"
+            f"- **Name:** {attrs.get('displayName')}\n"
+            f"- **Version:** v{attrs.get('versionNumber')}\n"
             f"- **Latest Version ID:** {tip_id}\n"
         )
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- TOOL 2.6: SMART DOWNLOAD URL (UPDATED) ---
 @mcp.tool()
 def get_download_url(project_id: str, id: str) -> str:
     """
-    Genereert een downloadlink. 
-    SMART: Accepteert zowel een Version ID als een Item ID (Lineage).
+    Generates a download link. 
+    SMART: Accepts either a Version ID OR an Item ID (Lineage).
     """
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
         
-        # 1. Checken: Is dit een Lineage ID (Item) of al een Versie?
-        # Lineage ID bevat vaak 'dm.lineage' of geen '?version='
+        # 1. Check: Is this a Lineage ID (Item) or a Version?
         target_version_id = id
         
-        # Simpele heuristiek: Als het lijkt op een item ID, zoek eerst de tip versie
+        # Heuristic: If it looks like an item ID, resolve to tip version first
         if "lineage" in id or "fs.file" in id and "?version=" not in id:
             print(f"Smart Download: Resolving Item ID {id} to Version...")
             encoded_item_id = encode_urn(id)
@@ -258,17 +244,16 @@ def get_download_url(project_id: str, id: str) -> str:
                 try:
                     target_version_id = item_resp.json()["data"]["relationships"]["tip"]["data"]["id"]
                 except KeyError:
-                    return "Fout: Kon geen versie vinden voor dit item."
+                    return "Error: Could not find version for this item."
             else:
-                # Als item lookup faalt, proberen we het gewoon als versie ID
                 print("Item lookup failed, assuming it is a version ID.")
 
-        # 2. Download link genereren met het juiste Version ID
+        # 2. Generate Link
         encoded_version_id = encode_urn(target_version_id)
         v_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encoded_version_id}"
         v_resp = requests.get(v_url, headers=headers)
         
-        if v_resp.status_code != 200: return f"Fout bij versie ophalen: {v_resp.text}"
+        if v_resp.status_code != 200: return f"Error fetching version: {v_resp.text}"
         
         try:
             storage_urn = v_resp.json()["data"]["relationships"]["storage"]["data"]["id"]
@@ -280,26 +265,25 @@ def get_download_url(project_id: str, id: str) -> str:
             oss_resp = requests.get(oss_url, headers=headers, params={"minutesExpiration": 60})
             
             if oss_resp.status_code == 200:
-                return f"⬇️ **[Klik hier om te downloaden]({oss_resp.json()['url']})**"
+                return f"⬇️ **[Click here to download]({oss_resp.json()['url']})**"
             else:
-                return f"Fout bij maken link: {oss_resp.text}"
+                return f"Error creating link: {oss_resp.text}"
         except KeyError:
-            return "Fout: Kon opslaglocatie niet bepalen."
+            return "Error: Could not determine storage location."
             
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- TOOL 3: ADMIN API (SMART) ---
 @mcp.tool()
 def get_account_projects_admin(account_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 10) -> str:
     """
-    (Admin API) Lijst projecten met admin details.
-    SMART: Als account_id ontbreekt, zoekt hij deze automatisch op.
+    (Admin API) Lists projects with admin details.
+    SMART: Auto-detects Account ID if missing.
     """
     if not account_id:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs_data, str) or not hubs_data.get("data"):
-            return "Kan geen Account/Hub ID vinden om als standaard te gebruiken."
+            return "Cannot find Account/Hub ID to use as default."
         raw_hub_id = hubs_data["data"][0]["id"]
         account_id = clean_id(raw_hub_id)
 
@@ -316,48 +300,41 @@ def get_account_projects_admin(account_id: Optional[str] = None, name_filter: Op
     count = len(results)
     display = results[:limit]
 
-    output = f"Admin Projecten (Gevonden: {count}) voor Account {c_id}:\n"
+    output = f"Admin Projects (Found: {count}) for Account {c_id}:\n"
     for proj in display:
-        name = proj.get("name", "Onbekend")
+        name = proj.get("name", "Unknown")
         p_id = proj.get("id")
         output += f"- {name} (ID: {p_id})\n"
         
     if count > limit:
-        output += f"... en {count - limit} meer."
+        output += f"... and {count - limit} more."
     return output
 
-# --- TOOL 4: ASSETS API ---
 @mcp.tool()
 def list_assets(project_id: str, limit: int = 10) -> str:
-    """Haalt Assets (bouwdelen/installaties) op. Maximaal 10 standaard."""
+    """Lists Assets (installations/equipment)."""
     c_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/assets/v2/projects/{c_id}/assets"
     
     data = make_api_request(url)
     if isinstance(data, str): return data
     results = data.get("results", [])
-    if not results: return "Geen assets gevonden."
+    if not results: return "No assets found."
 
     display = results[:limit]
     output = f"Assets in project {c_id} (Top {len(display)}):\n"
     for asset in display:
-        ref = asset.get("clientAssetId", "Geen Ref")
+        ref = asset.get("clientAssetId", "No Ref")
         cat = asset.get("category", {}).get("name", "-")
         status = asset.get("status", {}).get("name", "Unknown")
         output += f"- [{cat}] {ref} | Status: {status}\n"
     if len(results) > limit:
-        output += "\n... (Gebruik specifiekere filters in de toekomst)"
+        output += "\n... (Use specific filters to narrow down)"
     return output
 
-# --- TOOL 5: ISSUES API ---
 @mcp.tool()
 def list_issues(project_id: str, status_filter: str = "open", limit: int = 10) -> str:
-    """
-    Haalt issues op.
-    Args:
-        status_filter: 'open' (standaard), 'answered', 'closed', of 'all'.
-        limit: Maximaal aantal resultaten (standaard 10).
-    """
+    """Lists Issues (filtered by status)."""
     c_id = clean_id(project_id)
     url = f"https://developer.api.autodesk.com/issues/v1/projects/{c_id}/issues"
     
@@ -370,28 +347,27 @@ def list_issues(project_id: str, status_filter: str = "open", limit: int = 10) -
         results = [i for i in results if i.get("attributes", i).get("status", "").lower() == status_filter]
 
     display = results[:limit]
-    output = f"Gevonden: {len(results)} '{status_filter}' issues (Toon {len(display)}):\n"
+    output = f"Found: {len(results)} '{status_filter}' issues (Showing {len(display)}):\n"
     for issue in display:
         attrs = issue.get("attributes", issue)
-        title = attrs.get("title", "Geen Titel")
+        title = attrs.get("title", "No Title")
         status = attrs.get("status", "Unknown")
         ident = attrs.get("identifier", "No ID")
         output += f"- #{ident}: {title} [{status}]\n"
     if len(results) > limit:
-        output += "\n... (Meer issues gevonden. Vraag om details.)"
+        output += "\n... (More issues found. Ask for details.)"
     return output
 
-# --- TOOL 6: DATA CONNECTOR (SMART) ---
 @mcp.tool()
 def get_data_connector_status(account_id: Optional[str] = None) -> str:
     """
-    Checkt de status van Data Connector extracties.
-    SMART: Als account_id ontbreekt, zoekt hij deze automatisch op.
+    Checks Data Connector extraction status.
+    SMART: Auto-detects Account ID if missing.
     """
     if not account_id:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs_data, str) or not hubs_data.get("data"):
-            return "Kan geen Account/Hub ID vinden om als standaard te gebruiken."
+            return "Cannot find Account/Hub ID to use as default."
         raw_hub_id = hubs_data["data"][0]["id"]
         account_id = clean_id(raw_hub_id)
 
@@ -402,15 +378,90 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
     if isinstance(data, str): return data
 
     results = data.get("data", [])
-    if not results: return "Geen data connector requests gevonden."
+    if not results: return "No data connector requests found."
 
-    output = f"Laatste 5 Data Connector Requests (Account {c_id}):\n"
+    output = f"Last 5 Data Connector Requests (Account {c_id}):\n"
     for req in results[:5]:
-        desc = req.get("description", "Geen beschrijving")
+        desc = req.get("description", "No description")
         status = req.get("status", "Unknown")
         date = req.get("createdAt", "")
         output += f"- {date}: {desc} | Status: {status}\n"
     return output
+
+# ==========================================
+# WRITE TOOLS (Management)
+# ==========================================
+
+@mcp.tool()
+def create_project(account_id: str, project_name: str, project_type: str = "Renovation") -> str:
+    """
+    Creates a new project in ACC.
+    Requires account:write permissions.
+    """
+    c_id = clean_id(account_id)
+    url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects"
+    
+    payload = {
+        "name": project_name,
+        "type": project_type,
+        "currency": "EUR",
+        "timezone": "Europe/Amsterdam",
+        "language": "en"
+    }
+    
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        
+        resp = requests.post(url, headers=headers, json=payload)
+        
+        if resp.status_code in [200, 201]:
+            new_proj = resp.json()
+            p_id = new_proj.get("id")
+            return f"✅ Success! Project '{project_name}' has been created.\n- ID: {p_id}\n- Type: {project_type}"
+        else:
+            return f"❌ Error creating project: {resp.status_code} {resp.text}"
+            
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+def add_user_to_project(project_id: str, email: str, role: str = "project_member") -> str:
+    """
+    Adds a user to a project.
+    Args:
+        role: 'project_member' or 'project_admin'
+    """
+    c_id = clean_id(project_id)
+    url = f"{BASE_URL_ACC}/admin/v1/projects/{c_id}/users"
+    
+    payload = [{
+        "email": email,
+        "products": [{
+            "key": "docs",
+            "access": role
+        }]
+    }]
+    
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        
+        resp = requests.post(url, headers=headers, json=payload)
+        
+        if resp.status_code in [200, 201]:
+            return f"✅ Invitation sent to {email} for project {c_id}."
+        else:
+            return f"❌ Error adding user: {resp.status_code} {resp.text}"
+            
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 if __name__ == "__main__":
     print(f"Starting MCP Server on port {PORT}...")
