@@ -145,6 +145,41 @@ def list_projects_dm(hub_id: Optional[str] = None, name_filter: Optional[str] = 
     except Exception as e:
         return f"Error: {str(e)}"
 
+# --- TOOL 1.5: TOP FOLDERS (NEW FIX) ---
+@mcp.tool()
+def get_top_folders(project_id: str) -> str:
+    """
+    Haalt de hoofdmappen (Top Folders) van een project op.
+    Gebruik dit als je nog geen specifieke folder_id hebt.
+    """
+    try:
+        # 1. Hub ID automatisch ophalen
+        hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(hubs_data, str) or not hubs_data.get("data"): 
+            return "Geen Hubs gevonden."
+        hub_id = hubs_data["data"][0]["id"]
+
+        # 2. Project ID fixen (moet 'b.' prefix hebben)
+        p_id = ensure_b_prefix(project_id)
+
+        # 3. API Call
+        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{p_id}/topFolders"
+        data = make_api_request(url)
+        
+        if isinstance(data, str): return data
+        
+        items = data.get("data", [])
+        output = f"Hoofdmappen voor project {p_id}:\n"
+        
+        for item in items:
+            name = item["attributes"]["displayName"]
+            folder_id = item["id"]
+            output += f"- 📁 {name} (ID: {folder_id})\n"
+            
+        return output
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 # --- TOOL 2: BESTANDEN (FILES) ---
 @mcp.tool()
 def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> str:
