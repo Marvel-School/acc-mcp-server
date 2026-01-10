@@ -195,37 +195,29 @@ def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> st
         output += "\n... (Lijst ingekort voor snelheid.)"
     return output
 
-# --- TOOL 2.5: FILE DETAILS (NEW) ---
+# --- TOOL 2.5: FILE DETAILS ---
 @mcp.tool()
 def get_file_details(project_id: str, item_id: str) -> str:
-    """
-    Haalt details op van een bestand (Item ID).
-    Geeft ook de Version ID terug die nodig is voor downloads.
-    """
+    """Haalt details op van een bestand (Item ID)."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
         encoded_item_id = encode_urn(item_id)
         
-        # 1. Item details ophalen (zoekt naar de 'tip' versie)
         url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encoded_item_id}"
         resp = requests.get(url, headers=headers)
-        
         if resp.status_code != 200: return f"Fout: {resp.status_code} {resp.text}"
         
         json_resp = resp.json()
         try:
-            # Hier vinden we de link naar de laatste versie (tip)
             tip_id = json_resp["data"]["relationships"]["tip"]["data"]["id"]
         except KeyError:
-             return "Fout: Kan geen actieve versie vinden voor dit item."
+             return "Fout: Kan geen actieve versie vinden."
         
-        # 2. Versie details ophalen
         encoded_tip_id = encode_urn(tip_id)
         v_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encoded_tip_id}"
         v_resp = requests.get(v_url, headers=headers)
-        
         if v_resp.status_code != 200: return f"Fout versie: {v_resp.status_code}"
              
         attrs = v_resp.json().get("data", {}).get("attributes", {})
@@ -234,43 +226,70 @@ def get_file_details(project_id: str, item_id: str) -> str:
             f"📄 **Bestandsdetails**\n"
             f"- **Naam:** {attrs.get('displayName')}\n"
             f"- **Versie:** v{attrs.get('versionNumber')}\n"
-            f"- **Latest Version ID (Nodig voor download):** {tip_id}\n"
-            f"- **Grootte:** {attrs.get('storageSize')} bytes\n"
+            f"- **Latest Version ID:** {tip_id}\n"
         )
     except Exception as e:
         return f"Error: {str(e)}"
 
+# --- TOOL 2.6: SMART DOWNLOAD URL (UPDATED) ---
 @mcp.tool()
-def get_download_url(project_id: str, version_id: str) -> str:
-    """Genereert een downloadlink voor een bestand."""
+def get_download_url(project_id: str, id: str) -> str:
+    """
+    Genereert een downloadlink. 
+    SMART: Accepteert zowel een Version ID als een Item ID (Lineage).
+    """
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
-        encoded_version_id = encode_urn(version_id)
         
-        # Stap 1: Opslaglocatie vinden
+        # 1. Checken: Is dit een Lineage ID (Item) of al een Versie?
+        # Lineage ID bevat vaak 'dm.lineage' of geen '?version='
+        target_version_id = id
+        
+        # Simpele heuristiek: Als het lijkt op een item ID, zoek eerst de tip versie
+        if "lineage" in id or "fs.file" in id and "?version=" not in id:
+            print(f"Smart Download: Resolving Item ID {id} to Version...")
+            encoded_item_id = encode_urn(id)
+            item_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encoded_item_id}"
+            item_resp = requests.get(item_url, headers=headers)
+            
+            if item_resp.status_code == 200:
+                try:
+                    target_version_id = item_resp.json()["data"]["relationships"]["tip"]["data"]["id"]
+                except KeyError:
+                    return "Fout: Kon geen versie vinden voor dit item."
+            else:
+                # Als item lookup faalt, proberen we het gewoon als versie ID
+                print("Item lookup failed, assuming it is a version ID.")
+
+        # 2. Download link genereren met het juiste Version ID
+        encoded_version_id = encode_urn(target_version_id)
         v_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encoded_version_id}"
         v_resp = requests.get(v_url, headers=headers)
+        
         if v_resp.status_code != 200: return f"Fout bij versie ophalen: {v_resp.text}"
         
-        storage_urn = v_resp.json()["data"]["relationships"]["storage"]["data"]["id"]
-        parts = storage_urn.split("/")
-        object_key = parts[-1]
-        bucket_key = parts[-2].split(":")[-1]
-        
-        # Stap 2: S3 Link maken
-        oss_url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_key}/objects/{object_key}/signeds3download"
-        oss_resp = requests.get(oss_url, headers=headers, params={"minutesExpiration": 60})
-        
-        if oss_resp.status_code == 200:
-            return f"⬇️ **[Klik hier om te downloaden]({oss_resp.json()['url']})**"
-        else:
-            return f"Fout bij maken link: {oss_resp.text}"
+        try:
+            storage_urn = v_resp.json()["data"]["relationships"]["storage"]["data"]["id"]
+            parts = storage_urn.split("/")
+            object_key = parts[-1]
+            bucket_key = parts[-2].split(":")[-1]
+            
+            oss_url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_key}/objects/{object_key}/signeds3download"
+            oss_resp = requests.get(oss_url, headers=headers, params={"minutesExpiration": 60})
+            
+            if oss_resp.status_code == 200:
+                return f"⬇️ **[Klik hier om te downloaden]({oss_resp.json()['url']})**"
+            else:
+                return f"Fout bij maken link: {oss_resp.text}"
+        except KeyError:
+            return "Fout: Kon opslaglocatie niet bepalen."
+            
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- TOOL 3: ADMIN API (UPDATED SMART) ---
+# --- TOOL 3: ADMIN API (SMART) ---
 @mcp.tool()
 def get_account_projects_admin(account_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 10) -> str:
     """
@@ -362,19 +381,30 @@ def list_issues(project_id: str, status_filter: str = "open", limit: int = 10) -
         output += "\n... (Meer issues gevonden. Vraag om details.)"
     return output
 
-# --- TOOL 6: DATA CONNECTOR ---
+# --- TOOL 6: DATA CONNECTOR (SMART) ---
 @mcp.tool()
-def get_data_connector_status(account_id: str) -> str:
-    """Checkt de status van Data Connector extracties (laatste 5)."""
+def get_data_connector_status(account_id: Optional[str] = None) -> str:
+    """
+    Checkt de status van Data Connector extracties.
+    SMART: Als account_id ontbreekt, zoekt hij deze automatisch op.
+    """
+    if not account_id:
+        hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(hubs_data, str) or not hubs_data.get("data"):
+            return "Kan geen Account/Hub ID vinden om als standaard te gebruiken."
+        raw_hub_id = hubs_data["data"][0]["id"]
+        account_id = clean_id(raw_hub_id)
+
     c_id = clean_id(account_id)
     url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{c_id}/requests"
     
     data = make_api_request(url)
     if isinstance(data, str): return data
+
     results = data.get("data", [])
     if not results: return "Geen data connector requests gevonden."
 
-    output = "Laatste 5 Data Connector Requests:\n"
+    output = f"Laatste 5 Data Connector Requests (Account {c_id}):\n"
     for req in results[:5]:
         desc = req.get("description", "Geen beschrijving")
         status = req.get("status", "Unknown")
