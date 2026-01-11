@@ -34,7 +34,7 @@ def get_token():
     url = "https://developer.api.autodesk.com/authentication/v2/token"
     auth = requests.auth.HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
     
-    # UPDATED SCOPES: Added data:write and account:write
+    # SCOPES: data:read data:write account:read account:write bucket:read
     data = {
         "grant_type": "client_credentials", 
         "scope": "data:read data:write account:read account:write bucket:read"
@@ -86,7 +86,7 @@ def make_api_request(url: str):
         return f"Request Error: {str(e)}"
 
 # ==========================================
-# READ TOOLS (Information Retrieval)
+# READ TOOLS
 # ==========================================
 
 @mcp.tool()
@@ -230,7 +230,6 @@ def get_download_url(project_id: str, id: str) -> str:
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
         
-        # 1. Check: Is this a Lineage ID (Item) or a Version?
         target_version_id = id
         
         # Heuristic: If it looks like an item ID, resolve to tip version first
@@ -245,10 +244,8 @@ def get_download_url(project_id: str, id: str) -> str:
                     target_version_id = item_resp.json()["data"]["relationships"]["tip"]["data"]["id"]
                 except KeyError:
                     return "Error: Could not find version for this item."
-            else:
-                print("Item lookup failed, assuming it is a version ID.")
 
-        # 2. Generate Link
+        # Generate Link
         encoded_version_id = encode_urn(target_version_id)
         v_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encoded_version_id}"
         v_resp = requests.get(v_url, headers=headers)
@@ -393,11 +390,20 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
 # ==========================================
 
 @mcp.tool()
-def create_project(account_id: str, project_name: str, project_type: str = "Renovation") -> str:
+def create_project(project_name: str, account_id: Optional[str] = None, project_type: str = "Renovation") -> str:
     """
     Creates a new project in ACC.
+    SMART: Auto-detects Account ID if missing.
     Requires account:write permissions.
     """
+    # 1. AUTO-DETECT Account ID if missing
+    if not account_id:
+        hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(hubs_data, str) or not hubs_data.get("data"):
+            return "Error: Cannot find Account/Hub ID to create project in."
+        raw_hub_id = hubs_data["data"][0]["id"]
+        account_id = clean_id(raw_hub_id)
+
     c_id = clean_id(account_id)
     url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects"
     
