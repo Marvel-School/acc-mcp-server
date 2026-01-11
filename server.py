@@ -85,6 +85,31 @@ def make_api_request(url: str):
     except Exception as e:
         return f"Request Error: {str(e)}"
 
+# --- HELPER: FIND ADMIN USER (REQUIRED FOR WRITE OPS) ---
+def get_admin_user_id(account_id: str) -> Optional[str]:
+    """
+    Finds the first Account Admin user to impersonate.
+    Required because 2-legged 'Create Project' requests need an 'x-user-id' header.
+    """
+    try:
+        token = get_token()
+        c_id = clean_id(account_id)
+        # Using the standard admin endpoint to list users
+        url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Grab first 20 users to find an active one
+        resp = requests.get(url, headers=headers, params={"limit": 20})
+        if resp.status_code == 200:
+            users = resp.json().get("results", [])
+            for user in users:
+                # Return the ID of the first active user found
+                if user.get("status") == "active": 
+                    return user.get("id") or user.get("autodeskId")
+    except Exception as e:
+        print(f"Warning: Could not fetch admin user: {e}")
+    return None
+
 # ==========================================
 # READ TOOLS
 # ==========================================
@@ -390,36 +415,55 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
 # ==========================================
 
 @mcp.tool()
-def create_project(project_name: str, account_id: Optional[str] = None, project_type: str = "Renovation") -> str:
+def create_project(
+    project_name: str, 
+    account_id: Optional[str] = None, 
+    project_type: str = "Renovation", 
+    currency: str = "EUR", 
+    language: str = "en",
+    timezone: str = "Europe/Amsterdam"
+) -> str:
     """
     Creates a new project in ACC.
-    SMART: Auto-detects Account ID if missing.
-    Requires account:write permissions.
+    Args:
+        project_name: Name of the project.
+        project_type: Industry type (e.g., Commercial, Residential, Renovation).
+        currency: e.g., 'EUR', 'USD'.
+        language: e.g., 'en', 'de', 'nl'.
     """
-    # 1. AUTO-DETECT Account ID if missing
+    # 1. AUTO-DETECT Account ID
     if not account_id:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs_data, str) or not hubs_data.get("data"):
-            return "Error: Cannot find Account/Hub ID to create project in."
+            return "Error: Cannot find Account/Hub ID."
         raw_hub_id = hubs_data["data"][0]["id"]
         account_id = clean_id(raw_hub_id)
 
     c_id = clean_id(account_id)
     url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects"
     
+    # 2. FIND ACTING USER (Critical Fix for 'Mandatory Fields' and 400 errors)
+    acting_user_id = get_admin_user_id(c_id)
+    if not acting_user_id:
+        return "Error: Could not find an active Admin user to perform this action. The API requires an acting user context."
+
+    # 3. CONSTRUCT PAYLOAD
+    # 'type' must be 'production' or 'template'. The actual project type goes into 'projectType'
     payload = {
         "name": project_name,
-        "type": project_type,
-        "currency": "EUR",
-        "timezone": "Europe/Amsterdam",
-        "language": "en"
+        "type": "production",
+        "currency": currency,
+        "timezone": timezone,
+        "language": language,
+        "projectType": project_type 
     }
     
     try:
         token = get_token()
         headers = {
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "x-user-id": acting_user_id # REQUIRED header for 2-legged write operations
         }
         
         resp = requests.post(url, headers=headers, json=payload)
@@ -427,7 +471,7 @@ def create_project(project_name: str, account_id: Optional[str] = None, project_
         if resp.status_code in [200, 201]:
             new_proj = resp.json()
             p_id = new_proj.get("id")
-            return f"✅ Success! Project '{project_name}' has been created.\n- ID: {p_id}\n- Type: {project_type}"
+            return f"✅ Success! Project '{project_name}' created.\n- ID: {p_id}\n- Currency: {currency}\n- Language: {language}"
         else:
             return f"❌ Error creating project: {resp.status_code} {resp.text}"
             
