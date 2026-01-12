@@ -72,17 +72,22 @@ def make_graphql_request(query: str, variables: Dict[str, Any] = None):
 
 # --- HELPER: SMART USER LOOKUP ---
 def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
+    """Search for a specific user by email using the API."""
     try:
         token = get_token()
         c_id = clean_id(account_id)
         url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
         params = {"filter[email]": email, "limit": 1}
+        
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
         if resp.status_code == 200:
             results = resp.json().get("results", [])
-            if results and results[0].get("status") == "active":
-                return results[0].get("id") or results[0].get("autodeskId")
-    except: pass
+            if results:
+                user = results[0]
+                # Priority: Return the 'id' (Account Member ID), not 'autodeskId'
+                return user.get("id") 
+    except Exception as e:
+        print(f"Search Error for {email}: {e}")
     return None
 
 def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -> Optional[str]:
@@ -106,7 +111,77 @@ def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -
     return None
 
 # ==========================================
-# TOOL: CREATE PROJECT
+# TOOL: DEBUG PERMISSIONS (NEW)
+# ==========================================
+
+@mcp.tool()
+def debug_permissions(requester_email: str) -> str:
+    """Run this to check why Project Creation is failing."""
+    output = []
+    output.append(f"🔍 **Diagnostics for {requester_email}**")
+    
+    # 1. Check Hub/Account
+    try:
+        hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(hubs, str): 
+            output.append(f"❌ Hub List Failed: {hubs}")
+            return "\n".join(output)
+        
+        # Check specific EU Region Hubs
+        hub_data = hubs.get("data", [])
+        if not hub_data:
+            output.append("❌ No Hubs found.")
+            return "\n".join(output)
+
+        hub = hub_data[0]
+        acc_id = clean_id(hub["id"])
+        name = hub["attributes"]["name"]
+        region = hub["attributes"].get("region", "Unknown")
+        
+        output.append(f"✅ Found Account: **{name}** (Region: {region})")
+        output.append(f"   ID: `{acc_id}`")
+    except Exception as e:
+        return f"❌ Critical Error reading hubs: {str(e)}"
+
+    # 2. Check User Identity
+    token = get_token()
+    user_id = get_user_id_by_email(acc_id, requester_email)
+    
+    if user_id:
+        output.append(f"✅ User Found: ID `{user_id}`")
+    else:
+        output.append(f"❌ User '{requester_email}' NOT FOUND in this account.")
+        output.append("   (Ensure email matches exactly in Account Admin > Members)")
+        return "\n".join(output)
+
+    # 3. Test Permission (Dry Run)
+    try:
+        url = f"{BASE_URL_ACC}/admin/v1/accounts/{acc_id}/projects"
+        headers = {
+            "Authorization": f"Bearer {token}", 
+            "x-user-id": user_id
+        }
+        # Try to read 1 project to test admin access
+        resp = requests.get(url, headers=headers, params={"limit": 1})
+        
+        if resp.status_code == 200:
+            output.append("✅ **Authorization Success:** This user CAN access the Admin API.")
+            output.append("   If 'Create Project' fails, it might be the 'Project Type' or 'Payload'.")
+        elif resp.status_code == 403:
+            output.append("❌ **Permission Denied (403):**")
+            output.append(f"   Raw Error: {resp.text}")
+            output.append("   -> Ensure 'Custom Integration' has 'Account Administration' access.")
+            output.append("   -> Ensure Client ID matches Azure Environment Variable.")
+        else:
+            output.append(f"❌ API Error {resp.status_code}: {resp.text}")
+            
+    except Exception as e:
+        output.append(f"❌ Exception during connection: {str(e)}")
+
+    return "\n".join(output)
+
+# ==========================================
+# TOOL: CREATE PROJECT (Fixed)
 # ==========================================
 
 @mcp.tool()
@@ -134,11 +209,16 @@ def create_project(
     acting_user_id = get_acting_user_id(c_id, requester_email)
     
     if not acting_user_id:
-        return "❌ Error: Authorization Failed. I could not find a valid user in ACC to create this project."
+        return "RAW_ERROR: Authorization Failed. I could not find a valid user ID for this email in ACC."
 
+    # Minimal Payload to avoid Validation Errors (Fixed)
     payload = {
-        "name": project_name, "type": "production", "currency": currency,
-        "timezone": timezone, "language": language, "projectType": project_type 
+        "name": project_name, 
+        "type": "production", # Standard fixed type
+        "currency": currency,
+        "timezone": timezone, 
+        "language": language
+        # Removed "projectType": project_type to prevent 400 Bad Request on custom types
     }
     
     try:
@@ -150,11 +230,12 @@ def create_project(
             used_email = requester_email if requester_email else "Service Account"
             return f"✅ Success! Project '{project_name}' created by **{used_email}** (ID: {resp.json().get('id')})."
         else:
-            return f"❌ Error: {resp.status_code} {resp.text}"
-    except Exception as e: return f"Error: {str(e)}"
+            # Return RAW error so Copilot doesn't hide it
+            return f"RAW_ERROR: {resp.status_code} - {resp.text}"
+    except Exception as e: return f"RAW_ERROR: {str(e)}"
 
 # ==========================================
-# OTHER TOOLS (Keep existing read tools)
+# OTHER TOOLS (Read Tools)
 # ==========================================
 
 @mcp.tool()
