@@ -20,7 +20,7 @@ mcp = FastMCP("Autodesk ACC Agent")
 token_cache = {"access_token": None, "expires_at": 0}
 
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
-BASE_URL_HQ = "https://developer.api.autodesk.com/hq/v1" # NEW: Legacy HQ API for Deep Search
+BASE_URL_HQ = "https://developer.api.autodesk.com/hq/v1" # Legacy HQ API for Deep Search
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # --- HELPER: AUTHENTICATION ---
@@ -71,46 +71,53 @@ def make_graphql_request(query: str, variables: Dict[str, Any] = None):
         return resp.json().get("data", {})
     except Exception as e: return f"GraphQL Exception: {str(e)}"
 
-# --- HELPER: ROBUST USER SEARCH (FIXED) ---
+# --- HELPER: ROBUST USER SEARCH (Client-Side Filtering) ---
 def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
     """
-    Searches for a user ID by email.
-    Tries ACC Admin API first, then falls back to HQ (Legacy) API.
+    Finds a user ID by pulling the user list and searching in Python.
+    This bypasses API filter bugs in EU regions.
     """
     token = get_token()
     c_id = clean_id(account_id)
     headers = {"Authorization": f"Bearer {token}"}
+    target_email = email.lower().strip()
     
-    # ATTEMPT 1: Modern ACC Admin API
+    # Strategy: Fetch 'limit=100' users and find the email manually
+    
+    # 1. Try HQ API (Legacy/Master DB) - Most reliable for Admins
+    try:
+        url_hq = f"{BASE_URL_HQ}/accounts/{c_id}/users"
+        # Fetch 100 users to manually filter
+        resp_hq = requests.get(url_hq, headers=headers, params={"limit": 100})
+        
+        if resp_hq.status_code == 200:
+            # HQ sometimes returns a list directly, sometimes a dict
+            data = resp_hq.json()
+            user_list = data if isinstance(data, list) else data.get("results", [])
+            
+            for u in user_list:
+                # Check email case-insensitively
+                u_email = u.get("email", "")
+                if u_email and u_email.lower().strip() == target_email:
+                    print(f"✅ Found user in HQ List: {target_email}")
+                    return u.get("uid") or u.get("id")
+    except Exception as e:
+        print(f"HQ List Search failed: {e}")
+
+    # 2. Try ACC API (Modern DB)
     try:
         url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
-        params = {"filter[email]": email, "limit": 1}
-        resp = requests.get(url, headers=headers, params=params)
+        resp = requests.get(url, headers=headers, params={"limit": 100})
         
         if resp.status_code == 200:
             results = resp.json().get("results", [])
-            if results:
-                print(f"User found in ACC API: {email}")
-                return results[0].get("id")
+            for u in results:
+                u_email = u.get("email", "")
+                if u_email and u_email.lower().strip() == target_email:
+                    print(f"✅ Found user in ACC List: {target_email}")
+                    return u.get("id")
     except Exception as e:
-        print(f"ACC Search failed: {e}")
-
-    # ATTEMPT 2: Legacy/HQ Admin API (Source of Truth for Admins)
-    # This is often required for EU accounts or Account Admins.
-    try:
-        url_hq = f"{BASE_URL_HQ}/accounts/{c_id}/users"
-        # HQ API uses 'email' param, NOT 'filter[email]'
-        params_hq = {"email": email, "limit": 1}
-        resp_hq = requests.get(url_hq, headers=headers, params=params_hq)
-        
-        if resp_hq.status_code == 200:
-            results = resp_hq.json() # HQ returns list directly sometimes, or key
-            if isinstance(results, list) and results:
-                print(f"User found in HQ API: {email}")
-                # HQ API returns 'uid' or 'id'
-                return results[0].get("uid") or results[0].get("id")
-    except Exception as e:
-        print(f"HQ Search failed: {e}")
+        print(f"ACC List Search failed: {e}")
         
     return None
 
@@ -164,7 +171,7 @@ def debug_permissions(requester_email: str) -> str:
         output.append(f"✅ User Found: ID `{user_id}`")
     else:
         output.append(f"❌ User '{requester_email}' NOT FOUND via API.")
-        output.append("   (Tried both ACC and HQ databases. Check exact spelling or region permissions.)")
+        output.append("   (Tried both ACC and HQ databases with client-side filtering.)")
         return "\n".join(output)
 
     # 3. Test Permission (Dry Run)
@@ -213,7 +220,8 @@ def create_project(
     acting_user_id = get_acting_user_id(c_id, requester_email)
     
     if not acting_user_id:
-        return "RAW_ERROR: Authorization Failed. I could not find a valid user ID for this email in ACC/HQ."
+        return (f"RAW_ERROR: Authorization Failed. I listed the users in account {c_id} "
+                f"but could not find a match for '{requester_email}'. Please check the email spelling.")
 
     payload = {
         "name": project_name, 
@@ -229,7 +237,8 @@ def create_project(
         resp = requests.post(f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects", headers=headers, json=payload)
         
         if resp.status_code in [200, 201]:
-            return f"✅ Success! Project '{project_name}' created by **{requester_email}** (ID: {resp.json().get('id')})."
+            used_email = requester_email if requester_email else "Service Account"
+            return f"✅ Success! Project '{project_name}' created by **{used_email}** (ID: {resp.json().get('id')})."
         else:
             return f"RAW_ERROR: {resp.status_code} - {resp.text}"
     except Exception as e: return f"RAW_ERROR: {str(e)}"
