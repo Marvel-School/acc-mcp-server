@@ -4,7 +4,7 @@ import requests
 import traceback
 from urllib.parse import quote
 from fastmcp import FastMCP
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
@@ -20,6 +20,7 @@ token_cache = {"access_token": None, "expires_at": 0}
 # Base URLs
 BASE_URL_DM = "https://developer.api.autodesk.com"
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
+BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # --- HELPER: AUTHENTICATION ---
 def get_token():
@@ -67,7 +68,7 @@ def encode_urn(urn: str) -> str:
     if not urn: return ""
     return quote(urn, safe='')
 
-# --- HELPER: API REQUEST ---
+# --- HELPER: REST API REQUEST ---
 def make_api_request(url: str):
     """Executes GET request and checks for errors."""
     try:
@@ -85,25 +86,43 @@ def make_api_request(url: str):
     except Exception as e:
         return f"Request Error: {str(e)}"
 
+# --- HELPER: GRAPHQL REQUEST (AEC DATA MODEL) ---
+def make_graphql_request(query: str, variables: Dict[str, Any] = None):
+    """Executes a GraphQL query against the AEC Data Model API."""
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        payload = {"query": query, "variables": variables or {}}
+        
+        resp = requests.post(BASE_URL_GRAPHQL, headers=headers, json=payload)
+        
+        if resp.status_code != 200:
+            return f"GraphQL Error {resp.status_code}: {resp.text}"
+            
+        result = resp.json()
+        if "errors" in result:
+            return f"GraphQL Query Errors: {result['errors']}"
+            
+        return result.get("data", {})
+    except Exception as e:
+        return f"GraphQL Exception: {str(e)}"
+
 # --- HELPER: FIND ADMIN USER (REQUIRED FOR WRITE OPS) ---
 def get_admin_user_id(account_id: str) -> Optional[str]:
-    """
-    Finds the first Account Admin user to impersonate.
-    Required because 2-legged 'Create Project' requests need an 'x-user-id' header.
-    """
+    """Finds the first Account Admin user to impersonate."""
     try:
         token = get_token()
         c_id = clean_id(account_id)
-        # Using the standard admin endpoint to list users
         url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
         headers = {"Authorization": f"Bearer {token}"}
         
-        # Grab first 20 users to find an active one
         resp = requests.get(url, headers=headers, params={"limit": 20})
         if resp.status_code == 200:
             users = resp.json().get("results", [])
             for user in users:
-                # Return the ID of the first active user found
                 if user.get("status") == "active": 
                     return user.get("id") or user.get("autodeskId")
     except Exception as e:
@@ -111,7 +130,119 @@ def get_admin_user_id(account_id: str) -> Optional[str]:
     return None
 
 # ==========================================
-# READ TOOLS
+# TOOLSET 1: AEC DATA MODEL (NEW AMAZING FEATURES)
+# ==========================================
+
+@mcp.tool()
+def list_designs(project_id: str) -> str:
+    """
+    Lists 'Element Groups' (Designs/Models) in a project using AEC Data Model.
+    Use this to find the 'design_id' needed for querying elements inside a model.
+    """
+    query = """
+    query GetElementGroupsByProject ($projectId: ID!) {
+        elementGroupsByProject(projectId: $projectId) {
+            results {
+                id
+                name
+                alternativeIdentifiers {
+                    fileVersionUrn
+                }
+            }
+        }
+    }
+    """
+    
+    # 1. Try with 'b.' prefix (Standard for ACC)
+    p_id = ensure_b_prefix(project_id)
+    data = make_graphql_request(query, {"projectId": p_id})
+    
+    # 2. Fallback to clean ID if 'b.' fails
+    if isinstance(data, str) and "Error" in data:
+        p_id = clean_id(project_id)
+        data = make_graphql_request(query, {"projectId": p_id})
+        
+    if isinstance(data, str): return data # Return error string
+    
+    groups = data.get("elementGroupsByProject", {}).get("results", [])
+    if not groups:
+        return "No designs (Element Groups) found. Ensure AEC Data Model is enabled for this hub."
+        
+    output = "🏗️ **Designs / Models Found:**\n"
+    for g in groups:
+        name = g.get("name")
+        g_id = g.get("id")
+        output += f"- **{name}**\n  ID: `{g_id}`\n"
+        
+    return output
+
+@mcp.tool()
+def query_model_elements(design_id: str, category: str, limit: int = 20) -> str:
+    """
+    Queries specific elements inside a model (Walls, Doors, Windows, etc.).
+    Args:
+        design_id: The Element Group ID (get this from list_designs).
+        category: The category to filter by (e.g., 'Walls', 'Doors', 'Windows', 'Floors', 'Furniture').
+    """
+    query = """
+    query GetElementsByCategory ($elementGroupId: ID!, $filter: String!) {
+      elementsByElementGroup(elementGroupId: $elementGroupId, filter: {query: $filter}) {
+        results {
+          id
+          name
+          properties {
+            results {
+              name
+              value
+            }
+          }
+        }
+      }
+    }
+    """
+    
+    # Construct filter string as per AEC Data Model syntax
+    filter_str = f"property.name.category=='{category}'"
+    
+    data = make_graphql_request(query, {"elementGroupId": design_id, "filter": filter_str})
+    if isinstance(data, str): return data
+    
+    elements = data.get("elementsByElementGroup", {}).get("results", [])
+    if not elements:
+        return f"No elements found of category '{category}' in this design."
+        
+    display = elements[:limit]
+    output = f"🔍 **Found {len(elements)} {category}** (Showing top {len(display)}):\n"
+    
+    for el in display:
+        name = el.get("name", "Unnamed")
+        el_id = el.get("id")
+        # Flatten properties for display
+        props = el.get("properties", {}).get("results", [])
+        
+        # Simple string representation of properties
+        prop_str = ", ".join([f"{p['name']}: {p['value']}" for p in props if p['value']])
+        if len(prop_str) > 100: prop_str = prop_str[:100] + "..."
+        
+        output += f"- **{name}** (ID: {el_id})\n  Props: {prop_str}\n"
+        
+    if len(elements) > limit:
+        output += f"\n... (and {len(elements) - limit} more)"
+        
+    return output
+
+@mcp.tool()
+def get_model_viewer_link(project_id: str, urn: str) -> str:
+    """
+    Generates a direct link to view the model in the Autodesk Construction Cloud website.
+    This replaces the need for a local desktop viewer.
+    """
+    clean_p_id = clean_id(project_id)
+    # This URL pattern directs the user to the specific file view in ACC
+    return f"https://acc.autodesk.com/docs/files/projects/{clean_p_id}?entityId={urn}"
+
+# ==========================================
+# TOOLSET 2: EXISTING READ TOOLS (REST API)
 # ==========================================
 
 @mcp.tool()
@@ -296,12 +427,13 @@ def get_download_url(project_id: str, id: str) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
+# ==========================================
+# TOOLSET 3: MANAGEMENT & WRITE TOOLS
+# ==========================================
+
 @mcp.tool()
 def get_account_projects_admin(account_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 10) -> str:
-    """
-    (Admin API) Lists projects with admin details.
-    SMART: Auto-detects Account ID if missing.
-    """
+    """(Admin API) Lists projects with admin details. SMART: Auto-detects Account ID."""
     if not account_id:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs_data, str) or not hubs_data.get("data"):
@@ -350,8 +482,6 @@ def list_assets(project_id: str, limit: int = 10) -> str:
         cat = asset.get("category", {}).get("name", "-")
         status = asset.get("status", {}).get("name", "Unknown")
         output += f"- [{cat}] {ref} | Status: {status}\n"
-    if len(results) > limit:
-        output += "\n... (Use specific filters to narrow down)"
     return output
 
 @mcp.tool()
@@ -376,16 +506,11 @@ def list_issues(project_id: str, status_filter: str = "open", limit: int = 10) -
         status = attrs.get("status", "Unknown")
         ident = attrs.get("identifier", "No ID")
         output += f"- #{ident}: {title} [{status}]\n"
-    if len(results) > limit:
-        output += "\n... (More issues found. Ask for details.)"
     return output
 
 @mcp.tool()
 def get_data_connector_status(account_id: Optional[str] = None) -> str:
-    """
-    Checks Data Connector extraction status.
-    SMART: Auto-detects Account ID if missing.
-    """
+    """Checks Data Connector extraction status."""
     if not account_id:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs_data, str) or not hubs_data.get("data"):
@@ -410,10 +535,6 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
         output += f"- {date}: {desc} | Status: {status}\n"
     return output
 
-# ==========================================
-# WRITE TOOLS (Management)
-# ==========================================
-
 @mcp.tool()
 def create_project(
     project_name: str, 
@@ -423,15 +544,7 @@ def create_project(
     language: str = "en",
     timezone: str = "Europe/Amsterdam"
 ) -> str:
-    """
-    Creates a new project in ACC.
-    Args:
-        project_name: Name of the project.
-        project_type: Industry type (e.g., Commercial, Residential, Renovation).
-        currency: e.g., 'EUR', 'USD'.
-        language: e.g., 'en', 'de', 'nl'.
-    """
-    # 1. AUTO-DETECT Account ID
+    """Creates a new project in ACC (Admin)."""
     if not account_id:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs_data, str) or not hubs_data.get("data"):
@@ -442,13 +555,10 @@ def create_project(
     c_id = clean_id(account_id)
     url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects"
     
-    # 2. FIND ACTING USER (Critical Fix for 'Mandatory Fields' and 400 errors)
     acting_user_id = get_admin_user_id(c_id)
     if not acting_user_id:
-        return "Error: Could not find an active Admin user to perform this action. The API requires an acting user context."
+        return "Error: Could not find an active Admin user to perform this action."
 
-    # 3. CONSTRUCT PAYLOAD
-    # 'type' must be 'production' or 'template'. The actual project type goes into 'projectType'
     payload = {
         "name": project_name,
         "type": "production",
@@ -463,7 +573,7 @@ def create_project(
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "x-user-id": acting_user_id # REQUIRED header for 2-legged write operations
+            "x-user-id": acting_user_id
         }
         
         resp = requests.post(url, headers=headers, json=payload)
@@ -480,11 +590,7 @@ def create_project(
 
 @mcp.tool()
 def add_user_to_project(project_id: str, email: str, role: str = "project_member") -> str:
-    """
-    Adds a user to a project.
-    Args:
-        role: 'project_member' or 'project_admin'
-    """
+    """Adds a user to a project."""
     c_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/admin/v1/projects/{c_id}/users"
     
