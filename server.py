@@ -110,35 +110,54 @@ def make_graphql_request(query: str, variables: Dict[str, Any] = None):
     except Exception as e:
         return f"GraphQL Exception: {str(e)}"
 
-# --- HELPER: FIND ADMIN USER (REQUIRED FOR WRITE OPS) ---
-def get_admin_user_id(account_id: str) -> Optional[str]:
-    """Finds the first Account Admin user to impersonate."""
+# --- HELPER: FIND ADMIN USER (IMPROVED WITH EMAIL SEARCH) ---
+def get_admin_user_id(account_id: str, email: Optional[str] = None) -> Optional[str]:
+    """
+    Finds a user ID to impersonate for project creation.
+    If 'email' is provided, it searches for that specific user.
+    Otherwise, it looks for the first active user.
+    """
     try:
         token = get_token()
         c_id = clean_id(account_id)
         url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
         headers = {"Authorization": f"Bearer {token}"}
         
-        resp = requests.get(url, headers=headers, params={"limit": 20})
+        # If email is provided, we fetch more users to increase chances of finding them
+        params = {"limit": 50} 
+        
+        resp = requests.get(url, headers=headers, params=params)
+        
         if resp.status_code == 200:
             users = resp.json().get("results", [])
-            for user in users:
-                if user.get("status") == "active": 
-                    return user.get("id") or user.get("autodeskId")
+            
+            # 1. Try to find the specific email if provided
+            if email:
+                for user in users:
+                    if user.get("email", "").lower() == email.lower():
+                        return user.get("id") or user.get("autodeskId")
+                print(f"Warning: User with email {email} not found in first 50 users.")
+
+            # 2. Fallback: Find first active user if no email provided or email not found
+            # (Only do fallback if email WAS NOT provided. If specific email was asked, likely better to fail or warn)
+            if not email:
+                for user in users:
+                    if user.get("status") == "active": 
+                        return user.get("id") or user.get("autodeskId")
+        else:
+            print(f"User Search Failed: {resp.status_code} {resp.text}")
+            
     except Exception as e:
         print(f"Warning: Could not fetch admin user: {e}")
     return None
 
 # ==========================================
-# TOOLSET 1: AEC DATA MODEL (NEW AMAZING FEATURES)
+# TOOLSET 1: AEC DATA MODEL
 # ==========================================
 
 @mcp.tool()
 def list_designs(project_id: str) -> str:
-    """
-    Lists 'Element Groups' (Designs/Models) in a project using AEC Data Model.
-    Use this to find the 'design_id' needed for querying elements inside a model.
-    """
+    """Lists 'Element Groups' (Designs/Models) in a project using AEC Data Model."""
     query = """
     query GetElementGroupsByProject ($projectId: ID!) {
         elementGroupsByProject(projectId: $projectId) {
@@ -152,17 +171,14 @@ def list_designs(project_id: str) -> str:
         }
     }
     """
-    
-    # 1. Try with 'b.' prefix (Standard for ACC)
     p_id = ensure_b_prefix(project_id)
     data = make_graphql_request(query, {"projectId": p_id})
     
-    # 2. Fallback to clean ID if 'b.' fails
     if isinstance(data, str) and "Error" in data:
         p_id = clean_id(project_id)
         data = make_graphql_request(query, {"projectId": p_id})
         
-    if isinstance(data, str): return data # Return error string
+    if isinstance(data, str): return data
     
     groups = data.get("elementGroupsByProject", {}).get("results", [])
     if not groups:
@@ -173,17 +189,11 @@ def list_designs(project_id: str) -> str:
         name = g.get("name")
         g_id = g.get("id")
         output += f"- **{name}**\n  ID: `{g_id}`\n"
-        
     return output
 
 @mcp.tool()
 def query_model_elements(design_id: str, category: str, limit: int = 20) -> str:
-    """
-    Queries specific elements inside a model (Walls, Doors, Windows, etc.).
-    Args:
-        design_id: The Element Group ID (get this from list_designs).
-        category: The category to filter by (e.g., 'Walls', 'Doors', 'Windows', 'Floors', 'Furniture').
-    """
+    """Queries specific elements inside a model (Walls, Doors, Windows, etc.)."""
     query = """
     query GetElementsByCategory ($elementGroupId: ID!, $filter: String!) {
       elementsByElementGroup(elementGroupId: $elementGroupId, filter: {query: $filter}) {
@@ -200,10 +210,7 @@ def query_model_elements(design_id: str, category: str, limit: int = 20) -> str:
       }
     }
     """
-    
-    # Construct filter string as per AEC Data Model syntax
     filter_str = f"property.name.category=='{category}'"
-    
     data = make_graphql_request(query, {"elementGroupId": design_id, "filter": filter_str})
     if isinstance(data, str): return data
     
@@ -213,32 +220,21 @@ def query_model_elements(design_id: str, category: str, limit: int = 20) -> str:
         
     display = elements[:limit]
     output = f"🔍 **Found {len(elements)} {category}** (Showing top {len(display)}):\n"
-    
     for el in display:
         name = el.get("name", "Unnamed")
         el_id = el.get("id")
-        # Flatten properties for display
         props = el.get("properties", {}).get("results", [])
-        
-        # Simple string representation of properties
         prop_str = ", ".join([f"{p['name']}: {p['value']}" for p in props if p['value']])
         if len(prop_str) > 100: prop_str = prop_str[:100] + "..."
-        
         output += f"- **{name}** (ID: {el_id})\n  Props: {prop_str}\n"
-        
     if len(elements) > limit:
         output += f"\n... (and {len(elements) - limit} more)"
-        
     return output
 
 @mcp.tool()
 def get_model_viewer_link(project_id: str, urn: str) -> str:
-    """
-    Generates a direct link to view the model in the Autodesk Construction Cloud website.
-    This replaces the need for a local desktop viewer.
-    """
+    """Generates a direct link to view the model in the Autodesk Construction Cloud website."""
     clean_p_id = clean_id(project_id)
-    # This URL pattern directs the user to the specific file view in ACC
     return f"https://acc.autodesk.com/docs/files/projects/{clean_p_id}?entityId={urn}"
 
 # ==========================================
@@ -274,7 +270,6 @@ def list_projects_dm(hub_id: Optional[str] = None, name_filter: Optional[str] = 
         if isinstance(data, str): return data
 
         all_projects = data.get("data", [])
-        
         if name_filter:
             lower_filter = name_filter.lower()
             filtered = [p for p in all_projects if lower_filter in p['attributes']['name'].lower()]
@@ -283,14 +278,11 @@ def list_projects_dm(hub_id: Optional[str] = None, name_filter: Optional[str] = 
 
         display = filtered[:limit]
         count = len(filtered)
-
         output = f"Found: {count} projects in Hub {hub_id} (Showing top {len(display)}):\n"
         for proj in display:
             output += f"- {proj['attributes']['name']} (ID: {proj['id']})\n"
-            
         if count > limit:
             output += f"\n... (and {count - limit} more. Use 'name_filter' to refine.)"
-            
         return output
     except Exception as e:
         return f"Error: {str(e)}"
@@ -321,13 +313,11 @@ def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> st
     """Lists contents of a specific folder."""
     p_id = ensure_b_prefix(project_id)
     url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/folders/{folder_id}/contents"
-    
     data = make_api_request(url)
     if isinstance(data, str): return data
 
     items = data.get("data", [])
     display = items[:limit]
-    
     output = f"Contents of folder {folder_id} (Top {len(display)} of {len(items)}):\n"
     for item in display:
         name = item["attributes"]["displayName"]
@@ -335,7 +325,6 @@ def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> st
         item_id = item["id"]
         icon = "📁" if "Folder" in item_type else "📄"
         output += f"- {icon} {name} (ID: {item_id})\n"
-        
     if len(items) > limit:
         output += "\n... (List truncated for speed.)"
     return output
@@ -348,7 +337,6 @@ def get_file_details(project_id: str, item_id: str) -> str:
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
         encoded_item_id = encode_urn(item_id)
-        
         url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encoded_item_id}"
         resp = requests.get(url, headers=headers)
         if resp.status_code != 200: return f"Error: {resp.status_code} {resp.text}"
@@ -365,7 +353,6 @@ def get_file_details(project_id: str, item_id: str) -> str:
         if v_resp.status_code != 200: return f"Version Error: {v_resp.status_code}"
              
         attrs = v_resp.json().get("data", {}).get("attributes", {})
-        
         return (
             f"📄 **File Details**\n"
             f"- **Name:** {attrs.get('displayName')}\n"
@@ -377,35 +364,27 @@ def get_file_details(project_id: str, item_id: str) -> str:
 
 @mcp.tool()
 def get_download_url(project_id: str, id: str) -> str:
-    """
-    Generates a download link. 
-    SMART: Accepts either a Version ID OR an Item ID (Lineage).
-    """
+    """Generates a download link. SMART: Accepts either a Version ID OR an Item ID (Lineage)."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
         
         target_version_id = id
-        
-        # Heuristic: If it looks like an item ID, resolve to tip version first
         if "lineage" in id or "fs.file" in id and "?version=" not in id:
             print(f"Smart Download: Resolving Item ID {id} to Version...")
             encoded_item_id = encode_urn(id)
             item_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encoded_item_id}"
             item_resp = requests.get(item_url, headers=headers)
-            
             if item_resp.status_code == 200:
                 try:
                     target_version_id = item_resp.json()["data"]["relationships"]["tip"]["data"]["id"]
                 except KeyError:
                     return "Error: Could not find version for this item."
 
-        # Generate Link
         encoded_version_id = encode_urn(target_version_id)
         v_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encoded_version_id}"
         v_resp = requests.get(v_url, headers=headers)
-        
         if v_resp.status_code != 200: return f"Error fetching version: {v_resp.text}"
         
         try:
@@ -413,17 +392,14 @@ def get_download_url(project_id: str, id: str) -> str:
             parts = storage_urn.split("/")
             object_key = parts[-1]
             bucket_key = parts[-2].split(":")[-1]
-            
             oss_url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_key}/objects/{object_key}/signeds3download"
             oss_resp = requests.get(oss_url, headers=headers, params={"minutesExpiration": 60})
-            
             if oss_resp.status_code == 200:
                 return f"⬇️ **[Click here to download]({oss_resp.json()['url']})**"
             else:
                 return f"Error creating link: {oss_resp.text}"
         except KeyError:
             return "Error: Could not determine storage location."
-            
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -443,23 +419,18 @@ def get_account_projects_admin(account_id: Optional[str] = None, name_filter: Op
 
     c_id = clean_id(account_id)
     url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects"
-    
     data = make_api_request(url)
     if isinstance(data, str): return data
     results = data if isinstance(data, list) else data.get("results", [])
-    
     if name_filter:
         results = [p for p in results if name_filter.lower() in p.get("name", "").lower()]
-    
     count = len(results)
     display = results[:limit]
-
     output = f"Admin Projects (Found: {count}) for Account {c_id}:\n"
     for proj in display:
         name = proj.get("name", "Unknown")
         p_id = proj.get("id")
         output += f"- {name} (ID: {p_id})\n"
-        
     if count > limit:
         output += f"... and {count - limit} more."
     return output
@@ -469,12 +440,10 @@ def list_assets(project_id: str, limit: int = 10) -> str:
     """Lists Assets (installations/equipment)."""
     c_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/assets/v2/projects/{c_id}/assets"
-    
     data = make_api_request(url)
     if isinstance(data, str): return data
     results = data.get("results", [])
     if not results: return "No assets found."
-
     display = results[:limit]
     output = f"Assets in project {c_id} (Top {len(display)}):\n"
     for asset in display:
@@ -489,15 +458,12 @@ def list_issues(project_id: str, status_filter: str = "open", limit: int = 10) -
     """Lists Issues (filtered by status)."""
     c_id = clean_id(project_id)
     url = f"https://developer.api.autodesk.com/issues/v1/projects/{c_id}/issues"
-    
     data = make_api_request(url)
     if isinstance(data, str): return data
     results = data.get("results", [])
     if not results and "data" in data: results = data["data"]
-
     if status_filter != "all":
         results = [i for i in results if i.get("attributes", i).get("status", "").lower() == status_filter]
-
     display = results[:limit]
     output = f"Found: {len(results)} '{status_filter}' issues (Showing {len(display)}):\n"
     for issue in display:
@@ -520,13 +486,10 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
 
     c_id = clean_id(account_id)
     url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{c_id}/requests"
-    
     data = make_api_request(url)
     if isinstance(data, str): return data
-
     results = data.get("data", [])
     if not results: return "No data connector requests found."
-
     output = f"Last 5 Data Connector Requests (Account {c_id}):\n"
     for req in results[:5]:
         desc = req.get("description", "No description")
@@ -538,13 +501,18 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
 @mcp.tool()
 def create_project(
     project_name: str, 
+    admin_email: Optional[str] = None,
     account_id: Optional[str] = None, 
     project_type: str = "Renovation", 
     currency: str = "EUR", 
     language: str = "en",
     timezone: str = "Europe/Amsterdam"
 ) -> str:
-    """Creates a new project in ACC (Admin)."""
+    """
+    Creates a new project in ACC.
+    SAFETY: If auto-detection of the admin fails, this tool will ask for an email.
+    """
+    # 1. AUTO-DETECT Account ID
     if not account_id:
         hubs_data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs_data, str) or not hubs_data.get("data"):
@@ -555,9 +523,16 @@ def create_project(
     c_id = clean_id(account_id)
     url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects"
     
-    acting_user_id = get_admin_user_id(c_id)
+    # 2. FIND ACTING USER (With Safety Net)
+    acting_user_id = get_admin_user_id(c_id, email=admin_email)
+    
+    # --- SAFETY NET TRIGGER ---
     if not acting_user_id:
-        return "Error: Could not find an active Admin user to perform this action."
+        return (
+            f"⚠️ ACTION REQUIRED: I could not automatically find an admin user to create project '{project_name}'. "
+            "Please ask the user for their email address (e.g., 'What is your email?'). "
+            "Once they provide it, retry this tool using the 'admin_email' parameter."
+        )
 
     payload = {
         "name": project_name,
@@ -581,7 +556,7 @@ def create_project(
         if resp.status_code in [200, 201]:
             new_proj = resp.json()
             p_id = new_proj.get("id")
-            return f"✅ Success! Project '{project_name}' created.\n- ID: {p_id}\n- Currency: {currency}\n- Language: {language}"
+            return f"✅ Success! Project '{project_name}' created.\n- ID: {p_id}\n- Admin: {admin_email or 'Auto-detected'}"
         else:
             return f"❌ Error creating project: {resp.status_code} {resp.text}"
             
