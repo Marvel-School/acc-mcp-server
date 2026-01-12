@@ -223,12 +223,10 @@ def create_project(
         return (f"RAW_ERROR: Authorization Failed. I listed the users in account {c_id} "
                 f"but could not find a match for '{requester_email}'. Please check the email spelling.")
 
+    # MINIMAL PAYLOAD: We removed the extra fields to stop 400 Bad Request
     payload = {
         "name": project_name, 
         "type": "production",
-        "currency": currency,
-        "timezone": timezone, 
-        "language": language
     }
     
     try:
@@ -244,21 +242,53 @@ def create_project(
     except Exception as e: return f"RAW_ERROR: {str(e)}"
 
 # ==========================================
-# OTHER TOOLS (Read Tools)
+# OTHER TOOLS (READ) - LIST DESIGNS FIXED
 # ==========================================
 
 @mcp.tool()
 def list_designs(project_id: str) -> str:
-    query = """query GetElementGroupsByProject($projectId: ID!) { elementGroupsByProject(projectId: $projectId) { results { id name alternativeIdentifiers { fileVersionUrn } } } }"""
+    """Lists 3D designs (Revit/IFC) in a project."""
+    # 1. Clean the ID
     p_id = ensure_b_prefix(project_id)
+    
+    # 2. Define Query
+    query = """query GetElementGroupsByProject($projectId: ID!) { 
+        elementGroupsByProject(projectId: $projectId) { 
+            results { 
+                id 
+                name 
+                alternativeIdentifiers { fileVersionUrn } 
+            } 
+        } 
+    }"""
+    
+    # 3. Make Request (Try with 'b.' prefix first)
+    print(f"🔍 Searching designs in: {p_id}")
     data = make_graphql_request(query, {"projectId": p_id})
-    if isinstance(data, str) and "Error" in data:
+    
+    # 4. Handle "None" or "Error" responses safely
+    if not data or isinstance(data, str): 
+        # Optional: Retry without 'b.' prefix if first attempt failed
+        print("⚠️ Retrying without 'b.' prefix...")
         data = make_graphql_request(query, {"projectId": clean_id(project_id)})
-    if isinstance(data, str): return data
-    groups = data.get("elementGroupsByProject", {}).get("results", [])
-    if not groups: return "No designs found."
-    output = "🏗️ **Designs Found:**\n"
-    for g in groups: output += f"- **{g.get('name')}**\n  ID: `{g.get('id')}`\n"
+        
+    if not data or isinstance(data, str):
+        return f"❌ Error: Could not retrieve designs. API returned: {data}"
+        
+    # 5. Safe Parsing (The Fix for 'NoneType' error)
+    groups_container = data.get("elementGroupsByProject")
+    if not groups_container:
+        return "⚠️ No design container found. The project might be empty or not initialized for Model Coordination."
+        
+    groups = groups_container.get("results", [])
+    
+    if not groups: 
+        return "📂 No 3D designs found in this project."
+        
+    # 6. Format Output
+    output = f"🏗️ **Found {len(groups)} Designs:**\n"
+    for g in groups: 
+        output += f"- **{g.get('name')}**\n  ID: `{g.get('id')}`\n"
     return output
 
 @mcp.tool()
