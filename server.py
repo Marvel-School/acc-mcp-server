@@ -9,8 +9,7 @@ from typing import Optional, List, Dict, Any
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
-# OPTIONAL: A "Service Account" email stored in Azure settings (not code).
-# Used only if the requesting user is not found or has no permissions.
+# Fallback service account (Optional, set in Azure)
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL") 
 PORT = int(os.environ.get("PORT", 8000))
 
@@ -20,8 +19,6 @@ mcp = FastMCP("Autodesk ACC Agent")
 # Global token cache
 token_cache = {"access_token": None, "expires_at": 0}
 
-# Base URLs
-BASE_URL_DM = "https://developer.api.autodesk.com"
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
@@ -38,16 +35,11 @@ def get_token():
     auth = requests.auth.HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
     data = {"grant_type": "client_credentials", "scope": "data:read data:write account:read account:write bucket:read"}
 
-    try:
-        resp = requests.post(url, auth=auth, data=data)
-        resp.raise_for_status()
-        result = resp.json()
-        token_cache["access_token"] = result["access_token"]
-        token_cache["expires_at"] = time.time() + result["expires_in"] - 60
-        return result["access_token"]
-    except Exception as e:
-        print(f"Auth Error: {e}")
-        raise e
+    resp = requests.post(url, auth=auth, data=data)
+    resp.raise_for_status()
+    token_cache["access_token"] = resp.json()["access_token"]
+    token_cache["expires_at"] = time.time() + resp.json()["expires_in"] - 60
+    return token_cache["access_token"]
 
 # --- HELPER: UTILS ---
 def clean_id(id_str: str) -> str:
@@ -80,43 +72,28 @@ def make_graphql_request(query: str, variables: Dict[str, Any] = None):
 
 # --- HELPER: SMART USER LOOKUP ---
 def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
-    """Search for a specific user by email using the API."""
     try:
         token = get_token()
         c_id = clean_id(account_id)
         url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
-        # Search for the user specifically
         params = {"filter[email]": email, "limit": 1}
-        
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
         if resp.status_code == 200:
             results = resp.json().get("results", [])
-            if results:
-                user = results[0]
-                if user.get("status") == "active":
-                    return user.get("id") or user.get("autodeskId")
-    except Exception as e:
-        print(f"Search Error for {email}: {e}")
+            if results and results[0].get("status") == "active":
+                return results[0].get("id") or results[0].get("autodeskId")
+    except: pass
     return None
 
 def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -> Optional[str]:
-    """
-    Determines who owns the action.
-    1. The user chatting (requester_email).
-    2. The Fallback Admin (ACC_ADMIN_EMAIL env var).
-    3. Any active admin (Last resort).
-    """
     # 1. Try Requesting User
     if requester_email:
         uid = get_user_id_by_email(account_id, requester_email)
         if uid: return uid
-        print(f"User {requester_email} not found in ACC.")
-
     # 2. Try Fallback Service Account
     if ACC_ADMIN_EMAIL:
         uid = get_user_id_by_email(account_id, ACC_ADMIN_EMAIL)
         if uid: return uid
-
     # 3. Last Resort: Any Admin
     try:
         token = get_token()
@@ -126,11 +103,10 @@ def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -
             for u in resp.json().get("results", []):
                 if u.get("status") == "active": return u.get("id")
     except: pass
-    
     return None
 
 # ==========================================
-# TOOLS
+# TOOL: CREATE PROJECT
 # ==========================================
 
 @mcp.tool()
@@ -144,22 +120,21 @@ def create_project(
     timezone: str = "Europe/Amsterdam"
 ) -> str:
     """
-    Creates a new project attributed to the user asking.
-    Args:
-        requester_email: The email of the logged-in user (from Copilot context).
+    Creates a new project. 
+    IMPORTANT: 'requester_email' must be passed from Copilot context to verify identity.
     """
-    # 1. Account ID
+    # 1. Auto-detect Account ID
     if not account_id:
         hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs, str) or not hubs.get("data"): return "Error: No Account/Hub found."
         account_id = clean_id(hubs["data"][0]["id"])
     
-    # 2. Smart User Lookup
+    # 2. SMART LOOKUP
     c_id = clean_id(account_id)
     acting_user_id = get_acting_user_id(c_id, requester_email)
     
     if not acting_user_id:
-        return "❌ Error: I cannot find a valid user in ACC to create this project (checked requester and fallback admin)."
+        return "❌ Error: Authorization Failed. I could not find a valid user in ACC to create this project."
 
     payload = {
         "name": project_name, "type": "production", "currency": currency,
@@ -178,11 +153,12 @@ def create_project(
             return f"❌ Error: {resp.status_code} {resp.text}"
     except Exception as e: return f"Error: {str(e)}"
 
-# --- READ TOOLS ---
+# ==========================================
+# OTHER TOOLS (Keep existing read tools)
+# ==========================================
 
 @mcp.tool()
 def list_designs(project_id: str) -> str:
-    """Lists 'Element Groups' (Designs)."""
     query = """query GetElementGroupsByProject($projectId: ID!) { elementGroupsByProject(projectId: $projectId) { results { id name alternativeIdentifiers { fileVersionUrn } } } }"""
     p_id = ensure_b_prefix(project_id)
     data = make_graphql_request(query, {"projectId": p_id})
@@ -197,7 +173,6 @@ def list_designs(project_id: str) -> str:
 
 @mcp.tool()
 def query_model_elements(design_id: str, category: str, limit: int = 20) -> str:
-    """Queries elements (e.g. Walls)."""
     query = """query GetElementsByCategory($elementGroupId: ID!, $filter: String!) { elementsByElementGroup(elementGroupId: $elementGroupId, filter: {query: $filter}) { results { id name properties { results { name value } } } } }"""
     data = make_graphql_request(query, {"elementGroupId": design_id, "filter": f"property.name.category=='{category}'"})
     if isinstance(data, str): return data
@@ -253,6 +228,22 @@ def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> st
     return output
 
 @mcp.tool()
+def get_file_details(project_id: str, item_id: str) -> str:
+    token = get_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    p_id = ensure_b_prefix(project_id)
+    item_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(item_id)}"
+    resp = requests.get(item_url, headers=headers)
+    if resp.status_code != 200: return f"Error: {resp.status_code}"
+    try: tip_id = resp.json()["data"]["relationships"]["tip"]["data"]["id"]
+    except KeyError: return "Error: No active version."
+    v_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encode_urn(tip_id)}"
+    v_resp = requests.get(v_url, headers=headers)
+    if v_resp.status_code != 200: return "Error fetching version."
+    attrs = v_resp.json().get("data", {}).get("attributes", {})
+    return f"📄 {attrs.get('displayName')} (v{attrs.get('versionNumber')})\nID: {tip_id}"
+
+@mcp.tool()
 def get_download_url(project_id: str, id: str) -> str:
     try:
         token = get_token()
@@ -278,6 +269,51 @@ def add_user_to_project(project_id: str, email: str, role: str = "project_member
         resp = requests.post(f"{BASE_URL_ACC}/admin/v1/projects/{c_id}/users", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=[{"email": email, "products": [{"key": "docs", "access": role}]}])
         return f"✅ Invited {email}." if resp.status_code in [200, 201] else f"❌ Error: {resp.text}"
     except Exception as e: return str(e)
+
+@mcp.tool()
+def get_data_connector_status(account_id: Optional[str] = None) -> str:
+    if not account_id:
+        hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(hubs, str) or not hubs.get("data"): return "No Hub found."
+        account_id = clean_id(hubs["data"][0]["id"])
+    data = make_api_request(f"https://developer.api.autodesk.com/data-connector/v1/accounts/{clean_id(account_id)}/requests")
+    if isinstance(data, str): return data
+    results = data.get("data", [])[:5]
+    if not results: return "No requests found."
+    output = "Data Connector Requests:\n"
+    for r in results: output += f"- {r.get('createdAt')}: {r.get('status')}\n"
+    return output
+
+@mcp.tool()
+def list_assets(project_id: str, limit: int = 10) -> str:
+    data = make_api_request(f"{BASE_URL_ACC}/assets/v2/projects/{clean_id(project_id)}/assets")
+    if isinstance(data, str): return data
+    output = "Assets:\n"
+    for a in data.get("results", [])[:limit]: output += f"- {a.get('clientAssetId')} | {a.get('status', {}).get('name')}\n"
+    return output
+
+@mcp.tool()
+def list_issues(project_id: str, limit: int = 10) -> str:
+    data = make_api_request(f"https://developer.api.autodesk.com/issues/v1/projects/{clean_id(project_id)}/issues")
+    if isinstance(data, str): return data
+    output = "Issues:\n"
+    results = data.get("results", []) if "results" in data else data.get("data", [])
+    for i in results[:limit]: output += f"- #{i.get('attributes', i).get('identifier')}: {i.get('attributes', i).get('title')}\n"
+    return output
+
+@mcp.tool()
+def get_account_projects_admin(account_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 10) -> str:
+    if not account_id:
+        hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(hubs, str) or not hubs.get("data"): return "No Hub found."
+        account_id = clean_id(hubs["data"][0]["id"])
+    data = make_api_request(f"{BASE_URL_ACC}/admin/v1/accounts/{clean_id(account_id)}/projects")
+    if isinstance(data, str): return data
+    results = data if isinstance(data, list) else data.get("results", [])
+    if name_filter: results = [p for p in results if name_filter.lower() in p.get("name", "").lower()]
+    output = f"Admin Projects ({len(results)}):\n"
+    for p in results[:limit]: output += f"- {p.get('name')} (ID: {p.get('id')})\n"
+    return output
 
 if __name__ == "__main__":
     print(f"Starting MCP Server on port {PORT}...")
