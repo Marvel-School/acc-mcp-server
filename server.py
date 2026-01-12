@@ -20,6 +20,7 @@ mcp = FastMCP("Autodesk ACC Agent")
 token_cache = {"access_token": None, "expires_at": 0}
 
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
+BASE_URL_HQ = "https://developer.api.autodesk.com/hq/v1" # NEW: Legacy HQ API for Deep Search
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # --- HELPER: AUTHENTICATION ---
@@ -70,24 +71,47 @@ def make_graphql_request(query: str, variables: Dict[str, Any] = None):
         return resp.json().get("data", {})
     except Exception as e: return f"GraphQL Exception: {str(e)}"
 
-# --- HELPER: SMART USER LOOKUP ---
+# --- HELPER: ROBUST USER SEARCH (FIXED) ---
 def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
-    """Search for a specific user by email using the API."""
+    """
+    Searches for a user ID by email.
+    Tries ACC Admin API first, then falls back to HQ (Legacy) API.
+    """
+    token = get_token()
+    c_id = clean_id(account_id)
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    # ATTEMPT 1: Modern ACC Admin API
     try:
-        token = get_token()
-        c_id = clean_id(account_id)
         url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
         params = {"filter[email]": email, "limit": 1}
+        resp = requests.get(url, headers=headers, params=params)
         
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
         if resp.status_code == 200:
             results = resp.json().get("results", [])
             if results:
-                user = results[0]
-                # Priority: Return the 'id' (Account Member ID), not 'autodeskId'
-                return user.get("id") 
+                print(f"User found in ACC API: {email}")
+                return results[0].get("id")
     except Exception as e:
-        print(f"Search Error for {email}: {e}")
+        print(f"ACC Search failed: {e}")
+
+    # ATTEMPT 2: Legacy/HQ Admin API (Source of Truth for Admins)
+    # This is often required for EU accounts or Account Admins.
+    try:
+        url_hq = f"{BASE_URL_HQ}/accounts/{c_id}/users"
+        # HQ API uses 'email' param, NOT 'filter[email]'
+        params_hq = {"email": email, "limit": 1}
+        resp_hq = requests.get(url_hq, headers=headers, params=params_hq)
+        
+        if resp_hq.status_code == 200:
+            results = resp_hq.json() # HQ returns list directly sometimes, or key
+            if isinstance(results, list) and results:
+                print(f"User found in HQ API: {email}")
+                # HQ API returns 'uid' or 'id'
+                return results[0].get("uid") or results[0].get("id")
+    except Exception as e:
+        print(f"HQ Search failed: {e}")
+        
     return None
 
 def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -> Optional[str]:
@@ -99,19 +123,10 @@ def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -
     if ACC_ADMIN_EMAIL:
         uid = get_user_id_by_email(account_id, ACC_ADMIN_EMAIL)
         if uid: return uid
-    # 3. Last Resort: Any Admin
-    try:
-        token = get_token()
-        url = f"{BASE_URL_ACC}/admin/v1/accounts/{clean_id(account_id)}/users"
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params={"limit": 20})
-        if resp.status_code == 200:
-            for u in resp.json().get("results", []):
-                if u.get("status") == "active": return u.get("id")
-    except: pass
     return None
 
 # ==========================================
-# TOOL: DEBUG PERMISSIONS (NEW)
+# TOOL: DEBUG PERMISSIONS
 # ==========================================
 
 @mcp.tool()
@@ -127,7 +142,6 @@ def debug_permissions(requester_email: str) -> str:
             output.append(f"❌ Hub List Failed: {hubs}")
             return "\n".join(output)
         
-        # Check specific EU Region Hubs
         hub_data = hubs.get("data", [])
         if not hub_data:
             output.append("❌ No Hubs found.")
@@ -143,35 +157,28 @@ def debug_permissions(requester_email: str) -> str:
     except Exception as e:
         return f"❌ Critical Error reading hubs: {str(e)}"
 
-    # 2. Check User Identity
-    token = get_token()
+    # 2. Check User Identity (Deep Search)
     user_id = get_user_id_by_email(acc_id, requester_email)
     
     if user_id:
         output.append(f"✅ User Found: ID `{user_id}`")
     else:
-        output.append(f"❌ User '{requester_email}' NOT FOUND in this account.")
-        output.append("   (Ensure email matches exactly in Account Admin > Members)")
+        output.append(f"❌ User '{requester_email}' NOT FOUND via API.")
+        output.append("   (Tried both ACC and HQ databases. Check exact spelling or region permissions.)")
         return "\n".join(output)
 
     # 3. Test Permission (Dry Run)
     try:
+        token = get_token()
         url = f"{BASE_URL_ACC}/admin/v1/accounts/{acc_id}/projects"
-        headers = {
-            "Authorization": f"Bearer {token}", 
-            "x-user-id": user_id
-        }
-        # Try to read 1 project to test admin access
+        headers = {"Authorization": f"Bearer {token}", "x-user-id": user_id}
         resp = requests.get(url, headers=headers, params={"limit": 1})
         
         if resp.status_code == 200:
             output.append("✅ **Authorization Success:** This user CAN access the Admin API.")
-            output.append("   If 'Create Project' fails, it might be the 'Project Type' or 'Payload'.")
         elif resp.status_code == 403:
             output.append("❌ **Permission Denied (403):**")
             output.append(f"   Raw Error: {resp.text}")
-            output.append("   -> Ensure 'Custom Integration' has 'Account Administration' access.")
-            output.append("   -> Ensure Client ID matches Azure Environment Variable.")
         else:
             output.append(f"❌ API Error {resp.status_code}: {resp.text}")
             
@@ -181,7 +188,7 @@ def debug_permissions(requester_email: str) -> str:
     return "\n".join(output)
 
 # ==========================================
-# TOOL: CREATE PROJECT (Fixed)
+# TOOL: CREATE PROJECT
 # ==========================================
 
 @mcp.tool()
@@ -194,31 +201,26 @@ def create_project(
     language: str = "en",
     timezone: str = "Europe/Amsterdam"
 ) -> str:
-    """
-    Creates a new project. 
-    IMPORTANT: 'requester_email' must be passed from Copilot context to verify identity.
-    """
+    """Creates a new project. Safe & Secure."""
     # 1. Auto-detect Account ID
     if not account_id:
         hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
         if isinstance(hubs, str) or not hubs.get("data"): return "Error: No Account/Hub found."
         account_id = clean_id(hubs["data"][0]["id"])
     
-    # 2. SMART LOOKUP
+    # 2. SMART LOOKUP (Deep Search)
     c_id = clean_id(account_id)
     acting_user_id = get_acting_user_id(c_id, requester_email)
     
     if not acting_user_id:
-        return "RAW_ERROR: Authorization Failed. I could not find a valid user ID for this email in ACC."
+        return "RAW_ERROR: Authorization Failed. I could not find a valid user ID for this email in ACC/HQ."
 
-    # Minimal Payload to avoid Validation Errors (Fixed)
     payload = {
         "name": project_name, 
-        "type": "production", # Standard fixed type
+        "type": "production",
         "currency": currency,
         "timezone": timezone, 
         "language": language
-        # Removed "projectType": project_type to prevent 400 Bad Request on custom types
     }
     
     try:
@@ -227,10 +229,8 @@ def create_project(
         resp = requests.post(f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects", headers=headers, json=payload)
         
         if resp.status_code in [200, 201]:
-            used_email = requester_email if requester_email else "Service Account"
-            return f"✅ Success! Project '{project_name}' created by **{used_email}** (ID: {resp.json().get('id')})."
+            return f"✅ Success! Project '{project_name}' created by **{requester_email}** (ID: {resp.json().get('id')})."
         else:
-            # Return RAW error so Copilot doesn't hide it
             return f"RAW_ERROR: {resp.status_code} - {resp.text}"
     except Exception as e: return f"RAW_ERROR: {str(e)}"
 
