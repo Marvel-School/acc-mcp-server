@@ -2,7 +2,6 @@ import os
 import time
 import requests
 from requests.auth import HTTPBasicAuth
-import traceback
 from urllib.parse import quote
 from fastmcp import FastMCP
 from typing import Optional, List, Dict, Any
@@ -10,18 +9,18 @@ from typing import Optional, List, Dict, Any
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
-# Fallback service account (Optional, set in Azure)
+# Fallback Admin Email (Optional, helps with "Admin" read permissions)
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL") 
 PORT = int(os.environ.get("PORT", 8000))
 
-# Initialize FastMCP
-mcp = FastMCP("Autodesk ACC Agent")
+# Initialize FastMCP (Read-Only Mode)
+mcp = FastMCP("Autodesk ACC Read-Only Agent")
 
 # Global token cache
 token_cache = {"access_token": None, "expires_at": 0}
 
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
-BASE_URL_HQ = "https://developer.api.autodesk.com/hq/v1" # Legacy HQ API for Deep Search
+BASE_URL_HQ = "https://developer.api.autodesk.com/hq/v1"
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # --- HELPER: AUTHENTICATION ---
@@ -35,7 +34,7 @@ def get_token():
 
     url = "https://developer.api.autodesk.com/authentication/v2/token"
     auth = HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
-    data = {"grant_type": "client_credentials", "scope": "data:read data:write account:read account:write bucket:read"}
+    data = {"grant_type": "client_credentials", "scope": "data:read account:read bucket:read"}
 
     resp = requests.post(url, auth=auth, data=data)
     resp.raise_for_status()
@@ -45,17 +44,20 @@ def get_token():
 
 # --- HELPER: UTILS ---
 def clean_id(id_str: str) -> str:
+    """Removes 'b.' prefix for APIs that don't want it."""
     return id_str.replace("b.", "") if id_str else ""
 
 def ensure_b_prefix(id_str: str) -> str:
+    """Adds 'b.' prefix for Data Management APIs."""
     if not id_str: return ""
     return id_str if id_str.startswith("b.") else f"b.{id_str}"
 
 def encode_urn(urn: str) -> str:
-    """Crucial for Folder IDs which contain special characters like ':'"""
+    """Safely encodes IDs with special characters (like :) for URLs."""
     return quote(urn, safe='') if urn else ""
 
 def make_api_request(url: str):
+    """Generic GET request with error handling."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
@@ -65,6 +67,7 @@ def make_api_request(url: str):
     except Exception as e: return f"Error: {str(e)}"
 
 def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None):
+    """Handles 3D Model queries."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -73,271 +76,206 @@ def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None)
         return resp.json().get("data", {})
     except Exception as e: return f"GraphQL Exception: {str(e)}"
 
-# --- HELPER: ROBUST USER SEARCH (Client-Side Filtering) ---
-def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
-    """Finds a user ID by pulling the user list and searching in Python."""
-    token = get_token()
-    c_id = clean_id(account_id)
-    headers = {"Authorization": f"Bearer {token}"}
-    target_email = email.lower().strip()
-    
-    # 1. Try HQ API (Legacy/Master DB)
-    try:
-        url_hq = f"{BASE_URL_HQ}/accounts/{c_id}/users"
-        resp_hq = requests.get(url_hq, headers=headers, params={"limit": 100})
-        if resp_hq.status_code == 200:
-            data = resp_hq.json()
-            user_list = data if isinstance(data, list) else data.get("results", [])
-            for u in user_list:
-                if u.get("email", "").lower().strip() == target_email:
-                    print(f"✅ Found user in HQ List: {target_email}")
-                    return u.get("uid") or u.get("id")
-    except Exception as e: print(f"HQ List Search failed: {e}")
-
-    # 2. Try ACC API (Modern DB)
-    try:
-        url = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
-        resp = requests.get(url, headers=headers, params={"limit": 100})
-        if resp.status_code == 200:
-            results = resp.json().get("results", [])
-            for u in results:
-                if u.get("email", "").lower().strip() == target_email:
-                    print(f"✅ Found user in ACC List: {target_email}")
-                    return u.get("id")
-    except Exception as e: print(f"ACC List Search failed: {e}")
-    return None
-
-def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -> Optional[str]:
-    if requester_email:
-        uid = get_user_id_by_email(account_id, requester_email)
-        if uid: return uid
-    if ACC_ADMIN_EMAIL:
-        uid = get_user_id_by_email(account_id, ACC_ADMIN_EMAIL)
-        if uid: return uid
-    return None
-
 # ==========================================
-# TOOL: DEBUG PERMISSIONS
+# DISCOVERY TOOLS (Finding Projects)
 # ==========================================
+
 @mcp.tool()
-def debug_permissions(requester_email: str) -> str:
-    """Run this to check why Project Creation is failing."""
-    output = [f"🔍 **Diagnostics for {requester_email}**"]
-    try:
-        hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
-        if isinstance(hubs, str): return f"❌ Hub List Failed: {hubs}"
-        
-        hub_data = hubs.get("data", [])
-        if not hub_data: return "❌ No Hubs found."
+def list_hubs() -> str:
+    """Step 1: Lists all Hubs/Accounts accessible to the bot."""
+    data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+    if isinstance(data, str): return data
+    
+    output = "🏢 **Found Hubs:**\n"
+    for h in data.get("data", []): 
+        output += f"- {h['attributes']['name']} (ID: {h['id']})\n"
+    return output
 
-        hub = hub_data[0]
-        acc_id = clean_id(hub["id"])
-        output.append(f"✅ Found Account: **{hub['attributes']['name']}** (ID: `{acc_id}`)")
-    except Exception as e: return f"❌ Critical Error reading hubs: {str(e)}"
-
-    user_id = get_user_id_by_email(acc_id, requester_email)
-    if user_id:
-        output.append(f"✅ User Found: ID `{user_id}`")
-    else:
-        output.append(f"❌ User '{requester_email}' NOT FOUND via API.")
-        return "\n".join(output)
-
-    try:
-        token = get_token()
-        url = f"{BASE_URL_ACC}/admin/v1/accounts/{acc_id}/projects"
-        headers = {"Authorization": f"Bearer {token}", "x-user-id": user_id}
-        resp = requests.get(url, headers=headers, params={"limit": 1})
-        if resp.status_code == 200: output.append("✅ **Authorization Success:** Admin API accessible.")
-        elif resp.status_code == 403: output.append(f"❌ **Permission Denied (403):** {resp.text}")
-        else: output.append(f"❌ API Error {resp.status_code}: {resp.text}")
-    except Exception as e: output.append(f"❌ Exception: {str(e)}")
-
-    return "\n".join(output)
-
-# ==========================================
-# TOOL: CREATE PROJECT
-# ==========================================
 @mcp.tool()
-def create_project(
-    project_name: str, 
-    requester_email: Optional[str] = None,
-    account_id: Optional[str] = None, 
-    project_type: str = "Renovation", 
-    currency: str = "EUR", 
-    language: str = "en",
-    timezone: str = "Europe/Amsterdam"
-) -> str:
-    """Creates a new project. Safe & Secure."""
-    if not account_id:
-        hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
-        if isinstance(hubs, str) or not hubs.get("data"): return "Error: No Account/Hub found."
-        account_id = clean_id(hubs["data"][0]["id"])
-    
-    c_id = clean_id(account_id)
-    acting_user_id = get_acting_user_id(c_id, requester_email)
-    
-    if not acting_user_id:
-        return (f"RAW_ERROR: Authorization Failed. Could not find user '{requester_email}' in account {c_id}.")
-
-    payload = {"name": project_name, "type": "production"}
-    
-    try:
-        token = get_token()
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "x-user-id": acting_user_id}
-        resp = requests.post(f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/projects", headers=headers, json=payload)
+def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 20) -> str:
+    """Step 2: Lists projects in a Hub. Optional: Filter by name."""
+    # Auto-detect Hub if missing
+    if not hub_id:
+        h = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(h, str) or not h.get("data"): return "Error: No Hubs found."
+        hub_id = h["data"][0]["id"]
         
-        if resp.status_code in [200, 201]:
-            return f"✅ Success! Project '{project_name}' created (ID: {resp.json().get('id')})."
-        else:
-            return f"RAW_ERROR: {resp.status_code} - {resp.text}"
-    except Exception as e: return f"RAW_ERROR: {str(e)}"
+    data = make_api_request(f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects")
+    if isinstance(data, str): return data
+    
+    # Filter and Limit
+    all_projs = data.get("data", [])
+    if name_filter:
+        all_projs = [p for p in all_projs if name_filter.lower() in p['attributes']['name'].lower()]
+    
+    output = f"📂 **Found {len(all_projs)} Projects:**\n"
+    for p in all_projs[:limit]: 
+        output += f"- **{p['attributes']['name']}**\n  ID: `{p['id']}`\n"
+    return output
 
 # ==========================================
-# FOLDER & FILE TOOLS (CRASH PROOF)
+# FILE & FOLDER TOOLS (Data Management)
 # ==========================================
 
 @mcp.tool()
 def get_top_folders(project_id: str) -> str:
-    """Lists root folders (Project Files, Plans) in a project."""
+    """Lists the root folders (Project Files / Plans)."""
+    # We need the hub ID to build the URL, so we fetch it first
     h = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
-    if isinstance(h, str) or not h.get("data"): return "Error: No Hubs found."
+    if isinstance(h, str) or not h.get("data"): return "Error: No Hubs."
     hub_id = h["data"][0]["id"]
     
     url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{ensure_b_prefix(project_id)}/topFolders"
     data = make_api_request(url)
+    if isinstance(data, str): return data
     
-    if isinstance(data, str): return f"API Error: {data}"
-    
-    try:
-        output = "📂 **Root Folders:**\n"
-        for i in data.get("data", []):
-            name = i.get("attributes", {}).get("displayName", "Unnamed")
-            output += f"- **{name}**\n  ID: `{i['id']}`\n"
-        return output
-    except Exception as e: return f"❌ Parsing Error: {str(e)}"
+    output = "root_folders:\n"
+    for i in data.get("data", []): 
+        output += f"- {i['attributes']['displayName']} (ID: {i['id']})\n"
+    return output
 
 @mcp.tool()
 def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> str:
-    """Lists files and folders inside a specific folder."""
-    # ENCODE ID: Crucial fix for 'SystemError'
-    safe_folder_id = encode_urn(folder_id)
-    safe_project_id = ensure_b_prefix(project_id)
+    """Lists files/folders inside a specific folder."""
+    # Critical: Encode the folder ID to prevent crashes
+    safe_folder = encode_urn(folder_id)
+    safe_proj = ensure_b_prefix(project_id)
     
-    url = f"https://developer.api.autodesk.com/data/v1/projects/{safe_project_id}/folders/{safe_folder_id}/contents"
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{safe_proj}/folders/{safe_folder}/contents"
     data = make_api_request(url)
-    
-    if isinstance(data, str): return f"API Error: {data}"
-    
-    try:
-        items = data.get("data", [])
-        if not items: return "📂 Folder is empty."
-        
-        output = f"📂 **Contents:**\n"
-        for i in items[:limit]:
-            name = i.get("attributes", {}).get("displayName", "Unnamed")
-            item_type = i.get("type", "unknown")
-            icon = "📁" if item_type == "folders" else "📄"
-            output += f"{icon} **{name}**\n  ID: `{i['id']}`\n"
-        return output
-    except Exception as e: return f"❌ Parsing Error: {str(e)}"
-
-# ==========================================
-# OTHER READ TOOLS
-# ==========================================
-
-@mcp.tool()
-def list_designs(project_id: str) -> str:
-    p_id = ensure_b_prefix(project_id)
-    query = """query GetElementGroupsByProject($projectId: ID!) { elementGroupsByProject(projectId: $projectId) { results { id name } } }"""
-    print(f"🔍 Searching designs in: {p_id}")
-    data = make_graphql_request(query, {"projectId": p_id})
-    
-    if not data or isinstance(data, str):
-        # Retry with clean ID
-        data = make_graphql_request(query, {"projectId": clean_id(project_id)})
-        
-    if not data or isinstance(data, str): return f"❌ Error: {data}"
-    
-    groups = data.get("elementGroupsByProject", {}).get("results", [])
-    if not groups: return "📂 No 3D designs found."
-    
-    output = f"🏗️ **Found {len(groups)} Designs:**\n"
-    for g in groups: output += f"- **{g.get('name')}**\n  ID: `{g.get('id')}`\n"
-    return output
-
-@mcp.tool()
-def get_model_viewer_link(project_id: str, urn: str) -> str:
-    return f"https://acc.autodesk.com/docs/files/projects/{clean_id(project_id)}?entityId={urn}"
-
-@mcp.tool()
-def list_hubs() -> str:
-    data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
     if isinstance(data, str): return data
-    output = "Found Hubs:\n"
-    for h in data.get("data", []): output += f"- {h['attributes']['name']} (ID: {h['id']})\n"
+    
+    items = data.get("data", [])
+    if not items: return "📂 Folder is empty."
+    
+    output = f"**Contents ({len(items)} items):**\n"
+    for i in items[:limit]:
+        name = i.get("attributes", {}).get("displayName", "Unnamed")
+        icon = "📁" if i["type"] == "folders" else "📄"
+        output += f"{icon} {name} (ID: `{i['id']}`)\n"
     return output
 
 @mcp.tool()
-def list_projects_dm(hub_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 10) -> str:
-    if not hub_id:
-        h = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
-        if isinstance(h, str) or not h.get("data"): return "No Hubs."
-        hub_id = h["data"][0]["id"]
-    data = make_api_request(f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects")
-    if isinstance(data, str): return data
-    projs = [p for p in data.get("data", []) if not name_filter or name_filter.lower() in p['attributes']['name'].lower()]
-    output = f"Found {len(projs)} projects:\n"
-    for p in projs[:limit]: output += f"- {p['attributes']['name']} (ID: {p['id']})\n"
-    return output
-
-@mcp.tool()
-def get_file_details(project_id: str, item_id: str) -> str:
-    token = get_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    p_id = ensure_b_prefix(project_id)
-    item_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(item_id)}"
-    resp = requests.get(item_url, headers=headers)
-    if resp.status_code != 200: return f"Error: {resp.status_code}"
-    try: tip_id = resp.json()["data"]["relationships"]["tip"]["data"]["id"]
-    except KeyError: return "Error: No active version."
-    return f"📄 Tip ID: {tip_id}"
-
-@mcp.tool()
-def get_download_url(project_id: str, id: str) -> str:
+def get_download_url(project_id: str, file_id: str) -> str:
+    """Generates a temporary download link for any file."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
-        # 1. Resolve Tip Version if needed
-        target = id
-        if "lineage" in id or "fs.file" in id:
-            r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(id)}", headers=headers)
-            if r.status_code == 200: target = r.json()["data"]["relationships"]["tip"]["data"]["id"]
-        # 2. Get Storage URN
-        r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encode_urn(target)}", headers=headers)
-        if r.status_code != 200: return f"Error: {r.text}"
-        parts = r.json()["data"]["relationships"]["storage"]["data"]["id"].split("/")
-        # 3. Get S3 Link
-        oss = f"https://developer.api.autodesk.com/oss/v2/buckets/{parts[-2].split(':')[-1]}/objects/{parts[-1]}/signeds3download"
-        r = requests.get(oss, headers=headers, params={"minutesExpiration": 60})
-        return f"⬇️ **[Click to Download]({r.json()['url']})**" if r.status_code == 200 else "Error."
+        
+        # 1. If it's a Lineage ID (File), get the Tip Version
+        target_version_id = file_id
+        if "lineage" in file_id or "fs.file" in file_id:
+            r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(file_id)}", headers=headers)
+            if r.status_code == 200: 
+                target_version_id = r.json()["data"]["relationships"]["tip"]["data"]["id"]
+        
+        # 2. Get the Storage Location (OSS URN)
+        r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encode_urn(target_version_id)}", headers=headers)
+        if r.status_code != 200: return f"Error finding file version: {r.text}"
+        
+        storage_urn = r.json()["data"]["relationships"]["storage"]["data"]["id"]
+        # Parse bucket and object key from: urn:adsk.objects:os.object:wip.dm.prod/123...
+        parts = storage_urn.split("/")
+        bucket_key = parts[-2].split(":")[-1]
+        object_key = parts[-1]
+        
+        # 3. Request Signed S3 URL
+        oss_url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_key}/objects/{object_key}/signeds3download"
+        r = requests.get(oss_url, headers=headers, params={"minutesExpiration": 60})
+        
+        if r.status_code == 200:
+            return f"⬇️ **[Click to Download File]({r.json()['url']})**"
+        return f"Error getting download link: {r.text}"
     except Exception as e: return str(e)
+
+# ==========================================
+# 3D MODEL TOOLS (AEC Data Model)
+# ==========================================
+
+@mcp.tool()
+def list_designs(project_id: str) -> str:
+    """Lists 3D Revit/IFC designs in a project."""
+    p_id = ensure_b_prefix(project_id)
+    query = """query GetElementGroups($projectId: ID!) { elementGroupsByProject(projectId: $projectId) { results { id name } } }"""
+    
+    # Try with 'b.' prefix
+    data = make_graphql_request(query, {"projectId": p_id})
+    
+    # Retry without 'b.' if needed
+    if not data or isinstance(data, str) or not data.get("elementGroupsByProject"):
+        data = make_graphql_request(query, {"projectId": clean_id(project_id)})
+
+    if isinstance(data, str): return data
+    
+    groups = data.get("elementGroupsByProject", {}).get("results", [])
+    if not groups: return "No 3D designs found."
+    
+    output = "🏗️ **Designs:**\n"
+    for g in groups: output += f"- **{g['name']}** (ID: `{g['id']}`)\n"
+    return output
+
+@mcp.tool()
+def get_model_viewer_link(project_id: str, design_id: str) -> str:
+    """Returns a direct link to view the model in ACC."""
+    # Note: entityId usually refers to the file URN, not the GraphQL ID, 
+    # but for simple viewing, linking to the project is often the safest start.
+    return f"https://acc.autodesk.com/docs/files/projects/{clean_id(project_id)}"
+
+# ==========================================
+# BUILD DATA TOOLS (Issues, Assets, Forms)
+# ==========================================
 
 @mcp.tool()
 def list_issues(project_id: str, limit: int = 10) -> str:
-    data = make_api_request(f"https://developer.api.autodesk.com/issues/v1/projects/{clean_id(project_id)}/issues")
+    """Lists construction issues (Open, Closed, etc)."""
+    url = f"https://developer.api.autodesk.com/issues/v1/projects/{clean_id(project_id)}/issues"
+    data = make_api_request(url)
     if isinstance(data, str): return data
-    output = "Issues:\n"
-    results = data.get("results", []) if "results" in data else data.get("data", [])
-    for i in results[:limit]: output += f"- #{i.get('attributes', i).get('identifier')}: {i.get('attributes', i).get('title')}\n"
+    
+    results = data.get("results", [])
+    if not results: return "No issues found."
+    
+    output = "🚧 **Project Issues:**\n"
+    for i in results[:limit]:
+        title = i.get("title", "No Title")
+        status = i.get("status", "unknown")
+        output += f"- #{i['identifier']} **{title}** ({status})\n"
     return output
 
 @mcp.tool()
 def list_assets(project_id: str, limit: int = 10) -> str:
-    data = make_api_request(f"{BASE_URL_ACC}/assets/v2/projects/{clean_id(project_id)}/assets")
+    """Lists assets (equipment, materials) in the project."""
+    url = f"https://developer.api.autodesk.com/construction/assets/v2/projects/{clean_id(project_id)}/assets"
+    data = make_api_request(url)
     if isinstance(data, str): return data
-    output = "Assets:\n"
-    for a in data.get("results", [])[:limit]: output += f"- {a.get('clientAssetId')} | {a.get('status', {}).get('name')}\n"
+    
+    results = data.get("results", [])
+    if not results: return "No assets found."
+    
+    output = "📦 **Project Assets:**\n"
+    for a in results[:limit]:
+        name = a.get("clientAssetId", "Unnamed Asset")
+        status = a.get("status", {}).get("name", "-")
+        output += f"- **{name}** (Status: {status})\n"
+    return output
+
+@mcp.tool()
+def get_data_connector_status(account_id: Optional[str] = None) -> str:
+    """Checks the status of Data Connector exports."""
+    if not account_id:
+        h = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+        if isinstance(h, str) or not h.get("data"): return "No Hub found."
+        account_id = h["data"][0]["id"]
+        
+    url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{clean_id(account_id)}/requests"
+    data = make_api_request(url)
+    if isinstance(data, str): return data
+    
+    results = data.get("data", [])[:5]
+    output = "📊 **Recent Data Exports:**\n"
+    for r in results:
+        output += f"- {r.get('createdAt')}: **{r.get('status')}**\n"
     return output
 
 if __name__ == "__main__":
