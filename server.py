@@ -190,19 +190,25 @@ def get_download_url(project_id: str, file_id: str) -> str:
     except Exception as e: return str(e)
 
 # ==========================================
-# 3D MODEL TOOLS (AEC Data Model)
+# 3D MODEL TOOLS (Unified Viewer & Search)
 # ==========================================
 
 @mcp.tool()
 def list_designs(project_id: str) -> str:
-    """Lists 3D Revit/IFC designs in a project."""
+    """Lists 3D designs (Revit/IFC) and their View IDs (URNs)."""
     p_id = ensure_b_prefix(project_id)
-    query = """query GetElementGroups($projectId: ID!) { elementGroupsByProject(projectId: $projectId) { results { id name } } }"""
+    # We explicitly ask for the 'fileVersionUrn' which works for deep linking
+    query = """query GetElementGroups($projectId: ID!) { 
+        elementGroupsByProject(projectId: $projectId) { 
+            results { 
+                id 
+                name 
+                alternativeIdentifiers { fileVersionUrn }
+            } 
+        } 
+    }"""
     
-    # Try with 'b.' prefix
     data = make_graphql_request(query, {"projectId": p_id})
-    
-    # Retry without 'b.' if needed
     if not data or isinstance(data, str) or not data.get("elementGroupsByProject"):
         data = make_graphql_request(query, {"projectId": clean_id(project_id)})
 
@@ -211,16 +217,69 @@ def list_designs(project_id: str) -> str:
     groups = data.get("elementGroupsByProject", {}).get("results", [])
     if not groups: return "No 3D designs found."
     
-    output = "🏗️ **Designs:**\n"
-    for g in groups: output += f"- **{g['name']}** (ID: `{g['id']}`)\n"
+    output = "🏗️ **Designs Found:**\n"
+    for g in groups:
+        # Prefer the URN (Deep Link ID), fall back to standard ID if missing
+        urn = g.get("alternativeIdentifiers", {}).get("fileVersionUrn", g['id'])
+        output += f"- **{g['name']}**\n  ID: `{urn}`\n" 
     return output
 
 @mcp.tool()
-def get_model_viewer_link(project_id: str, design_id: str) -> str:
-    """Returns a direct link to view the model in ACC."""
-    # Note: entityId usually refers to the file URN, not the GraphQL ID, 
-    # but for simple viewing, linking to the project is often the safest start.
-    return f"https://acc.autodesk.com/docs/files/projects/{clean_id(project_id)}"
+def get_model_viewer_link(project_id: str, item_id: str) -> str:
+    """Returns a direct link to view ANY file (.rvt, .rcp, .pdf, .dwg)."""
+    # The 'item_id' can be a Design URN or a File Version ID.
+    # The viewer URL format works for both.
+    return f"https://acc.autodesk.com/docs/files/projects/{clean_id(project_id)}?entityId={quote(item_id, safe='')}"
+
+@mcp.tool()
+def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
+    """Searches the entire project for model files (.rvt, .rcp, etc) and returns View Links."""
+    # 1. Get the 'Project Files' Root Folder ID
+    h = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+    if isinstance(h, str) or not h.get("data"): return "Error: No Hubs."
+    hub_id = h["data"][0]["id"]
+    
+    p_id = ensure_b_prefix(project_id)
+    top_folders_url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{p_id}/topFolders"
+    top_data = make_api_request(top_folders_url)
+    
+    if isinstance(top_data, str): return top_data
+    
+    # Find the "Project Files" folder (where models usually live)
+    proj_files_folder = next((f["id"] for f in top_data.get("data", []) if f["attributes"]["name"] == "Project Files"), None)
+    if not proj_files_folder: return "Error: Could not find 'Project Files' folder."
+
+    # 2. Search for files matching the extensions
+    # The Search API allows filtering by file type or name
+    output = f"🔍 **Searching for {file_types} in Project Files...**\n"
+    found_count = 0
+    
+    # We search specifically for the extensions provided
+    extensions = [ext.strip().lower() for ext in file_types.split(",")]
+    
+    # Note: ACC Search API is powerful but requires specific filters. 
+    # We will search for EVERYTHING in the folder and filter in Python to be safe/thorough.
+    # (Limit set to 50 to prevent timeouts)
+    search_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/folders/{proj_files_folder}/search?filter[extension.type]={','.join(extensions)}"
+    
+    search_results = make_api_request(search_url)
+    if isinstance(search_results, str): return search_results
+    
+    items = search_results.get("data", [])
+    if not items: return "❌ No models found matching those extensions."
+
+    for i in items:
+        name = i["attributes"]["displayName"]
+        # Double check extension (API sometimes fuzzy)
+        if any(name.lower().endswith(ext) for ext in extensions):
+            # We use the Version ID (i['id']) which works for the Viewer
+            urn = quote(i['id'], safe='')
+            viewer_link = f"https://acc.autodesk.com/docs/files/projects/{clean_id(project_id)}?entityId={urn}"
+            output += f"- **{name}**\n  [Open in Viewer]({viewer_link}) (ID: `{i['id']}`)\n"
+            found_count += 1
+            
+    if found_count == 0: return "❌ Found files, but none matched your extension filter."
+    return output
 
 # ==========================================
 # BUILD DATA TOOLS (Issues, Assets, Forms)
