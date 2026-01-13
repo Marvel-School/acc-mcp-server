@@ -1,6 +1,7 @@
 import os
 import time
 import requests
+from requests.auth import HTTPBasicAuth
 import traceback
 from urllib.parse import quote
 from fastmcp import FastMCP
@@ -33,7 +34,7 @@ def get_token():
         return token_cache["access_token"]
 
     url = "https://developer.api.autodesk.com/authentication/v2/token"
-    auth = requests.auth.HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
+    auth = HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
     data = {"grant_type": "client_credentials", "scope": "data:read data:write account:read account:write bucket:read"}
 
     resp = requests.post(url, auth=auth, data=data)
@@ -63,7 +64,7 @@ def make_api_request(url: str):
         return resp.json()
     except Exception as e: return f"Error: {str(e)}"
 
-def make_graphql_request(query: str, variables: Dict[str, Any] = None):
+def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None):
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
