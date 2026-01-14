@@ -282,6 +282,141 @@ def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
     return output
 
 # ==========================================
+# AEC DATA MODEL TOOLS (Granular Data)
+# ==========================================
+
+@mcp.tool()
+def query_model_elements(design_id: str, category: str, limit: int = 20) -> str:
+    """
+    Counts and lists specific elements (Walls, Doors, Windows) inside a 3D Model.
+    Args:
+        design_id: The ID of the design (get this from list_designs).
+        category: The Revit Category (e.g., "Walls", "Doors", "Windows", "Floors").
+    """
+    # GraphQL Query to find elements by Category
+    # We use a filter to only get items where property.name.category == Your Input
+    query = """
+    query GetElementsByCategory($elementGroupId: ID!, $filter: String!) {
+        elementsByElementGroup(
+            elementGroupId: $elementGroupId, 
+            filter: {query: $filter}
+            pagination: {limit: 50}
+        ) {
+            pagination { totalResults }
+            results {
+                id
+                name
+                properties {
+                    results {
+                        name
+                        value
+                    }
+                }
+            }
+        }
+    }
+    """
+    
+    # Construct the RSQL Filter string
+    # "property.name.category" is a standard indexed field in AEC Data Model
+    rsql_filter = f"property.name.category=='{category}'"
+    
+    print(f"🔍 Querying elements in {design_id} with filter: {rsql_filter}")
+    
+    data = make_graphql_request(query, {
+        "elementGroupId": clean_id(design_id), # Ensure no 'b.' prefix if strictly ID
+        "filter": rsql_filter
+    })
+    
+    if isinstance(data, str): return f"Error: {data}"
+    
+    container = data.get("elementsByElementGroup", {})
+    total_count = container.get("pagination", {}).get("totalResults", "Unknown")
+    elements = container.get("results", [])
+    
+    if not elements:
+        return f"🧱 **No '{category}' found** in this design.\n(Make sure the design is published to the AEC Data Model)."
+    
+    output = f"🧱 **Found {total_count} {category}:**\n"
+    output += f"(Showing first {len(elements[:limit])})\n\n"
+    
+    for el in elements[:limit]:
+        # Try to find specific useful properties (like Level or Area) to display
+        props = el.get("properties", {}).get("results", [])
+        
+        # Simple helper to find a property value by name
+        def get_prop(name):
+            return next((p["value"] for p in props if p["name"] == name), "-")
+            
+        level = get_prop("Level")
+        output += f"- **{el['name']}**\n"
+        output += f"  ID: `{el['id']}` | Level: {level}\n"
+        
+    return output
+
+@mcp.tool()
+def get_element_properties(element_id: str) -> str:
+    """
+    Retrieves all properties (Dimensions, Materials, Constraints) for a specific Element ID.
+    Args:
+        element_id: The long ID of the specific element (from query_model_elements).
+    """
+    query = """
+    query GetElementProperties($elementId: ID!) {
+        element(elementId: $elementId) {
+            id
+            name
+            properties {
+                results {
+                    name
+                    value
+                    definition { units }
+                }
+            }
+        }
+    }
+    """
+    
+    data = make_graphql_request(query, {"elementId": element_id})
+    if isinstance(data, str): return f"Error: {data}"
+    
+    el = data.get("element")
+    if not el: return "❌ Element not found."
+    
+    props = el.get("properties", {}).get("results", [])
+    
+    output = f"📋 **Properties for {el['name']}:**\n"
+    
+    # Grouping key properties for readability
+    dimensions = []
+    identity = []
+    other = []
+    
+    for p in props:
+        name = p['name']
+        val = str(p['value'])
+        unit = p.get('definition', {}).get('units', '')
+        
+        # Simple categorization
+        entry = f"- **{name}**: {val} {unit}".strip()
+        
+        if any(x in name.lower() for x in ['area', 'volume', 'height', 'width', 'length']):
+            dimensions.append(entry)
+        elif any(x in name.lower() for x in ['type', 'family', 'id']):
+            identity.append(entry)
+        else:
+            other.append(entry)
+            
+    if dimensions:
+        output += "\n**📏 Dimensions:**\n" + "\n".join(dimensions) + "\n"
+    if identity:
+        output += "\n**🆔 Identity:**\n" + "\n".join(identity) + "\n"
+    
+    output += "\n**Other Data:**\n" + "\n".join(other[:10]) # Limit to avoid spamming
+    
+    return output
+
+# ==========================================
 # BUILD DATA TOOLS (Issues, Assets, Forms)
 # ==========================================
 
