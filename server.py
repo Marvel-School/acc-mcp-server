@@ -441,10 +441,16 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
 # ==========================================
 
 @mcp.tool()
-def create_project(project_name: str, project_type: str = "Commercial") -> str:
+def create_project(
+    project_name: str, 
+    project_type: str = "Commercial",
+    city: str = "Amsterdam",
+    country: str = "Netherlands",
+    job_number: str = ""
+) -> str:
     """
-    Creates a new project in the ACC Account.
-    Includes ALL mandatory fields (Address, Dates, Job Number) to prevent 400 errors.
+    Creates a new project. 
+    Accepts specific details (City, Country, Job Number) to satisfy strict API requirements.
     """
     # 1. Get Authentication
     try:
@@ -466,12 +472,13 @@ def create_project(project_name: str, project_type: str = "Commercial") -> str:
         "Content-Type": "application/json"
     }
 
-    # 4. Generate Mandatory Data
+    # 4. Generate Data
     today = datetime.now()
     next_year = today + timedelta(days=365)
     
-    # Generate a random-ish job number to ensure uniqueness
-    job_num = f"JN-{int(time.time())}"
+    # If no job number provided, generate a unique one
+    if not job_number:
+        job_number = f"JN-{int(time.time())}"
 
     payload = {
         "name": project_name,
@@ -482,24 +489,23 @@ def create_project(project_name: str, project_type: str = "Commercial") -> str:
         "currency": "EUR",              
         "timezone": "Europe/Amsterdam", 
         "language": "en",
-        "job_number": job_num,          # Often required
-        "address_line_1": "Main Street 1", # REQUIRED by API
-        "city": "Amsterdam",               # REQUIRED by API
-        "postal_code": "1000AA",           # REQUIRED by API
-        "country": "Netherlands"           # REQUIRED by API
+        "job_number": job_number,
+        "address_line_1": "Main Street 1", # Generic placeholder
+        "city": city,                      # Uses User Input
+        "postal_code": "1000AA",           
+        "country": country                 # Uses User Input
     }
 
-    print(f"🚀 Creating Project '{project_name}' with full payload...")
+    print(f"🚀 Creating Project '{project_name}' in {city}, {country}...")
     
     response = requests.post(url, headers=headers, json=payload)
 
     if response.status_code == 201:
         new_id = response.json().get("id")
-        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nJob #: {job_num}"
+        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nJob #: {job_number}"
     elif response.status_code == 409:
         return f"⚠️ A project with the name '{project_name}' already exists."
     else:
-        # If it fails, we show the EXACT error message from Autodesk
         return f"❌ Failed to create project. (Status: {response.status_code})\nError Details: {response.text}"
 
 if __name__ == "__main__":
