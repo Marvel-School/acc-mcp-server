@@ -442,13 +442,15 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
 # ADMIN TOOLS (Write Access - EU Compatible)
 # ==========================================
 
+from datetime import datetime, timedelta 
+
+# ... [Keep the rest of your code same until the create_project tool] ...
+
 @mcp.tool()
-def create_project(project_name: str, project_type: str = "Construction") -> str:
+def create_project(project_name: str, project_type: str = "Commercial") -> str:
     """
     Creates a new project in the ACC Account.
-    Args:
-        project_name: The name of the new project.
-        project_type: (Optional) Type of project (e.g., "Commercial", "Residential").
+    Automatically handles mandatory dates (Today -> +1 Year).
     """
     # 1. Get Authentication
     try:
@@ -456,12 +458,12 @@ def create_project(project_name: str, project_type: str = "Construction") -> str
     except Exception as e:
         return f"❌ Auth Error: {e}"
 
-    # 2. Get Account ID (Hub ID)
+    # 2. Get Account ID
     raw_hub_id = get_cached_hub_id()
     if not raw_hub_id: return "❌ Error: Could not find Hub/Account ID."
     account_id = clean_id(raw_hub_id) 
 
-    # 3. Determine Region URL (Forces EU for your known context)
+    # 3. Determine Region URL (Force EU)
     base_url = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts"
     url = f"{base_url}/{account_id}/projects"
 
@@ -470,27 +472,33 @@ def create_project(project_name: str, project_type: str = "Construction") -> str
         "Content-Type": "application/json"
     }
 
+    # 4. Generate Mandatory Dates 
+    today = datetime.now()
+    next_year = today + timedelta(days=365)
+
     payload = {
         "name": project_name,
         "service_types": "doc_manager", # Auto-activate Docs
-        "type": project_type,
-        "value": project_type, 
+        "type": project_type,           # e.g. "Commercial", "Residential"
+        "start_date": today.strftime("%Y-%m-%d"),
+        "end_date": next_year.strftime("%Y-%m-%d"),
         "currency": "EUR",              
         "timezone": "Europe/Amsterdam", 
         "language": "en"
     }
 
-    print(f"🚀 Creating Project '{project_name}' in EU Region...")
+    print(f"🚀 Creating Project '{project_name}' (EU)...")
     
     response = requests.post(url, headers=headers, json=payload)
 
     if response.status_code == 201:
         new_id = response.json().get("id")
-        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\n(Note: It may take a minute to appear in lists)."
+        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nStart: {payload['start_date']}\nEnd: {payload['end_date']}"
     elif response.status_code == 409:
         return f"⚠️ A project with the name '{project_name}' already exists."
     else:
-        return f"❌ Failed to create project. (Status: {response.status_code})\nResponse: {response.text}"
+        # Print the full error so we see exactly what Autodesk is complaining about
+        return f"❌ Failed to create project. (Status: {response.status_code})\nError: {response.text}"
 
 if __name__ == "__main__":
     print(f"Starting MCP Server on port {PORT}...")
