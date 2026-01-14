@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import base64
+from datetime import datetime, timedelta
 from requests.auth import HTTPBasicAuth
 from urllib.parse import quote
 from fastmcp import FastMCP
@@ -10,7 +11,6 @@ from typing import Optional, List, Dict, Any
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
-# Fallback Admin Email (Optional, helps with "Admin" read permissions)
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL") 
 PORT = int(os.environ.get("PORT", 8000))
 
@@ -18,7 +18,6 @@ PORT = int(os.environ.get("PORT", 8000))
 mcp = FastMCP("Autodesk ACC Agent")
 
 # Global Cache (Token + Hub ID)
-# We store the Hub ID so we don't have to ask for it every single command.
 global_cache = {
     "access_token": None, 
     "expires_at": 0,
@@ -54,7 +53,6 @@ def get_cached_hub_id():
     if global_cache["hub_id"]:
         return global_cache["hub_id"]
         
-    # If not cached, fetch it
     data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
     if isinstance(data, dict) and data.get("data"):
         hub_id = data["data"][0]["id"]
@@ -62,7 +60,7 @@ def get_cached_hub_id():
         return hub_id
     return None
 
-# --- HELPER: UTILS (Fixed Type Hints) ---
+# --- HELPER: UTILS ---
 def clean_id(id_str: Optional[str]) -> str:
     """Removes 'b.' prefix. Safely handles None."""
     return id_str.replace("b.", "") if id_str else ""
@@ -442,15 +440,11 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
 # ADMIN TOOLS (Write Access - EU Compatible)
 # ==========================================
 
-from datetime import datetime, timedelta 
-
-# ... [Keep the rest of your code same until the create_project tool] ...
-
 @mcp.tool()
 def create_project(project_name: str, project_type: str = "Commercial") -> str:
     """
     Creates a new project in the ACC Account.
-    Automatically handles mandatory dates (Today -> +1 Year).
+    Includes ALL mandatory fields (Address, Dates, Job Number) to prevent 400 errors.
     """
     # 1. Get Authentication
     try:
@@ -472,33 +466,41 @@ def create_project(project_name: str, project_type: str = "Commercial") -> str:
         "Content-Type": "application/json"
     }
 
-    # 4. Generate Mandatory Dates 
+    # 4. Generate Mandatory Data
     today = datetime.now()
     next_year = today + timedelta(days=365)
+    
+    # Generate a random-ish job number to ensure uniqueness
+    job_num = f"JN-{int(time.time())}"
 
     payload = {
         "name": project_name,
-        "service_types": "doc_manager", # Auto-activate Docs
-        "type": project_type,           # e.g. "Commercial", "Residential"
+        "service_types": "doc_manager", 
+        "type": project_type,           
         "start_date": today.strftime("%Y-%m-%d"),
         "end_date": next_year.strftime("%Y-%m-%d"),
         "currency": "EUR",              
         "timezone": "Europe/Amsterdam", 
-        "language": "en"
+        "language": "en",
+        "job_number": job_num,          # Often required
+        "address_line_1": "Main Street 1", # REQUIRED by API
+        "city": "Amsterdam",               # REQUIRED by API
+        "postal_code": "1000AA",           # REQUIRED by API
+        "country": "Netherlands"           # REQUIRED by API
     }
 
-    print(f"🚀 Creating Project '{project_name}' (EU)...")
+    print(f"🚀 Creating Project '{project_name}' with full payload...")
     
     response = requests.post(url, headers=headers, json=payload)
 
     if response.status_code == 201:
         new_id = response.json().get("id")
-        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nStart: {payload['start_date']}\nEnd: {payload['end_date']}"
+        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nJob #: {job_num}"
     elif response.status_code == 409:
         return f"⚠️ A project with the name '{project_name}' already exists."
     else:
-        # Print the full error so we see exactly what Autodesk is complaining about
-        return f"❌ Failed to create project. (Status: {response.status_code})\nError: {response.text}"
+        # If it fails, we show the EXACT error message from Autodesk
+        return f"❌ Failed to create project. (Status: {response.status_code})\nError Details: {response.text}"
 
 if __name__ == "__main__":
     print(f"Starting MCP Server on port {PORT}...")
