@@ -216,18 +216,26 @@ def list_designs(project_id: str) -> str:
     }"""
     
     data = make_graphql_request(query, {"projectId": p_id})
+    
+    # Retry Logic: If data is missing or the specific field is Null, try the other ID format
+    # We use (data.get(...) or {}) to treat 'None' as an empty dict
     if not data or isinstance(data, str) or not data.get("elementGroupsByProject"):
         data = make_graphql_request(query, {"projectId": clean_id(project_id)})
 
     if isinstance(data, str): return data
     
-    groups = data.get("elementGroupsByProject", {}).get("results", [])
+    # CRASH FIX: Explicitly handle if the API returns 'null' for the container
+    container = data.get("elementGroupsByProject") or {}
+    groups = container.get("results", [])
+    
     if not groups: return "No 3D designs found."
     
     output = "🏗️ **Designs Found:**\n"
     for g in groups:
-        # Prefer the URN (Deep Link ID), fall back to standard ID if missing
-        urn = g.get("alternativeIdentifiers", {}).get("fileVersionUrn", g['id'])
+        # CRASH FIX: Safely handle if 'alternativeIdentifiers' is null
+        identifiers = g.get("alternativeIdentifiers") or {}
+        urn = identifiers.get("fileVersionUrn", g['id'])
+        
         output += f"- **{g['name']}**\n  ID: `{urn}`\n" 
     return output
 
