@@ -10,13 +10,15 @@ from typing import Optional, List, Dict, Any
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
+# Fallback Admin Email (Optional, helps with "Admin" read permissions)
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL") 
 PORT = int(os.environ.get("PORT", 8000))
 
-# Initialize FastMCP (Read-Only Mode)
-mcp = FastMCP("Autodesk ACC Read-Only Agent")
+# Initialize FastMCP
+mcp = FastMCP("Autodesk ACC Agent")
 
 # Global Cache (Token + Hub ID)
+# We store the Hub ID so we don't have to ask for it every single command.
 global_cache = {
     "access_token": None, 
     "expires_at": 0,
@@ -36,7 +38,9 @@ def get_token():
 
     url = "https://developer.api.autodesk.com/authentication/v2/token"
     auth = HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
-    data = {"grant_type": "client_credentials", "scope": "data:read account:read bucket:read"}
+    
+    # UPDATED: Added 'account:write' to scope for creating projects
+    data = {"grant_type": "client_credentials", "scope": "data:read account:read bucket:read account:write"}
 
     resp = requests.post(url, auth=auth, data=data)
     resp.raise_for_status()
@@ -50,6 +54,7 @@ def get_cached_hub_id():
     if global_cache["hub_id"]:
         return global_cache["hub_id"]
         
+    # If not cached, fetch it
     data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
     if isinstance(data, dict) and data.get("data"):
         hub_id = data["data"][0]["id"]
@@ -57,23 +62,28 @@ def get_cached_hub_id():
         return hub_id
     return None
 
-# --- HELPER: UTILS ---
+# --- HELPER: UTILS (Fixed Type Hints) ---
 def clean_id(id_str: Optional[str]) -> str:
+    """Removes 'b.' prefix. Safely handles None."""
     return id_str.replace("b.", "") if id_str else ""
 
 def ensure_b_prefix(id_str: Optional[str]) -> str:
+    """Adds 'b.' prefix. Safely handles None."""
     if not id_str: return ""
     return id_str if id_str.startswith("b.") else f"b.{id_str}"
 
 def encode_urn(urn: Optional[str]) -> str:
+    """Safely encodes IDs for URLs."""
     return quote(urn, safe='') if urn else ""
 
 def safe_b64encode(value: Optional[str]) -> str:
+    """Helper to create URNs for the Model Derivative API."""
     if not value: return ""
     encoded = base64.urlsafe_b64encode(value.encode("utf-8")).decode("utf-8")
     return encoded.rstrip("=")
 
 def make_api_request(url: str):
+    """Generic GET request with error handling."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
@@ -83,16 +93,22 @@ def make_api_request(url: str):
     except Exception as e: return f"Error: {str(e)}"
 
 def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None):
+    """Handles 3D Model queries with Null Safety."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         resp = requests.post(BASE_URL_GRAPHQL, headers=headers, json={"query": query, "variables": variables or {}})
-        if resp.status_code != 200: return f"GraphQL Error {resp.status_code}: {resp.text}"
+        
+        if resp.status_code != 200: 
+            return f"GraphQL Error {resp.status_code}: {resp.text}"
+        # FIX: Explicitly handle if 'data' is null
         return resp.json().get("data") or {} 
     except Exception as e: return f"GraphQL Exception: {str(e)}"
 
 def get_viewer_domain(urn: str) -> str:
-    if "wipemea" in urn or "emea" in urn: return "acc.autodesk.eu"
+    """Detects if project is EU or US based on the URN."""
+    if "wipemea" in urn or "emea" in urn:
+        return "acc.autodesk.eu"
     return "acc.autodesk.com"
 
 def search_for_file_id(project_id: str, file_name: str) -> Optional[str]:
@@ -167,6 +183,7 @@ def resolve_to_version_id(project_id: str, item_id: str) -> str:
 
 @mcp.tool()
 def list_hubs() -> str:
+    """Step 1: Lists all Hubs/Accounts accessible to the bot."""
     data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
     if isinstance(data, str): return data
     output = "🏢 **Found Hubs:**\n"
@@ -175,6 +192,7 @@ def list_hubs() -> str:
 
 @mcp.tool()
 def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 20) -> str:
+    """Step 2: Lists projects in a Hub. Optional: Filter by name."""
     if not hub_id:
         hub_id = get_cached_hub_id()
         if not hub_id: return "Error: No Hubs found."
@@ -197,6 +215,7 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
 
 @mcp.tool()
 def get_top_folders(project_id: str) -> str:
+    """Lists the root folders (Project Files / Plans)."""
     hub_id = get_cached_hub_id()
     if not hub_id: return "Error: No Hubs."
     
@@ -211,13 +230,17 @@ def get_top_folders(project_id: str) -> str:
 
 @mcp.tool()
 def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> str:
+    """Lists files/folders inside a specific folder."""
     safe_folder = encode_urn(folder_id)
     safe_proj = ensure_b_prefix(project_id)
+    
     url = f"https://developer.api.autodesk.com/data/v1/projects/{safe_proj}/folders/{safe_folder}/contents"
     data = make_api_request(url)
     if isinstance(data, str): return data
+    
     items = data.get("data", [])
     if not items: return "📂 Folder is empty."
+    
     output = f"**Contents ({len(items)} items):**\n"
     for i in items[:limit]:
         name = i.get("attributes", {}).get("displayName", "Unnamed")
@@ -227,10 +250,13 @@ def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> st
 
 @mcp.tool()
 def get_download_url(project_id: str, file_id: str) -> str:
+    """Generates a temporary download link for any file."""
     try:
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
+        
+        # Resolve to Version ID first
         target_version_id = resolve_to_version_id(project_id, file_id)
         
         r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encode_urn(target_version_id)}", headers=headers)
@@ -242,25 +268,32 @@ def get_download_url(project_id: str, file_id: str) -> str:
         
         oss_url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_key}/objects/{object_key}/signeds3download"
         r = requests.get(oss_url, headers=headers, params={"minutesExpiration": 60})
+        
         return f"⬇️ **[Click to Download File]({r.json()['url']})**" if r.status_code == 200 else f"Error: {r.text}"
     except Exception as e: return str(e)
 
 # ==========================================
-# 3D MODEL TOOLS
+# 3D MODEL TOOLS (Robust & Universal)
 # ==========================================
 
 @mcp.tool()
 def list_designs(project_id: str) -> str:
+    """Lists 3D designs (Revit/IFC) and their View IDs (URNs)."""
     p_id = ensure_b_prefix(project_id)
     query = """query GetElementGroups($projectId: ID!) { 
         elementGroupsByProject(projectId: $projectId) { 
             results { id name alternativeIdentifiers { fileVersionUrn } } 
         } 
     }"""
+    
     data = make_graphql_request(query, {"projectId": p_id})
+    
+    # Retry Logic: Split into two checks for Pylance safety
     should_retry = False
-    if not data or isinstance(data, str): should_retry = True
-    elif isinstance(data, dict) and not data.get("elementGroupsByProject"): should_retry = True
+    if not data or isinstance(data, str):
+        should_retry = True
+    elif isinstance(data, dict) and not data.get("elementGroupsByProject"):
+        should_retry = True
 
     if should_retry:
         data = make_graphql_request(query, {"projectId": clean_id(project_id)})
@@ -270,6 +303,7 @@ def list_designs(project_id: str) -> str:
 
     container = data.get("elementGroupsByProject") or {}
     groups = container.get("results", [])
+    
     if not groups: return "No 3D designs found (Check 'Project Files' using find_models instead)."
     
     output = "🏗️ **Designs Found:**\n"
@@ -281,12 +315,17 @@ def list_designs(project_id: str) -> str:
 
 @mcp.tool()
 def get_model_viewer_link(project_id: str, item_id: str) -> str:
+    """Returns a direct link to view ANY file (.rvt, .rcp, .pdf, .dwg)."""
+    # 1. Resolve Lineage ID -> Version ID (Fixes broken links)
     version_id = resolve_to_version_id(project_id, item_id)
+    
+    # 2. Check region based on URN
     domain = get_viewer_domain(version_id)
     return f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(version_id, safe='')}"
 
 @mcp.tool()
 def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
+    """Searches the entire project for model files and returns View Links."""
     hub_id = get_cached_hub_id()
     if not hub_id: return "Error: No Hubs."
     p_id = ensure_b_prefix(project_id)
@@ -344,7 +383,9 @@ def get_model_tree(project_id: str, file_id: str) -> str:
     if not data: return "❌ No 3D views found."
     guid = data[0]["guid"]
     
-    resp_tree = requests.get(f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn}/metadata/{guid}", headers=headers, params={"forceget": "true"})
+    # 3. Get the Actual Tree
+    tree_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn}/metadata/{guid}"
+    resp_tree = requests.get(tree_url, headers=headers, params={"forceget": "true"})
     
     if resp_tree.status_code == 202:
         return "⏳ The Model Tree is currently processing. Please try again in 1 minute."
@@ -396,6 +437,60 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
     output = "📊 **Recent Data Exports:**\n"
     for r in data.get("data", [])[:5]: output += f"- {r.get('createdAt')}: **{r.get('status')}**\n"
     return output
+
+# ==========================================
+# ADMIN TOOLS (Write Access - EU Compatible)
+# ==========================================
+
+@mcp.tool()
+def create_project(project_name: str, project_type: str = "Construction") -> str:
+    """
+    Creates a new project in the ACC Account.
+    Args:
+        project_name: The name of the new project.
+        project_type: (Optional) Type of project (e.g., "Commercial", "Residential").
+    """
+    # 1. Get Authentication
+    try:
+        token = get_token() 
+    except Exception as e:
+        return f"❌ Auth Error: {e}"
+
+    # 2. Get Account ID (Hub ID)
+    raw_hub_id = get_cached_hub_id()
+    if not raw_hub_id: return "❌ Error: Could not find Hub/Account ID."
+    account_id = clean_id(raw_hub_id) 
+
+    # 3. Determine Region URL (Forces EU for your known context)
+    base_url = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts"
+    url = f"{base_url}/{account_id}/projects"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "name": project_name,
+        "service_types": "doc_manager", # Auto-activate Docs
+        "type": project_type,
+        "value": project_type, 
+        "currency": "EUR",              
+        "timezone": "Europe/Amsterdam", 
+        "language": "en"
+    }
+
+    print(f"🚀 Creating Project '{project_name}' in EU Region...")
+    
+    response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code == 201:
+        new_id = response.json().get("id")
+        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\n(Note: It may take a minute to appear in lists)."
+    elif response.status_code == 409:
+        return f"⚠️ A project with the name '{project_name}' already exists."
+    else:
+        return f"❌ Failed to create project. (Status: {response.status_code})\nResponse: {response.text}"
 
 if __name__ == "__main__":
     print(f"Starting MCP Server on port {PORT}...")
