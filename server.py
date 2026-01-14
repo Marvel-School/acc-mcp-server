@@ -20,8 +20,6 @@ mcp = FastMCP("Autodesk ACC Read-Only Agent")
 # Global token cache
 token_cache = {"access_token": None, "expires_at": 0}
 
-BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
-BASE_URL_HQ = "https://developer.api.autodesk.com/hq/v1"
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # --- HELPER: AUTHENTICATION ---
@@ -43,18 +41,18 @@ def get_token():
     token_cache["expires_at"] = time.time() + resp.json()["expires_in"] - 60
     return token_cache["access_token"]
 
-# --- HELPER: UTILS (Fixed Type Hints for Pylance) ---
+# --- HELPER: UTILS (Fixed Type Hints & Region Logic) ---
 def clean_id(id_str: Optional[str]) -> str:
-    """Removes 'b.' prefix for APIs that don't want it. Safely handles None."""
+    """Removes 'b.' prefix. Safely handles None."""
     return id_str.replace("b.", "") if id_str else ""
 
 def ensure_b_prefix(id_str: Optional[str]) -> str:
-    """Adds 'b.' prefix for Data Management APIs. Safely handles None."""
+    """Adds 'b.' prefix. Safely handles None."""
     if not id_str: return ""
     return id_str if id_str.startswith("b.") else f"b.{id_str}"
 
 def encode_urn(urn: Optional[str]) -> str:
-    """Safely encodes IDs with special characters (like :) for URLs."""
+    """Safely encodes IDs for URLs."""
     return quote(urn, safe='') if urn else ""
 
 def safe_b64encode(value: Optional[str]) -> str:
@@ -83,13 +81,19 @@ def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None)
         if resp.status_code != 200: 
             return f"GraphQL Error {resp.status_code}: {resp.text}"
             
-        # FIX: Explicitly handle if 'data' is null (prevents NoneType crash)
+        # FIX: Explicitly handle if 'data' is null
         return resp.json().get("data") or {} 
         
     except Exception as e: return f"GraphQL Exception: {str(e)}"
 
+def get_viewer_domain(urn: str) -> str:
+    """Detects if project is EU or US based on the URN."""
+    if "wipemea" in urn or "emea" in urn:
+        return "acc.autodesk.eu"
+    return "acc.autodesk.com"
+
 # ==========================================
-# DISCOVERY TOOLS (Finding Projects)
+# DISCOVERY TOOLS
 # ==========================================
 
 @mcp.tool()
@@ -97,10 +101,8 @@ def list_hubs() -> str:
     """Step 1: Lists all Hubs/Accounts accessible to the bot."""
     data = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
     if isinstance(data, str): return data
-    
     output = "🏢 **Found Hubs:**\n"
-    for h in data.get("data", []): 
-        output += f"- {h['attributes']['name']} (ID: {h['id']})\n"
+    for h in data.get("data", []): output += f"- {h['attributes']['name']} (ID: {h['id']})\n"
     return output
 
 @mcp.tool()
@@ -124,7 +126,7 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
     return output
 
 # ==========================================
-# FILE & FOLDER TOOLS (Data Management)
+# FILE & FOLDER TOOLS
 # ==========================================
 
 @mcp.tool()
@@ -190,7 +192,7 @@ def get_download_url(project_id: str, file_id: str) -> str:
     except Exception as e: return str(e)
 
 # ==========================================
-# 3D MODEL TOOLS (CRASH-PROOF)
+# 3D MODEL TOOLS (SMART REGION DETECTION)
 # ==========================================
 
 @mcp.tool()
@@ -205,13 +207,10 @@ def list_designs(project_id: str) -> str:
     
     data = make_graphql_request(query, {"projectId": p_id})
     
-    # Retry Logic: Split into two checks to prevent Pylance confusion
+    # Retry Logic: Split into two checks for Pylance safety
     should_retry = False
-    
-    # Check 1: Is it empty or an Error String?
     if not data or isinstance(data, str):
         should_retry = True
-    # Check 2: Is it a Dictionary but missing the key we need?
     elif isinstance(data, dict) and not data.get("elementGroupsByProject"):
         should_retry = True
 
@@ -221,7 +220,6 @@ def list_designs(project_id: str) -> str:
     if isinstance(data, str): return data
     if not data: return "❌ No design data returned."
 
-    # FIX: Explicit check to prevent 'NoneType' crash
     container = data.get("elementGroupsByProject") or {}
     groups = container.get("results", [])
     
@@ -237,11 +235,13 @@ def list_designs(project_id: str) -> str:
 @mcp.tool()
 def get_model_viewer_link(project_id: str, item_id: str) -> str:
     """Returns a direct link to view ANY file (.rvt, .rcp, .pdf, .dwg)."""
-    return f"https://acc.autodesk.com/docs/files/projects/{clean_id(project_id)}?entityId={quote(item_id, safe='')}"
+    # FIX: Check region based on URN
+    domain = get_viewer_domain(item_id)
+    return f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(item_id, safe='')}"
 
 @mcp.tool()
 def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
-    """Searches the entire project for model files (.rvt, .rcp, etc) and returns View Links."""
+    """Searches the entire project for model files and returns View Links."""
     h = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
     if isinstance(h, str) or not h.get("data"): return "Error: No Hubs."
     hub_id = h["data"][0]["id"]
@@ -265,8 +265,13 @@ def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
     output = f"🔍 **Found {len(items)} Models:**\n"
     for i in items:
         name = i["attributes"]["displayName"]
-        viewer_link = f"https://acc.autodesk.com/docs/files/projects/{clean_id(project_id)}?entityId={quote(i['id'], safe='')}"
-        output += f"- **{name}**\n  [Open in Viewer]({viewer_link}) (ID: `{i['id']}`)\n"
+        item_id = i['id']
+        
+        # FIX: Check region based on URN
+        domain = get_viewer_domain(item_id)
+        viewer_link = f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(item_id, safe='')}"
+        
+        output += f"- **{name}**\n  [Open in Viewer]({viewer_link}) (ID: `{item_id}`)\n"
     return output
 
 # ==========================================
