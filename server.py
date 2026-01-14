@@ -10,7 +10,6 @@ from typing import Optional, List, Dict, Any
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
-# Fallback Admin Email (Optional, helps with "Admin" read permissions)
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL") 
 PORT = int(os.environ.get("PORT", 8000))
 
@@ -41,7 +40,7 @@ def get_token():
     token_cache["expires_at"] = time.time() + resp.json()["expires_in"] - 60
     return token_cache["access_token"]
 
-# --- HELPER: UTILS (Fixed Type Hints & Region Logic) ---
+# --- HELPER: UTILS ---
 def clean_id(id_str: Optional[str]) -> str:
     """Removes 'b.' prefix. Safely handles None."""
     return id_str.replace("b.", "") if id_str else ""
@@ -80,10 +79,7 @@ def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None)
         
         if resp.status_code != 200: 
             return f"GraphQL Error {resp.status_code}: {resp.text}"
-            
-        # FIX: Explicitly handle if 'data' is null
         return resp.json().get("data") or {} 
-        
     except Exception as e: return f"GraphQL Exception: {str(e)}"
 
 def get_viewer_domain(urn: str) -> str:
@@ -91,6 +87,36 @@ def get_viewer_domain(urn: str) -> str:
     if "wipemea" in urn or "emea" in urn:
         return "acc.autodesk.eu"
     return "acc.autodesk.com"
+
+def resolve_to_version_id(project_id: str, item_id: str) -> str:
+    """
+    CRITICAL FIX: Converts a 'Lineage ID' (History) to a 'Version ID' (Specific File).
+    The Viewer and Model Derivative APIs fail if you give them a History ID.
+    """
+    # If it already looks like a version (has ?version= or starts with fs.file), return it.
+    if "fs.file" in item_id or "version=" in item_id:
+        return item_id
+        
+    # If it's a Lineage (dm.lineage), we must fetch the latest version.
+    try:
+        print(f"🔄 Resolving Lineage ID to Latest Version: {item_id}")
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        p_id = ensure_b_prefix(project_id)
+        
+        url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(item_id)}"
+        r = requests.get(url, headers=headers)
+        
+        if r.status_code == 200:
+            # The 'tip' relationship points to the latest version
+            version_id = r.json()["data"]["relationships"]["tip"]["data"]["id"]
+            print(f"✅ Resolved to: {version_id}")
+            return version_id
+    except Exception as e:
+        print(f"⚠️ Failed to resolve version: {e}")
+    
+    # Fallback: Return original if resolution failed
+    return item_id
 
 # ==========================================
 # DISCOVERY TOOLS
@@ -173,10 +199,8 @@ def get_download_url(project_id: str, file_id: str) -> str:
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
         
-        target_version_id = file_id
-        if "lineage" in file_id or "fs.file" in file_id:
-            r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(file_id)}", headers=headers)
-            if r.status_code == 200: target_version_id = r.json()["data"]["relationships"]["tip"]["data"]["id"]
+        # Resolve to Version ID first
+        target_version_id = resolve_to_version_id(project_id, file_id)
         
         r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encode_urn(target_version_id)}", headers=headers)
         if r.status_code != 200: return f"Error finding file version: {r.text}"
@@ -192,7 +216,7 @@ def get_download_url(project_id: str, file_id: str) -> str:
     except Exception as e: return str(e)
 
 # ==========================================
-# 3D MODEL TOOLS (SMART REGION DETECTION)
+# 3D MODEL TOOLS
 # ==========================================
 
 @mcp.tool()
@@ -206,8 +230,6 @@ def list_designs(project_id: str) -> str:
     }"""
     
     data = make_graphql_request(query, {"projectId": p_id})
-    
-    # Retry Logic: Split into two checks for Pylance safety
     should_retry = False
     if not data or isinstance(data, str):
         should_retry = True
@@ -235,9 +257,12 @@ def list_designs(project_id: str) -> str:
 @mcp.tool()
 def get_model_viewer_link(project_id: str, item_id: str) -> str:
     """Returns a direct link to view ANY file (.rvt, .rcp, .pdf, .dwg)."""
-    # FIX: Check region based on URN
-    domain = get_viewer_domain(item_id)
-    return f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(item_id, safe='')}"
+    # 1. Resolve Lineage ID -> Version ID (Fixes broken links)
+    version_id = resolve_to_version_id(project_id, item_id)
+    
+    # 2. Check region based on URN
+    domain = get_viewer_domain(version_id)
+    return f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(version_id, safe='')}"
 
 @mcp.tool()
 def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
@@ -266,8 +291,6 @@ def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
     for i in items:
         name = i["attributes"]["displayName"]
         item_id = i['id']
-        
-        # FIX: Check region based on URN
         domain = get_viewer_domain(item_id)
         viewer_link = f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(item_id, safe='')}"
         
@@ -281,9 +304,12 @@ def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
 @mcp.tool()
 def get_model_tree(project_id: str, file_id: str) -> str:
     """Reads the hierarchy of ANY 3D file (WIP or Shared)."""
+    # 1. Resolve Lineage ID -> Version ID (Critical Step!)
+    version_id = resolve_to_version_id(project_id, file_id)
+    
     token = get_token()
     headers = {"Authorization": f"Bearer {token}"}
-    urn = safe_b64encode(file_id)
+    urn = safe_b64encode(version_id) # Now encoding the correct ID
     
     resp = requests.get(f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn}/metadata", headers=headers)
     if resp.status_code != 200: return f"❌ Could not read metadata (Status: {resp.status_code}). Has the file been viewed yet?"
