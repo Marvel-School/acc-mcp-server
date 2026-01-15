@@ -11,7 +11,6 @@ from typing import Optional, List, Dict, Any
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
-# Fallback Admin Email (Optional, helps with "Admin" read permissions)
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL") 
 PORT = int(os.environ.get("PORT", 8000))
 
@@ -19,7 +18,6 @@ PORT = int(os.environ.get("PORT", 8000))
 mcp = FastMCP("Autodesk ACC Agent")
 
 # Global Cache (Token + Hub ID)
-# We store the Hub ID so we don't have to ask for it every single command.
 global_cache = {
     "access_token": None, 
     "expires_at": 0,
@@ -149,7 +147,7 @@ def resolve_to_version_id(project_id: str, item_id: str) -> str:
         print(f"🔄 Detected Filename '{item_id}', searching for real ID...")
         found_id = search_for_file_id(project_id, item_id)
         if found_id:
-            item_id = found_id # Proceed to resolve this new ID
+            item_id = found_id 
         else:
             return item_id 
 
@@ -282,9 +280,13 @@ def list_designs(project_id: str) -> str:
     }"""
     
     data = make_graphql_request(query, {"projectId": p_id})
+    
+    # Retry Logic: Split into two checks for Pylance safety
     should_retry = False
-    if not data or isinstance(data, str): should_retry = True
-    elif isinstance(data, dict) and not data.get("elementGroupsByProject"): should_retry = True
+    if not data or isinstance(data, str):
+        should_retry = True
+    elif isinstance(data, dict) and not data.get("elementGroupsByProject"):
+        should_retry = True
 
     if should_retry:
         data = make_graphql_request(query, {"projectId": clean_id(project_id)})
@@ -470,7 +472,8 @@ def create_project(project_name: str) -> str:
     payload = {
         "name": project_name,
         "service_types": "doc_manager", 
-        "type": "Office",                # Hardcoded
+        "type": "Commercial",            # FIXED: Universal Type
+        "value": "Commercial",           # FIXED: Restored Value field
         "start_date": today.strftime("%Y-%m-%d"),
         "end_date": next_year.strftime("%Y-%m-%d"),
         "currency": "EUR",              
@@ -478,9 +481,9 @@ def create_project(project_name: str) -> str:
         "language": "en",
         "job_number": job_num,
         "address_line_1": "Teststraat 123", 
-        "city": "Rotterdam",             # Hardcoded
+        "city": "Rotterdam",             
         "postal_code": "3011AA",           
-        "country": "Netherlands"         # Hardcoded
+        "country": "Netherlands"         
     }
 
     print(f"🚀 Creating Project '{project_name}' (Hardcoded NL Data)...")
@@ -493,6 +496,8 @@ def create_project(project_name: str) -> str:
     elif response.status_code == 409:
         return f"⚠️ A project with the name '{project_name}' already exists."
     else:
+        # Added console print for debugging
+        print(f"❌ Error creating project: {response.text}")
         return f"❌ Failed to create project. (Status: {response.status_code})\nError Details: {response.text}"
 
 if __name__ == "__main__":
