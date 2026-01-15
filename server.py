@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any
 # --- CONFIGURATION ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
+# Fallback Admin Email (Optional, helps with "Admin" read permissions)
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL") 
 PORT = int(os.environ.get("PORT", 8000))
 
@@ -18,6 +19,7 @@ PORT = int(os.environ.get("PORT", 8000))
 mcp = FastMCP("Autodesk ACC Agent")
 
 # Global Cache (Token + Hub ID)
+# We store the Hub ID so we don't have to ask for it every single command.
 global_cache = {
     "access_token": None, 
     "expires_at": 0,
@@ -38,7 +40,7 @@ def get_token():
     url = "https://developer.api.autodesk.com/authentication/v2/token"
     auth = HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
     
-    # UPDATED: Added 'account:write' to scope for creating projects
+    # SCOPE includes account:write for project creation
     data = {"grant_type": "client_credentials", "scope": "data:read account:read bucket:read account:write"}
 
     resp = requests.post(url, auth=auth, data=data)
@@ -99,7 +101,6 @@ def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None)
         
         if resp.status_code != 200: 
             return f"GraphQL Error {resp.status_code}: {resp.text}"
-        # FIX: Explicitly handle if 'data' is null
         return resp.json().get("data") or {} 
     except Exception as e: return f"GraphQL Exception: {str(e)}"
 
@@ -150,8 +151,7 @@ def resolve_to_version_id(project_id: str, item_id: str) -> str:
         if found_id:
             item_id = found_id # Proceed to resolve this new ID
         else:
-            print("⚠️ Could not find file by name.")
-            return item_id # Fail gracefully, let the main tool handle the 404
+            return item_id 
 
     # CASE 2: Already a Version ID
     if "fs.file" in item_id or "version=" in item_id:
@@ -159,7 +159,6 @@ def resolve_to_version_id(project_id: str, item_id: str) -> str:
         
     # CASE 3: Lineage ID (History) -> Fetch Tip Version
     try:
-        print(f"🔄 Resolving Lineage ID: {item_id}")
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
@@ -168,9 +167,7 @@ def resolve_to_version_id(project_id: str, item_id: str) -> str:
         r = requests.get(url, headers=headers)
         
         if r.status_code == 200:
-            version_id = r.json()["data"]["relationships"]["tip"]["data"]["id"]
-            print(f"✅ Resolved to Version: {version_id}")
-            return version_id
+            return r.json()["data"]["relationships"]["tip"]["data"]["id"]
     except Exception: pass
     
     return item_id
@@ -285,13 +282,9 @@ def list_designs(project_id: str) -> str:
     }"""
     
     data = make_graphql_request(query, {"projectId": p_id})
-    
-    # Retry Logic: Split into two checks for Pylance safety
     should_retry = False
-    if not data or isinstance(data, str):
-        should_retry = True
-    elif isinstance(data, dict) and not data.get("elementGroupsByProject"):
-        should_retry = True
+    if not data or isinstance(data, str): should_retry = True
+    elif isinstance(data, dict) and not data.get("elementGroupsByProject"): should_retry = True
 
     if should_retry:
         data = make_graphql_request(query, {"projectId": clean_id(project_id)})
@@ -437,20 +430,15 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
     return output
 
 # ==========================================
-# ADMIN TOOLS (Write Access - EU Compatible)
+# ADMIN TOOLS (Hardcoded for Test Simplicity)
 # ==========================================
 
 @mcp.tool()
-def create_project(
-    project_name: str, 
-    project_type: str = "Commercial",
-    city: str = "Amsterdam",
-    country: str = "Netherlands",
-    job_number: str = ""
-) -> str:
+def create_project(project_name: str) -> str:
     """
-    Creates a new project. 
-    Accepts specific details (City, Country, Job Number) to satisfy strict API requirements.
+    Creates a new project in the ACC Account.
+    **HARDCODED FOR TESTING:** Automatically sets Location=Rotterdam, Country=Netherlands.
+    Only requires 'project_name' to run.
     """
     # 1. Get Authentication
     try:
@@ -472,37 +460,36 @@ def create_project(
         "Content-Type": "application/json"
     }
 
-    # 4. Generate Data
+    # 4. Generate HARDCODED Mandatory Data
     today = datetime.now()
     next_year = today + timedelta(days=365)
     
-    # If no job number provided, generate a unique one
-    if not job_number:
-        job_number = f"JN-{int(time.time())}"
+    # Auto-generate unique Job Number
+    job_num = f"JN-{int(time.time())}"
 
     payload = {
         "name": project_name,
         "service_types": "doc_manager", 
-        "type": project_type,           
+        "type": "Office",                # Hardcoded
         "start_date": today.strftime("%Y-%m-%d"),
         "end_date": next_year.strftime("%Y-%m-%d"),
         "currency": "EUR",              
         "timezone": "Europe/Amsterdam", 
         "language": "en",
-        "job_number": job_number,
-        "address_line_1": "Main Street 1", # Generic placeholder
-        "city": city,                      # Uses User Input
-        "postal_code": "1000AA",           
-        "country": country                 # Uses User Input
+        "job_number": job_num,
+        "address_line_1": "Teststraat 123", 
+        "city": "Rotterdam",             # Hardcoded
+        "postal_code": "3011AA",           
+        "country": "Netherlands"         # Hardcoded
     }
 
-    print(f"🚀 Creating Project '{project_name}' in {city}, {country}...")
+    print(f"🚀 Creating Project '{project_name}' (Hardcoded NL Data)...")
     
     response = requests.post(url, headers=headers, json=payload)
 
     if response.status_code == 201:
         new_id = response.json().get("id")
-        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nJob #: {job_number}"
+        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nJob #: {job_num}\nLoc: Rotterdam, NL"
     elif response.status_code == 409:
         return f"⚠️ A project with the name '{project_name}' already exists."
     else:
