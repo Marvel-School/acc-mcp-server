@@ -436,11 +436,19 @@ def get_data_connector_status(account_id: Optional[str] = None) -> str:
 # ==========================================
 
 @mcp.tool()
-def create_project(project_name: str) -> str:
+def create_project(
+    project_name: str, 
+    project_type: str = "Commercial", 
+    start_date: str = "", 
+    end_date: str = "", 
+    address: str = "",
+    city: str = "",
+    country: str = "",
+    job_number: str = ""
+) -> str:
     """
     Creates a new project in the ACC Account.
-    **HARDCODED FOR TESTING:** Automatically sets Location=Rotterdam, Country=Netherlands.
-    Only requires 'project_name' to run.
+    The Bot may provide dates/address, but for testing, this tool forces valid defaults (Netherlands/Rotterdam).
     """
     # 1. Get Authentication
     try:
@@ -462,42 +470,46 @@ def create_project(project_name: str) -> str:
         "Content-Type": "application/json"
     }
 
-    # 4. Generate HARDCODED Mandatory Data
+    # 4. Generate Mandatory Data (Overrides Bot input to ensure success)
     today = datetime.now()
     next_year = today + timedelta(days=365)
     
     # Auto-generate unique Job Number
-    job_num = f"JN-{int(time.time())}"
+    # Use the one from the bot if provided, otherwise generate one
+    final_job_num = job_number if job_number else f"JN-{int(time.time())}"
+
+    # We enforce "Commercial" because the API rejects unknown types
+    safe_type = "Commercial" 
 
     payload = {
         "name": project_name,
         "service_types": "doc_manager", 
-        "type": "Commercial",            # FIXED: Universal Type
-        "value": "Commercial",           # FIXED: Restored Value field
+        "type": safe_type,               
+        "value": safe_type,              # <--- THE MISSING FIELD THAT CAUSED ERROR 1000
         "start_date": today.strftime("%Y-%m-%d"),
         "end_date": next_year.strftime("%Y-%m-%d"),
         "currency": "EUR",              
         "timezone": "Europe/Amsterdam", 
         "language": "en",
-        "job_number": job_num,
+        "job_number": final_job_num,
         "address_line_1": "Teststraat 123", 
         "city": "Rotterdam",             
         "postal_code": "3011AA",           
         "country": "Netherlands"         
     }
 
-    print(f"🚀 Creating Project '{project_name}' (Hardcoded NL Data)...")
+    print(f"🚀 Creating Project '{project_name}' (Payload forced to valid EU defaults)...")
     
     response = requests.post(url, headers=headers, json=payload)
 
     if response.status_code == 201:
         new_id = response.json().get("id")
-        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nJob #: {job_num}\nLoc: Rotterdam, NL"
+        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nJob #: {final_job_num}\nLoc: Rotterdam, NL"
     elif response.status_code == 409:
         return f"⚠️ A project with the name '{project_name}' already exists."
     else:
-        # Added console print for debugging
-        print(f"❌ Error creating project: {response.text}")
+        # Log the specific error to the console for easier debugging
+        print(f"❌ API Error: {response.text}")
         return f"❌ Failed to create project. (Status: {response.status_code})\nError Details: {response.text}"
 
 if __name__ == "__main__":
