@@ -245,8 +245,8 @@ def create_project(
     if not raw_hub_id: return "❌ Error: Could not find Hub/Account ID."
     account_id = clean_id(raw_hub_id) 
 
-    # 3. Determine Endpoint (Switching to ACC Admin V1 API for reliability)
-    # The HQ API (v1) is legacy and strictly enforced. The ACC Admin API (v1) is preferred.
+    # 3. Determine Endpoint (Switching to ACC Admin V1 API)
+    # The ACC Admin API (v1) generally prefers snake_case for field names.
     url = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
 
     headers = {
@@ -254,32 +254,30 @@ def create_project(
         "Content-Type": "application/json"
     }
 
-    # 4. Generate Data (ACC Admin API uses camelCase)
+    # 4. Generate Data
     today = datetime.now()
     next_year = today + timedelta(days=365)
     
     # Auto-generate unique Job Number
     final_job_num = job_number if job_number else f"JN-{int(time.time())}"
 
-    # ACC Admin payload structure
+    # ACC Admin payload structure (snake_case)
     payload = {
         "name": project_name,
-        "type": project_type, # e.g. "Commercial"
+        "project_type": project_type, # snake_case key
         "currency": "EUR",              
         "timezone": "Europe/Amsterdam", 
         "language": "en",
-        "jobNumber": final_job_num,
+        "job_number": final_job_num,  # snake_case key
         "address": {
-            "addressLine1": address or "Teststraat 123",
+            "address_line_1": address or "Teststraat 123", # snake_case key
             "city": city or "Rotterdam",
-            "postalCode": "3011AA",
+            "postal_code": "3011AA",      # snake_case key
             "country": country or "Netherlands"
         }
     }
 
-    # Note: ACC Admin API does NOT require 'service_types' or 'value' in the initial payload.
-
-    logger.info(f"🚀 Creating Project '{project_name}' via ACC Admin API...")
+    logger.info(f"🚀 Creating Project '{project_name}' via ACC Admin API (SnakeCase)...")
     logger.info(f"Payload: {payload}")
     
     response = requests.post(url, headers=headers, json=payload)
