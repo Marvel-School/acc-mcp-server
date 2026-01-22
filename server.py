@@ -294,23 +294,33 @@ def create_project(
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
     import uvicorn
-    # Create ASGI app from FastMCP
-    app = mcp._fastapi_app if hasattr(mcp, "_fastapi_app") else mcp
+    from starlette.middleware.base import BaseHTTPMiddleware
 
-    # Add middleware to fix 406 Not Acceptable error from Copilot
-    # Copilot sends Accept: application/json but starlette/sse might require text/event-stream
-    # This middleware forces the Accept header if it's missing the required type
-    @app.middleware("http")
+    # Create ASGI app from FastMCP
+    # mcp.http_app is the underlying FastAPI/Starlette app
+    if hasattr(mcp, "http_app") and mcp.http_app:
+        app = mcp.http_app() if callable(mcp.http_app) else mcp.http_app
+    elif hasattr(mcp, "_fastapi_app"):
+         app = mcp._fastapi_app
+    else:
+         logger.warning("Could not find http_app or _fastapi_app on mcp object. Using mcp as app.")
+         app = mcp
+
+    # Middleware to fix 406 Not Acceptable error
     async def fix_accept_header(request, call_next):
         if "text/event-stream" not in request.headers.get("accept", ""):
-            # Create a mutable copy of the headers path
             headers = dict(request.scope["headers"])
-            # Append text/event-stream to Accept header
             current_accept = request.headers.get("accept", "*/*")
             headers[b"accept"] = f"{current_accept}, text/event-stream".encode()
             request.scope["headers"] = [(k, v) for k, v in headers.items()]
         
         response = await call_next(request)
         return response
+
+    # Add middleware safely
+    if hasattr(app, "add_middleware"):
+        app.add_middleware(BaseHTTPMiddleware, dispatch=fix_accept_header)
+    else:
+        logger.error(f"Cannot add middleware. App type: {type(app)}")
 
     uvicorn.run(app, host="0.0.0.0", port=PORT)
