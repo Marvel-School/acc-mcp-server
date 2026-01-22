@@ -299,4 +299,24 @@ def create_project(
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
-    mcp.run(transport="http", host="0.0.0.0", port=PORT)
+    import uvicorn
+    # Create ASGI app from FastMCP
+    app = mcp._fastapi_app if hasattr(mcp, "_fastapi_app") else mcp
+
+    # Add middleware to fix 406 Not Acceptable error from Copilot
+    # Copilot sends Accept: application/json but starlette/sse might require text/event-stream
+    # This middleware forces the Accept header if it's missing the required type
+    @app.middleware("http")
+    async def fix_accept_header(request, call_next):
+        if "text/event-stream" not in request.headers.get("accept", ""):
+            # Create a mutable copy of the headers path
+            headers = dict(request.scope["headers"])
+            # Append text/event-stream to Accept header
+            current_accept = request.headers.get("accept", "*/*")
+            headers[b"accept"] = f"{current_accept}, text/event-stream".encode()
+            request.scope["headers"] = [(k, v) for k, v in headers.items()]
+        
+        response = await call_next(request)
+        return response
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
