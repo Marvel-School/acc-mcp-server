@@ -245,46 +245,42 @@ def create_project(
     if not raw_hub_id: return "❌ Error: Could not find Hub/Account ID."
     account_id = clean_id(raw_hub_id) 
 
-    # 3. Determine Region URL (Force EU for now, configurability can be added)
-    hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
-    region = "us" # Default to US
-    if isinstance(hubs, dict) and hubs.get("data"):
-         region_code = hubs["data"][0]["attributes"].get("region", "US")
-         region = "eu" if region_code == "EMEA" else "us"
-
-    base_url = f"https://developer.api.autodesk.com/hq/v1/regions/{region}/accounts"
-    url = f"{base_url}/{account_id}/projects"
+    # 3. Determine Endpoint (Switching to ACC Admin V1 API for reliability)
+    # The HQ API (v1) is legacy and strictly enforced. The ACC Admin API (v1) is preferred.
+    url = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
 
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
 
-    # 4. Generate Mandatory Data
+    # 4. Generate Data (ACC Admin API uses camelCase)
     today = datetime.now()
     next_year = today + timedelta(days=365)
     
     # Auto-generate unique Job Number
     final_job_num = job_number if job_number else f"JN-{int(time.time())}"
 
+    # ACC Admin payload structure
     payload = {
         "name": project_name,
-        "service_types": "doc_manager",
-        "type": project_type,
-        "value": 100000, 
-        "start_date": today.strftime("%Y-%m-%d"),
-        "end_date": next_year.strftime("%Y-%m-%d"),
+        "type": project_type, # e.g. "Commercial"
         "currency": "EUR",              
         "timezone": "Europe/Amsterdam", 
         "language": "en",
-        "job_number": final_job_num,
-        "address_line_1": address or "Teststraat 123", 
-        "city": city or "Rotterdam",             
-        "postal_code": "3011AA",           
-        "country": country or "Netherlands"         
+        "jobNumber": final_job_num,
+        "address": {
+            "addressLine1": address or "Teststraat 123",
+            "city": city or "Rotterdam",
+            "postalCode": "3011AA",
+            "country": country or "Netherlands"
+        }
     }
 
-    logger.info(f"🚀 Creating Project '{project_name}' (Payload EU/Type Fixed)...")
+    # Note: ACC Admin API does NOT require 'service_types' or 'value' in the initial payload.
+
+    logger.info(f"🚀 Creating Project '{project_name}' via ACC Admin API...")
+    logger.info(f"Payload: {payload}")
     
     response = requests.post(url, headers=headers, json=payload)
 
