@@ -259,21 +259,20 @@ def create_project(
     
     final_job_num = job_number if job_number else f"JN-{int(time.time())}"
 
-    # Minimal + Essential payload based on verified documentation
+    # Minimal + Essential payload based on verified documentation (NO currency/language)
+    # The API explicitly rejected 'currency' and 'language' as unknown properties.
     payload = {
         "name": project_name,
-        "type": project_type,  # Key must be 'type', Value = e.g. "Residential" or "Commercial"
-        "currency": "EUR",              
+        "type": project_type,  
         "timezone": "Europe/Amsterdam", 
-        "language": "en",
         "jobNumber": final_job_num,
-        "addressLine1": address or "Teststraat 123", # camelCase
+        "addressLine1": address or "Teststraat 123", 
         "city": city or "Rotterdam",
-        "postalCode": "3011AA",       # camelCase
+        "postalCode": "3011AA",       
         "country": country or "Netherlands"
     }
 
-    logger.info(f"🚀 Creating Project '{project_name}' via ACC Admin API (Fixed Keys)...")
+    logger.info(f"🚀 Creating Project '{project_name}' via ACC Admin API (Minimal)...")
     logger.info(f"Payload: {payload}")
     
     response = requests.post(url, headers=headers, json=payload)
