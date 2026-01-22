@@ -151,6 +151,10 @@ def get_model_viewer_link(project_id: str, item_id: str) -> str:
 
 @mcp.tool()
 def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
+    """
+    Finds models in the Project Files folder.
+    file_types: Comma-separated list of file extensions (e.g. "rvt,dwg")
+    """
     hub_id = get_cached_hub_id()
     if not hub_id: return "Error: No Hubs."
     p_id = ensure_b_prefix(project_id)
@@ -219,12 +223,12 @@ def get_model_tree(project_id: str, file_id: str) -> str:
 def create_project(
     project_name: str, 
     project_type: str = "Commercial", 
-    start_date: str = "", 
-    end_date: str = "", 
-    address: str = "",
-    city: str = "",
-    country: str = "",
-    job_number: str = ""
+    start_date: Optional[str] = None, 
+    end_date: Optional[str] = None, 
+    address: Optional[str] = None, 
+    city: Optional[str] = None, 
+    country: Optional[str] = None, 
+    job_number: Optional[str] = None
 ) -> str:
     """
     Creates a new project in the ACC Account.
@@ -242,7 +246,13 @@ def create_project(
     account_id = clean_id(raw_hub_id) 
 
     # 3. Determine Region URL (Force EU for now, configurability can be added)
-    base_url = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts"
+    hubs = make_api_request("https://developer.api.autodesk.com/project/v1/hubs")
+    region = "us" # Default to US
+    if isinstance(hubs, dict) and hubs.get("data"):
+         region_code = hubs["data"][0]["attributes"].get("region", "US")
+         region = "eu" if region_code == "EMEA" else "us"
+
+    base_url = f"https://developer.api.autodesk.com/hq/v1/regions/{region}/accounts"
     url = f"{base_url}/{account_id}/projects"
 
     headers = {
