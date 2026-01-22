@@ -107,7 +107,7 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
             for u in results:
                 u_email = u.get("email", "")
                 if u_email and u_email.lower().strip() == target_email:
-                    logger.info(f"✅ Found user in ACC List: {target_email}")
+                    logger.info(f"✅ Found user in ACC List: {target_email} -> {u.get('id')}")
                     return u.get("id")
             
             if len(results) < limit:
@@ -130,6 +130,8 @@ def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -
         logger.info(f"Using fallback admin email: {ACC_ADMIN_EMAIL}")
         uid = get_user_id_by_email(account_id, ACC_ADMIN_EMAIL)
         if uid: return uid
+    
+    logger.warning("Could not resolve any User ID for x-user-id header.")
     return None
 
 def resolve_to_version_id(project_id: str, item_id: str) -> str:

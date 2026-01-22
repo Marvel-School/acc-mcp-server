@@ -36,9 +36,10 @@ def get_token() -> str:
     auth = HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
     
     # Scopes required for the tool's operations
+    # Added project:read and project:write to ensure full coverage
     data = {
         "grant_type": "client_credentials", 
-        "scope": "data:read data:write account:read account:write bucket:read"
+        "scope": "data:read data:write account:read account:write bucket:read project:read project:write"
     }
 
     try:

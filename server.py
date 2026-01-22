@@ -242,8 +242,20 @@ def create_project(
 
     # 2. Get Account ID
     raw_hub_id = get_cached_hub_id()
-    if not raw_hub_id: return "❌ Error: Could not find Hub/Account ID."
+    if not raw_hub_id: 
+        logger.error("Could not find Hub/Account ID via Data Management API.")
+        return "❌ Error: Could not find Hub/Account ID. Check if your app is added to the BIM 360/ACC Account Admin."
+    
     account_id = clean_id(raw_hub_id) 
+    logger.info(f"Targeting Account ID: {account_id}")
+
+    # Resolve Acting Admin ID for 2-legged Auth
+    admin_id = get_acting_user_id(account_id)
+    if not admin_id:
+        # Without x-user-id, Admin API often returns 401/403 for 2-legged tokens
+        logger.warning("⚠️ Could not resolve Admin User ID. Request might fail with 401.")
+    else:
+        logger.info(f"Acting as Admin User ID: {admin_id}")
 
     # 3. Determine Endpoint (ACC Admin V1)
     url = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
@@ -252,6 +264,10 @@ def create_project(
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
+    
+    # Add x-user-id header if resolved
+    if admin_id:
+        headers["x-user-id"] = admin_id
 
     # 4. Generate Data (ACC Admin API matches the docs: camelCase, 'type' for project category)
     today = datetime.now()
