@@ -245,8 +245,7 @@ def create_project(
     if not raw_hub_id: return "❌ Error: Could not find Hub/Account ID."
     account_id = clean_id(raw_hub_id) 
 
-    # 3. Determine Endpoint (Switching to ACC Admin V1 API)
-    # The ACC Admin API (v1) generally prefers snake_case for field names.
+    # 3. Determine Endpoint (ACC Admin V1)
     url = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
 
     headers = {
@@ -254,30 +253,27 @@ def create_project(
         "Content-Type": "application/json"
     }
 
-    # 4. Generate Data
+    # 4. Generate Data (ACC Admin API matches the docs: camelCase, 'type' for project category)
     today = datetime.now()
     next_year = today + timedelta(days=365)
     
-    # Auto-generate unique Job Number
     final_job_num = job_number if job_number else f"JN-{int(time.time())}"
 
-    # ACC Admin payload structure (snake_case)
+    # Minimal + Essential payload based on verified documentation
     payload = {
         "name": project_name,
-        "project_type": project_type, # snake_case key
+        "type": project_type,  # Key must be 'type', Value = e.g. "Residential" or "Commercial"
         "currency": "EUR",              
         "timezone": "Europe/Amsterdam", 
         "language": "en",
-        "job_number": final_job_num,  # snake_case key
-        "address": {
-            "address_line_1": address or "Teststraat 123", # snake_case key
-            "city": city or "Rotterdam",
-            "postal_code": "3011AA",      # snake_case key
-            "country": country or "Netherlands"
-        }
+        "jobNumber": final_job_num,
+        "addressLine1": address or "Teststraat 123", # camelCase
+        "city": city or "Rotterdam",
+        "postalCode": "3011AA",       # camelCase
+        "country": country or "Netherlands"
     }
 
-    logger.info(f"🚀 Creating Project '{project_name}' via ACC Admin API (SnakeCase)...")
+    logger.info(f"🚀 Creating Project '{project_name}' via ACC Admin API (Fixed Keys)...")
     logger.info(f"Payload: {payload}")
     
     response = requests.post(url, headers=headers, json=payload)
