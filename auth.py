@@ -36,10 +36,11 @@ def get_token() -> str:
     auth = HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
     
     # Scopes required for the tool's operations
-    # Added project:read and project:write to ensure full coverage
+    # Reverting to known working scopes (account:write is key for Admin API)
+    # project:read/write are often not supported in 2-legged auth for this endpoint or app config
     data = {
         "grant_type": "client_credentials", 
-        "scope": "data:read data:write account:read account:write bucket:read project:read project:write"
+        "scope": "data:read data:write account:read account:write bucket:read"
     }
 
     try:
