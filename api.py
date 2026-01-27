@@ -1,6 +1,7 @@
 import os
 import requests
 import logging
+import time
 import base64
 from functools import lru_cache
 from urllib.parse import quote
@@ -260,9 +261,94 @@ def search_project_folder(project_id: str, query: str, limit: int = 20) -> List[
     except Exception as e:
         logger.error(f"Search Exception: {e}")
         return []
-        url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(item_id)}"
-        r = requests.get(url, headers=headers)
-        if r.status_code == 200:
-            return r.json()["data"]["relationships"]["tip"]["data"]["id"]
-    except Exception: pass
-    return item_id
+
+# --- NEW: FEATURES API (Issues/Assets) ---
+
+def fetch_paginated_data(url: str, limit: int = 100, style: str = "url") -> List[Dict[str, Any]]:
+    """
+    Generic pagination helper for ACC APIs.
+    styles: 
+      - 'url': uses data['links']['next']['href'] (Data Management API)
+      - 'offset': uses 'offset' and 'limit' query params (Admin/Issues API)
+    """
+    all_items = []
+    page_count = 0
+    MAX_PAGES = 50
+    current_url = url
+    offset = 0
+    
+    while current_url and page_count < MAX_PAGES:
+        try:
+            token = get_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            # Add params for offset style
+            params = {}
+            if style == 'offset':
+                params = {"offset": offset, "limit": limit}
+
+            resp = requests.get(current_url, headers=headers, params=params if style == 'offset' else None)
+            
+            if resp.status_code in [403, 404]:
+                logger.warning(f"Endpoint returned {resp.status_code} (Module inactive?).")
+                break
+            if resp.status_code != 200:
+                logger.error(f"Pagination Error {resp.status_code} at {current_url}: {resp.text}")
+                break
+                
+            data = resp.json()
+            
+            # Determine list key
+            batch = []
+            if isinstance(data, list):
+                batch = data
+            elif isinstance(data, dict):
+                if "data" in data and isinstance(data["data"], list):
+                    batch = data["data"]
+                elif "results" in data and isinstance(data["results"], list):
+                    batch = data["results"]
+            
+            all_items.extend(batch)
+            
+            # Navigate
+            if style == 'url':
+                links = data.get("links", {})
+                next_obj = links.get("next")
+                if isinstance(next_obj, dict):
+                    current_url = next_obj.get("href")
+                else:
+                    current_url = None
+            elif style == 'offset':
+                if len(batch) < limit:
+                     current_url = None
+                else:
+                     offset += limit
+            
+            page_count += 1
+            time.sleep(0.5) # Rate limit protection
+
+        except Exception as e:
+            logger.error(f"Pagination Loop Exception: {e}")
+            break
+            
+    return all_items
+
+def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    p_id = clean_id(project_id)
+    url = f"{BASE_URL_ACC}/issues/v1/projects/{p_id}/issues"
+    # Issues API uses offset/limit
+    items = fetch_paginated_data(url, limit=50, style='offset')
+    
+    if status:
+        items = [i for i in items if i.get("status", "").lower() == status.lower()]
+        
+    return items
+
+def get_project_assets(project_id: str, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    p_id = clean_id(project_id)
+    url = f"{BASE_URL_ACC}/assets/v2/projects/{p_id}/assets" # Assets V2
+    items = fetch_paginated_data(url, limit=50, style='offset')
+    
+    if category:
+        items = [i for i in items if category.lower() in i.get("category", {}).get("name", "").lower()]
+        
+    return items

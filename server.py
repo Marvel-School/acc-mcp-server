@@ -19,7 +19,10 @@ from api import (
     resolve_to_version_id,
     safe_b64encode,
     get_viewer_domain,
-    search_project_folder
+    search_project_folder,
+    fetch_paginated_data,
+    get_project_issues,
+    get_project_assets
 )
 
 # Initialize Logging
@@ -52,33 +55,11 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
         hub_id = get_cached_hub_id()
         if not hub_id: return "Error: No Hubs found."
         
-    # Start Pagination Loop
     url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
-    all_projs = []
-    page_count = 0
-    MAX_PAGES = 50 # Safety break
     
-    while url and page_count < MAX_PAGES:
-        data = make_api_request(url)
-        if isinstance(data, str): 
-            if page_count == 0: return data # Return error if first page fails
-            logger.warning(f"Error fetching page {page_count + 1}: {data}")
-            break
-        
-        current_batch = data.get("data", [])
-        all_projs.extend(current_batch)
-        
-        # Check for next page link (Autodesk Data Management API JSON:API standard)
-        links = data.get("links", {})
-        next_info = links.get("next")
-        if next_info and isinstance(next_info, dict):
-            url = next_info.get("href")
-        else:
-            url = None # Stops loop
-            
-        page_count += 1
-        time.sleep(0.2) # Rate limit protection
-
+    # Use shared pagination logic (Style 'url' for Data Management API)
+    all_projs = fetch_paginated_data(url, style='url')
+    
     # Client-side filtering
     if name_filter:
         all_projs = [p for p in all_projs if name_filter.lower() in p['attributes']['name'].lower()]
@@ -86,7 +67,7 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
     # Sort by name
     all_projs.sort(key=lambda x: x['attributes'].get('name', ''))
 
-    output = f"📂 **Found {len(all_projs)} Projects (Pages Scanned: {page_count}):**\n"
+    output = f"📂 **Found {len(all_projs)} Projects:**\n"
     for p in all_projs[:limit]: 
         output += f"- **{p['attributes']['name']}**\n  ID: `{p['id']}`\n"
         
@@ -364,6 +345,90 @@ def create_project(
     else:
         logger.error(f"Failed to create project: {response.text}")
         return f"❌ Failed to create project. (Status: {response.status_code})\nError Details: {response.text}"
+
+# ==========================================
+# QUALITY & ASSETS TOOLS
+# ==========================================
+
+@mcp.tool()
+def list_issues(project_id: str, status: Optional[str] = None) -> str:
+    """
+    Lists operational issues in a project.
+    Inputs:
+    - project_id: The ID of the project.
+    - status: Filter by status (e.g., 'open', 'closed', 'draft').
+    """
+    items = get_project_issues(project_id, status)
+    if not items:
+        status_msg = f" (Status: {status})" if status else ""
+        return f"📋 No issues found in project {project_id}{status_msg}."
+    
+    # Sort by ID descending (newest first usually)
+    items.sort(key=lambda x: x.get('displayId', 0), reverse=True)
+    
+    output = f"📋 **Found {len(items)} Issues:**\n"
+    output += "| ID | Title | Status | Assignee |\n"
+    output += "|---|---|---|---|\n"
+    
+    for i in items[:20]: # Show top 20
+        # Data extraction safety
+        title = i.get('title', 'Untitled').replace("|", "-")
+        stat = i.get('status', 'Unknown')
+        
+        assignee_data = i.get('assignedTo', {})
+        assignee = "Unassigned"
+        if assignee_data:
+            assignee = assignee_data.get('name', assignee_data.get('email', 'Unknown User'))
+        
+        display_id = i.get('displayId', i.get('identifier', '?'))
+        
+        output += f"| {display_id} | {title} | {stat} | {assignee} |\n"
+        
+    if len(items) > 20:
+        output += f"\n*(Displaying 20 of {len(items)} issues)*"
+        
+    return output
+
+@mcp.tool()
+def list_assets(project_id: str, category: Optional[str] = None) -> str:
+    """
+    Lists assets in a project.
+    Inputs:
+    - project_id: The ID of the project.
+    - category: Filter by category name (e.g., 'HVAC', 'Electrical').
+    """
+    items = get_project_assets(project_id, category)
+    if not items:
+        cat_msg = f" (Category: {category})" if category else ""
+        return f"📦 No assets found in project {project_id}{cat_msg}."
+        
+    output = f"📦 **Found {len(items)} Assets:**\n"
+    output += "| ID | Name | Category | Status |\n"
+    output += "|---|---|---|---|\n"
+    
+    for a in items[:20]:
+        client_id = a.get('clientAssetId', a.get('id', '?'))
+        # Name might be in 'description' or 'clientAssetId' depending on implementation
+        # Assets V2 often uses 'clientAssetId' as the main identifier/name or specific custom fields
+        # But 'categoryId' maps to category.
+        
+        # Let's try to find a name-like field
+        # Usually Assets have 'clientAssetId' (User faced ID) and sometimes 'description'
+        name = a.get('description', client_id).replace("|", "-")
+        if len(name) > 30: name = name[:27] + "..."
+        
+        cat_node = a.get('category', {})
+        cat_name = cat_node.get('name', 'General')
+        
+        status_node = a.get('status', {})
+        status_name = status_node.get('name', status_node.get('displayName', 'Unknown'))
+        
+        output += f"| {client_id} | {name} | {cat_name} | {status_name} |\n"
+        
+    if len(items) > 20:
+        output += f"\n*(Displaying 20 of {len(items)} assets)*"
+        
+    return output
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
