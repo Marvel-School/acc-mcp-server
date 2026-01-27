@@ -24,7 +24,7 @@ from api import (
     get_project_issues,
     get_project_assets,
     get_account_users,
-    invite_user_to_project
+    # invite_user_to_project
 )
 
 # Initialize Logging
@@ -382,10 +382,9 @@ def list_users() -> str:
     return str(get_account_users(""))
 
 @mcp.tool()
-def add_project_member(project_id: str, email: str) -> str:
-    """Adds a member to a project. Required: project_id and email."""
-    # STUB MODE: Connects to Copilot without invoking API risk.
-    return f"SIMULATION: Would add {email} to project {project_id}. (Logic Connected)"
+def add_project_member(target_project_id: str, user_email_address: str) -> str:
+    """Adds a member. Args: target_project_id, user_email_address."""
+    return f"STUB: Adding {user_email_address} to {target_project_id}"
         
     output = f"📦 **Found {len(items)} Assets:**\n"
     output += "| ID | Name | Category | Status |\n"
