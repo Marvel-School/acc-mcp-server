@@ -44,20 +44,55 @@ def list_hubs() -> str:
 
 @mcp.tool()
 def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 20) -> str:
+    """
+    Lists projects in the Hub (Pagination enabled).
+    Fetches ALL projects via pagination, then filters and returns up to 'limit' results.
+    """
     if not hub_id:
         hub_id = get_cached_hub_id()
         if not hub_id: return "Error: No Hubs found."
         
-    data = make_api_request(f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects")
-    if isinstance(data, str): return data
+    # Start Pagination Loop
+    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
+    all_projs = []
+    page_count = 0
+    MAX_PAGES = 50 # Safety break
     
-    all_projs = data.get("data", [])
+    while url and page_count < MAX_PAGES:
+        data = make_api_request(url)
+        if isinstance(data, str): 
+            if page_count == 0: return data # Return error if first page fails
+            logger.warning(f"Error fetching page {page_count + 1}: {data}")
+            break
+        
+        current_batch = data.get("data", [])
+        all_projs.extend(current_batch)
+        
+        # Check for next page link (Autodesk Data Management API JSON:API standard)
+        links = data.get("links", {})
+        next_info = links.get("next")
+        if next_info and isinstance(next_info, dict):
+            url = next_info.get("href")
+        else:
+            url = None # Stops loop
+            
+        page_count += 1
+        time.sleep(0.2) # Rate limit protection
+
+    # Client-side filtering
     if name_filter:
         all_projs = [p for p in all_projs if name_filter.lower() in p['attributes']['name'].lower()]
     
-    output = f"📂 **Found {len(all_projs)} Projects:**\n"
+    # Sort by name
+    all_projs.sort(key=lambda x: x['attributes'].get('name', ''))
+
+    output = f"📂 **Found {len(all_projs)} Projects (Pages Scanned: {page_count}):**\n"
     for p in all_projs[:limit]: 
         output += f"- **{p['attributes']['name']}**\n  ID: `{p['id']}`\n"
+        
+    if len(all_projs) > limit:
+        output += f"\n*(Displaying {limit} of {len(all_projs)} results. Use 'name_filter' to refine.)*"
+        
     return output
 
 # ==========================================
