@@ -381,10 +381,10 @@ def list_users() -> str:
     """List all users in the account. No arguments."""
     return str(get_account_users(""))
 
-# @mcp.tool()
-# def add_user(project_id: str, email: str) -> str:
-#     """Adds a user to a project by email."""
-#     return str(invite_user_to_project(project_id, email))
+@mcp.tool()
+def add_user(project_id: str, email: str) -> str:
+    """Add a user to a project. Both arguments are required."""
+    return str(invite_user_to_project(project_id, email))
         
     output = f"📦 **Found {len(items)} Assets:**\n"
     output += "| ID | Name | Category | Status |\n"
