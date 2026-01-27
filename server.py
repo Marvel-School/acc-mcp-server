@@ -404,34 +404,6 @@ def manage_project_users(json_payload: str) -> str:
         return "Error: Invalid JSON format. Please provide a valid JSON string."
     except Exception as e:
         return f"Error processing request: {str(e)}"
-        
-    output = f"📦 **Found {len(items)} Assets:**\n"
-    output += "| ID | Name | Category | Status |\n"
-    output += "|---|---|---|---|\n"
-    
-    for a in items[:20]:
-        client_id = a.get('clientAssetId', a.get('id', '?'))
-        # Name might be in 'description' or 'clientAssetId' depending on implementation
-        # Assets V2 often uses 'clientAssetId' as the main identifier/name or specific custom fields
-        # But 'categoryId' maps to category.
-        
-        # Let's try to find a name-like field
-        # Usually Assets have 'clientAssetId' (User faced ID) and sometimes 'description'
-        name = a.get('description', client_id).replace("|", "-")
-        if len(name) > 30: name = name[:27] + "..."
-        
-        cat_node = a.get('category', {})
-        cat_name = cat_node.get('name', 'General')
-        
-        status_node = a.get('status', {})
-        status_name = status_node.get('name', status_node.get('displayName', 'Unknown'))
-        
-        output += f"| {client_id} | {name} | {cat_name} | {status_name} |\n"
-        
-    if len(items) > 20:
-        output += f"\n*(Displaying 20 of {len(items)} assets)*"
-        
-    return output
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
