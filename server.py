@@ -22,7 +22,9 @@ from api import (
     search_project_folder,
     fetch_paginated_data,
     get_project_issues,
-    get_project_assets
+    get_project_assets,
+    get_account_users,
+    invite_user_to_project
 )
 
 # Initialize Logging
@@ -369,6 +371,37 @@ def list_assets(project_id: str, category_filter: str = "all") -> str:
     # Logic: pass filter if it exists
     cat = category_filter if category_filter and category_filter not in ["all", "none"] else None
     return str(get_project_assets(project_id, cat))
+
+# ==========================================
+# ADMIN TOOLS
+# ==========================================
+
+@mcp.tool()
+def list_users(name_filter: str = "all") -> str:
+    """Lists users in the account. name_filter searches name/email."""
+    filter_val = name_filter if name_filter and name_filter != "all" else ""
+    users = get_account_users(filter_val)
+    
+    if not users:
+        return "👥 No users found."
+        
+    output = f"👥 **Found {len(users)} Users:**\n"
+    for u in users[:20]:
+        name = u.get('name', 'Unknown')
+        email = u.get('email', '-')
+        uid = u.get('id', '?')
+        status = u.get('status', 'active')
+        output += f"- **{name}** ({email})\n  ID: `{uid}` | Status: {status}\n"
+        
+    if len(users) > 20:
+        output += f"\n*(Displaying 20 of {len(users)} users)*"
+    
+    return output
+
+@mcp.tool()
+def add_user(project_id: str, email: str) -> str:
+    """Adds a user to a project by email."""
+    return invite_user_to_project(project_id, email)
         
     output = f"📦 **Found {len(items)} Assets:**\n"
     output += "| ID | Name | Category | Status |\n"

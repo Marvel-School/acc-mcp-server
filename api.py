@@ -352,3 +352,101 @@ def get_project_assets(project_id: str, category: Optional[str] = None) -> List[
         items = [i for i in items if category.lower() in i.get("category", {}).get("name", "").lower()]
         
     return items
+
+# --- ADMIN API (Users) ---
+
+def get_account_users(search_term: str = "") -> List[Dict[str, Any]]:
+    """
+    Fetches users from the Account Admin.
+    Defaults to HQ US API as fallbacks proved necessary for this account.
+    """
+    hub_id = get_cached_hub_id()
+    if not hub_id: return []
+    account_id = clean_id(hub_id)
+    
+    # Use HQ US endpoint based on previous successful debugging
+    # We could make this adaptive, but keeping it simple for now as we know what works.
+    url = f"{BASE_URL_HQ_US}/{account_id}/users"
+    
+    # HQ API handles basic list, but searching might need client side filtering 
+    # if the API search param isn't strictly 'name'.
+    # HQ API supports ?name=... but simple list + filter is safer.
+    
+    all_users = fetch_paginated_data(url, limit=100, style='url') # HQ often uses offset, but let's check fetch_paginated_data...
+    # Actually HQ usually returns a list at the top level or inside results?
+    # fetch_paginated_data handles "results" key.
+    # But HQ pagination is usually limit/offset? 
+    # Let's try style='offset' just to be safe if it follows common patterns, 
+    # BUT wait, read_file of api.py showed logic in get_user_id_by_email dealing with this.
+    # It used params={"limit": limit, "offset": offset}, so it IS offset based.
+    
+    if not all_users:
+         # Retry with offset style explicitly
+         all_users = fetch_paginated_data(url, limit=100, style='offset')
+
+    if search_term and search_term.lower() != "all":
+        term = search_term.lower()
+        all_users = [
+            u for u in all_users 
+            if term in u.get("name", "").lower() or term in u.get("email", "").lower()
+        ]
+        
+    return all_users
+
+def invite_user_to_project(project_id: str, email: str) -> str:
+    """
+    Adds a user to a project.
+    """
+    token = get_token()
+    p_id = clean_id(project_id)
+    
+    # 1. Resolve Account parameters
+    hub_id = get_cached_hub_id()
+    account_id = clean_id(hub_id)
+    
+    # 2. Get Admin Context (x-user-id)
+    admin_id = get_acting_user_id(account_id)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    if admin_id:
+        headers["x-user-id"] = admin_id
+        
+    # 3. Import/Assign
+    # Endpoint: POST /construction/admin/v1/projects/{projectId}/users
+    url = f"{BASE_URL_ACC}/admin/v1/projects/{p_id}/users"
+    
+    # Basic payload - assigning 'project_member' role (usually default)
+    # Using 'products' list is often required. 'projectAdministration' is a common one, or 'docs'.
+    # Let's try a minimal add.
+    payload = [
+        {
+            "email": email,
+            "products": [
+                {
+                    "key": "docs", # Build/Docs is standard
+                    "access": "member"
+                }
+            ]
+        }
+    ]
+    
+    try:
+        resp = requests.post(url, headers=headers, json=payload)
+        
+        if resp.status_code in [200, 201]:
+            return f"✅ User {email} successfully added/invited to project {p_id}."
+        elif resp.status_code == 207: # Multi-status
+             # Check distinct results
+             data = resp.json()
+             if data.get("success") and data.get("success") > 0:
+                 return f"✅ User {email} added (Status 207)."
+             errors = data.get("errors", [])
+             err_msg = str(errors[0]) if errors else "Unknown error"
+             return f"⚠️ Partial failure adding user: {err_msg}"
+        else:
+            return f"❌ Failed to add user. Status: {resp.status_code} - {resp.text}"
+            
+    except Exception as e:
+        return f"❌ Exception adding user: {str(e)}"
