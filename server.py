@@ -18,7 +18,8 @@ from api import (
     get_cached_hub_id,
     resolve_to_version_id,
     safe_b64encode,
-    get_viewer_domain
+    get_viewer_domain,
+    search_project_folder
 )
 
 # Initialize Logging
@@ -178,6 +179,23 @@ def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
     return output
 
 @mcp.tool()
+def search_files(project_id: str, query: str) -> str:
+    """
+    Search for files or folders within a project by name.
+    """
+    items = search_project_folder(project_id, query)
+    if not items:
+        return f"🔍 No files found matching '{query}' in Project {project_id}."
+        
+    output = f"🔍 **Search Results for '{query}':**\n"
+    for i in items:
+        name = i["attributes"]["displayName"]
+        item_id = i['id']
+        item_type = "📁" if i.get("type") == "folders" else "📄"
+        output += f"{item_type} **{name}** (ID: `{item_id}`)\n"
+    return output
+
+@mcp.tool()
 def get_model_tree(project_id: str, file_id: str) -> str:
     version_id = resolve_to_version_id(project_id, file_id)
     if not version_id or not version_id.startswith("urn:"):
@@ -277,15 +295,17 @@ def create_project(
 
     # Minimal + Essential payload based on verified documentation (NO currency/language)
     # The API explicitly rejected 'currency' and 'language' as unknown properties.
+    # Uses environment variables for defaults if not provided in arguments.
+    # Updated to remove specific real-world test addresses in favor of generic defaults.
     payload = {
         "name": project_name,
         "type": project_type,  
-        "timezone": "Europe/Amsterdam", 
+        "timezone": os.environ.get("DEFAULT_PROJECT_TIMEZONE", "Europe/Amsterdam"), 
         "jobNumber": final_job_num,
-        "addressLine1": address or "Teststraat 123", 
-        "city": city or "Rotterdam",
-        "postalCode": "3011AA",       
-        "country": country or "Netherlands"
+        "addressLine1": address or os.environ.get("DEFAULT_PROJECT_ADDRESS_LINE1", "123 Generic St"), 
+        "city": city or os.environ.get("DEFAULT_PROJECT_CITY", "Metropolis"),
+        "postalCode": os.environ.get("DEFAULT_PROJECT_POSTAL_CODE", "0000AA"),       
+        "country": country or os.environ.get("DEFAULT_PROJECT_COUNTRY", "Netherlands")
     }
 
     logger.info(f"🚀 Creating Project '{project_name}' via ACC Admin API (Minimal)...")

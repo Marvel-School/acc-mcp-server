@@ -2,9 +2,10 @@ import os
 import requests
 import logging
 import base64
+from functools import lru_cache
 from urllib.parse import quote
 from typing import Optional, Dict, Any, List
-from auth import get_token, BASE_URL_ACC, BASE_URL_HQ, BASE_URL_GRAPHQL, ACC_ADMIN_EMAIL
+from auth import get_token, BASE_URL_ACC, BASE_URL_HQ_US, BASE_URL_HQ_EU, BASE_URL_GRAPHQL, ACC_ADMIN_EMAIL
 
 logger = logging.getLogger(__name__)
 
@@ -79,75 +80,186 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
     """
     Finds a user ID by pulling the user list.
     Handles pagination to ensure all users are checked.
+    Tries ACC Admin API first, then falls back to HQ API (US then EU).
     """
     token = get_token()
     c_id = clean_id(account_id)
     headers = {"Authorization": f"Bearer {token}"}
     target_email = email.lower().strip()
     
-    # Try ACC API (Modern DB)
-    # Note: We prioritize ACC API here as it's the standard for new projects
-    try:
-        url_acc = f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users"
-        offset = 0
-        limit = 100
+    # Define strategies: (Name, URL_Pattern, Is_ACC_Format)
+    strategies = [
+        ("ACC Admin", f"{BASE_URL_ACC}/admin/v1/accounts/{c_id}/users", True),
+        ("HQ US", f"{BASE_URL_HQ_US}/{c_id}/users", False),
+        ("HQ EU", f"{BASE_URL_HQ_EU}/{c_id}/users", False)
+    ]
+    
+    for name, url_base, is_acc in strategies:
+        try:
+            logger.info(f"Trying User Search via {name} ({url_base})...")
+            offset = 0
+            limit = 100
+            
+            while True:
+                params = {"limit": limit, "offset": offset}
+                resp = requests.get(url_base, headers=headers, params=params)
+                
+                if resp.status_code == 404:
+                    logger.warning(f"❌ {name} returned 404 (Not Found). Account might be in a different region or using a different API.")
+                    break # Trigger fallback to next strategy
+                
+                if resp.status_code != 200:
+                    logger.warning(f"⚠️ {name} Search failed: {resp.status_code} {resp.text}")
+                    break # API Error, but endpoint exists. Probably stop? Or try next? safer to break loop and let fallback happen if appropriate or return None.
+                
+                data = resp.json()
+                results = []
+                
+                if is_acc:
+                    results = data.get("results", [])
+                else:
+                    # HQ API typically returns a list, but handle dict wrapper just in case
+                    if isinstance(data, list):
+                        results = data
+                    elif isinstance(data, dict):
+                        results = data.get("results", [])
+                        if not results and "id" in data: # Single user? Unlikely for list endpoint
+                             pass
+                
+                if not results:
+                    if offset == 0:
+                        logger.info(f"Endpoint {name} returned empty list. Account exists but has no users?")
+                    break
+                    
+                for u in results:
+                    u_email = u.get("email", "")
+                    if u_email and u_email.lower().strip() == target_email:
+                        logger.info(f"✅ Found user in {name}: {target_email} -> {u.get('id')}")
+                        return u.get("id")
+                
+                if len(results) < limit:
+                    break # Last page
+                    
+                offset += limit
+                
+            # If we finished the while loop (and didn't break due to 404), 
+            # and didn't return, it means we scanned the valid account and didn't find the user.
+            if resp.status_code == 200:
+                logger.info(f"Scanned {name} and did NOT find user. Stopping search.")
+                return None # Account found, User not found. Do not fallback to other regions (Risk of false negatives/confusion?). 
+                # Actually, usually Account ID is unique globally. If it works in US, it won't work in EU.
         
-        while True:
-            params = {"limit": limit, "offset": offset}
-            resp = requests.get(url_acc, headers=headers, params=params)
-            
-            if resp.status_code != 200:
-                logger.warning(f"ACC List Search failed for offset {offset}: {resp.status_code}")
-                break
-
-            results = resp.json().get("results", [])
-            if not results:
-                break
-                
-            for u in results:
-                u_email = u.get("email", "")
-                if u_email and u_email.lower().strip() == target_email:
-                    logger.info(f"✅ Found user in ACC List: {target_email} -> {u.get('id')}")
-                    return u.get("id")
-            
-            if len(results) < limit:
-                break # Last page
-                
-            offset += limit
-
-    except Exception as e:
-        logger.error(f"ACC List Search Exception: {e}")
+        except Exception as e:
+            logger.error(f"{name} Search Exception: {e}")
+            # Continue to next strategy
 
     return None
 
+@lru_cache(maxsize=16)
 def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -> Optional[str]:
-    # 1. Try Requesting User
-    if requester_email:
-        uid = get_user_id_by_email(account_id, requester_email)
-        if uid: return uid
-    # 2. Try Fallback Service Account
-    if ACC_ADMIN_EMAIL:
-        logger.info(f"Using fallback admin email: {ACC_ADMIN_EMAIL}")
-        uid = get_user_id_by_email(account_id, ACC_ADMIN_EMAIL)
-        if uid: return uid
+    """
+    Robustly resolves a User ID for 2-legged auth impersonation.
+    Cached to prevent repeated API hits for the same account/email.
+    """
+    try:
+        # 0. Check for explicit Admin ID in env (Fastest path)
+        env_admin_id = os.environ.get("ACC_ADMIN_ID")
+        if env_admin_id:
+            # We trust the environment variable if present
+            # logger.debug(f"Using explicitly configured ACC_ADMIN_ID.")
+            return env_admin_id
+
+        # 1. Try Requesting User (Context-specific)
+        if requester_email:
+            logger.info(f"Looking up specific requester: {requester_email}")
+            uid = get_user_id_by_email(account_id, requester_email)
+            if uid: return uid
+
+        # 2. Try Fallback Service Account (Global Admin)
+        if ACC_ADMIN_EMAIL:
+            # Check if we've already warned about this to reduce log noise?
+            # actually lru_cache handles the function result, so we only log once per unique input execution
+            logger.info(f"Resolving Admin ID for configured email: {ACC_ADMIN_EMAIL}")
+            uid = get_user_id_by_email(account_id, ACC_ADMIN_EMAIL)
+            if uid: 
+                return uid
+            else:
+                logger.error(f"FATAL: Configured ACC_ADMIN_EMAIL '{ACC_ADMIN_EMAIL}' could not be found in Account {account_id}. Admin actions will fail.")
+        else:
+            logger.warning("ACC_ADMIN_EMAIL (or ACC_ADMIN_ID) is not set in environment. 2-legged Admin actions require this for x-user-id impersonation.")
+
+    except Exception as e:
+        logger.error(f"Unexpected error resolving Acting User ID: {e}")
     
-    logger.warning("Could not resolve any User ID for x-user-id header.")
     return None
 
 def resolve_to_version_id(project_id: str, item_id: str) -> str:
     """Helper to resolve a File Item ID (urn:adsk.wipp...) to its latest Version ID."""
     try:
-        # If it looks like a file extension ID but not a URN, search for it
-        if not item_id.startswith("urn:") and not item_id.startswith("b.") and "." in item_id:
-            # Simple name search heuristic
-            pass 
-
         if "fs.file" in item_id or "version=" in item_id:
             return item_id
             
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         p_id = ensure_b_prefix(project_id)
+        
+        # If item_id is a plain Item ID (urn:adsk.wipp:dm.lineage:...), resolved to latest tip
+        if item_id.startswith("urn:adsk.wipp:dm.lineage"):
+             url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(item_id)}/tip"
+             r = requests.get(url, headers=headers)
+             if r.status_code == 200:
+                 return r.json()["data"]["id"] # Returns the specific Version URN
+    except Exception as e:
+        logger.error(f"Version Resolution Error: {e}")
+    
+    return item_id
+
+def search_project_folder(project_id: str, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Searches for files/folders in a project using the Data Management API search.
+    """
+    try:
+        # 1. Get Hub ID (Cached)
+        hub_id = get_cached_hub_id()
+        if not hub_id: return []
+
+        # 2. Find 'Project Files' root folder
+        p_id = ensure_b_prefix(project_id)
+        # We need to fetch top folders to find the root
+        url_top = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{p_id}/topFolders"
+        data_top = make_api_request(url_top)
+        
+        if isinstance(data_top, str) or not data_top.get("data"):
+            logger.warning("Could not find top folders for search.")
+            return []
+            
+        # Prioritize 'Project Files' or just use the first valid folder
+        target_folder = next((f["id"] for f in data_top["data"] if f["attributes"]["name"] == "Project Files"), None)
+        if not target_folder:
+            target_folder = data_top["data"][0]["id"]
+            
+        # 3. Perform Search
+        # Filter syntax: filter[attributes.displayName-contains]=query
+        safe_folder = encode_urn(target_folder)
+        url_search = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/folders/{safe_folder}/search"
+        params = {
+            "filter[attributes.displayName-contains]": query,
+            "page[limit]": limit
+        }
+        
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        resp = requests.get(url_search, headers=headers, params=params)
+        if resp.status_code != 200:
+            logger.error(f"Search API Error {resp.status_code}: {resp.text}")
+            return []
+            
+        return resp.json().get("data", [])
+        
+    except Exception as e:
+        logger.error(f"Search Exception: {e}")
+        return []
         url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(item_id)}"
         r = requests.get(url, headers=headers)
         if r.status_code == 200:

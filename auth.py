@@ -15,7 +15,9 @@ ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL")
 
 # API Base URLs
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
-BASE_URL_HQ = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts" # Defaulting to EU as per code hints
+BASE_URL_HQ_US = "https://developer.api.autodesk.com/hq/v1/accounts"
+BASE_URL_HQ_EU = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts"
+BASE_URL_HQ = BASE_URL_HQ_US # Default to US, fallback logic will handle EU
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # Global token cache
