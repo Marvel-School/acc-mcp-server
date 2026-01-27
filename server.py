@@ -313,9 +313,17 @@ def create_project(
     
     response = requests.post(url, headers=headers, json=payload)
 
-    if response.status_code == 201:
-        new_id = response.json().get("id")
-        return f"✅ **Success!** Project '{project_name}' created.\nID: `{new_id}`\nJob #: {final_job_num}\nLoc: Rotterdam, NL"
+    if response.status_code in [201, 202]:
+        data = response.json()
+        new_id = data.get("id")
+        
+        if response.status_code == 202:
+             logger.info(f"INFO - Project creation initiated (Async). ID: {new_id}")
+             msg = f"✅ **Success!** Project '{project_name}' creation initiated (Async)."
+        else:
+             msg = f"✅ **Success!** Project '{project_name}' created."
+             
+        return f"{msg}\nID: `{new_id}`\nJob #: {final_job_num}\nLoc: {payload.get('city')}, {payload.get('country')}"
     elif response.status_code == 409:
         return f"⚠️ A project with the name '{project_name}' already exists."
     else:
