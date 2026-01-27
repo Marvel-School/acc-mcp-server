@@ -377,31 +377,19 @@ def list_assets(project_id: str, category_filter: str = "all") -> str:
 # ==========================================
 
 @mcp.tool()
-def list_users(name_filter: str = "all") -> str:
-    """Lists users in the account. name_filter searches name/email."""
-    filter_val = name_filter if name_filter and name_filter != "all" else ""
-    users = get_account_users(filter_val)
-    
-    if not users:
-        return "👥 No users found."
-        
-    output = f"👥 **Found {len(users)} Users:**\n"
-    for u in users[:20]:
-        name = u.get('name', 'Unknown')
-        email = u.get('email', '-')
-        uid = u.get('id', '?')
-        status = u.get('status', 'active')
-        output += f"- **{name}** ({email})\n  ID: `{uid}` | Status: {status}\n"
-        
-    if len(users) > 20:
-        output += f"\n*(Displaying 20 of {len(users)} users)*"
-    
-    return output
+def list_users(search_filter: str = "all") -> str:
+    """Lists account users. Filter is optional."""
+    # Logic: handle defaults
+    term = search_filter if search_filter and search_filter != "all" else None
+    # If term is None, get_account_users expects empty string based on api.py definition: 
+    # def get_account_users(search_term: str = "")
+    if term is None: term = ""
+    return str(get_account_users(term))
 
 @mcp.tool()
 def add_user(project_id: str, email: str) -> str:
     """Adds a user to a project by email."""
-    return invite_user_to_project(project_id, email)
+    return str(invite_user_to_project(project_id, email))
         
     output = f"📦 **Found {len(items)} Assets:**\n"
     output += "| ID | Name | Category | Status |\n"
