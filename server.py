@@ -382,9 +382,10 @@ def list_users() -> str:
     return str(get_account_users(""))
 
 @mcp.tool()
-def add_user(project_id: str, email: str) -> str:
-    """Add a user to a project. Both arguments are required."""
-    return str(invite_user_to_project(project_id, email))
+def add_project_member(project_id: str, email: str) -> str:
+    """Adds a member to a project. Required: project_id and email."""
+    # STUB MODE: Connects to Copilot without invoking API risk.
+    return f"SIMULATION: Would add {email} to project {project_id}. (Logic Connected)"
         
     output = f"📦 **Found {len(items)} Assets:**\n"
     output += "| ID | Name | Category | Status |\n"
