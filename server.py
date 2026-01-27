@@ -1,5 +1,6 @@
 import os
 import requests
+import json
 import logging
 import time
 from typing import Optional
@@ -24,7 +25,7 @@ from api import (
     get_project_issues,
     get_project_assets,
     get_account_users,
-    # invite_user_to_project
+    invite_user_to_project
 )
 
 # Initialize Logging
@@ -382,9 +383,27 @@ def list_users() -> str:
     return str(get_account_users(""))
 
 @mcp.tool()
-def add_project_member(target_project_id: str, user_email_address: str) -> str:
-    """Adds a member. Args: target_project_id, user_email_address."""
-    return f"STUB: Adding {user_email_address} to {target_project_id}"
+def manage_project_users(json_payload: str) -> str:
+    """
+    Add a user to a project.
+    REQUIRED: Pass a JSON string with keys "project_id" and "email".
+    Example: '{"project_id": "b.123", "email": "user@test.com"}'
+    """
+    try:
+        data = json.loads(json_payload)
+        p_id = data.get("project_id")
+        email = data.get("email")
+        
+        if not p_id or not email:
+            return "Error: JSON must contain 'project_id' and 'email'."
+            
+        # Call the API function
+        return str(invite_user_to_project(p_id, email))
+        
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON format. Please provide a valid JSON string."
+    except Exception as e:
+        return f"Error processing request: {str(e)}"
         
     output = f"📦 **Found {len(items)} Assets:**\n"
     output += "| ID | Name | Category | Status |\n"
