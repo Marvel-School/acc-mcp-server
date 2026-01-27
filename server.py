@@ -376,20 +376,21 @@ def list_assets(project_id: str, category_filter: str = "all") -> str:
 # ADMIN TOOLS
 # ==========================================
 
-@mcp.tool()
-def list_users(search_filter: str = "all") -> str:
-    """Lists account users. Filter is optional."""
-    # Logic: handle defaults
-    term = search_filter if search_filter and search_filter != "all" else None
-    # If term is None, get_account_users expects empty string based on api.py definition: 
-    # def get_account_users(search_term: str = "")
-    if term is None: term = ""
-    return str(get_account_users(term))
+# Temporarily disabled due to schema issues
+# @mcp.tool()
+# def list_users(search_filter: str = "all") -> str:
+#     """Lists account users. Filter is optional."""
+#     # Logic: handle defaults
+#     term = search_filter if search_filter and search_filter != "all" else None
+#     # If term is None, get_account_users expects empty string based on api.py definition: 
+#     # def get_account_users(search_term: str = "")
+#     if term is None: term = ""
+#     return str(get_account_users(term))
 
-@mcp.tool()
-def add_user(project_id: str, email: str) -> str:
-    """Adds a user to a project by email."""
-    return str(invite_user_to_project(project_id, email))
+# @mcp.tool()
+# def add_user(project_id: str, email: str) -> str:
+#     """Adds a user to a project by email."""
+#     return str(invite_user_to_project(project_id, email))
         
     output = f"📦 **Found {len(items)} Assets:**\n"
     output += "| ID | Name | Category | Status |\n"
