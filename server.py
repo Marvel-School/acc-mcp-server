@@ -351,12 +351,13 @@ def create_project(
 # ==========================================
 
 @mcp.tool()
-def list_issues(project_id: str, status: Optional[str] = None) -> str:
+def list_issues(project_id: str, status: str = "open") -> str:
     """
     Lists operational issues in a project.
-    Inputs:
-    - project_id: The ID of the project.
-    - status: Filter by status (e.g., 'open', 'closed', 'draft').
+    
+    Args:
+        project_id: The unique identifier of the project (UUID).
+        status: Filter by status (e.g., 'open', 'closed', 'draft'). Default is 'open'.
     """
     items = get_project_issues(project_id, status)
     if not items:
@@ -393,9 +394,10 @@ def list_issues(project_id: str, status: Optional[str] = None) -> str:
 def list_assets(project_id: str, category: Optional[str] = None) -> str:
     """
     Lists assets in a project.
-    Inputs:
-    - project_id: The ID of the project.
-    - category: Filter by category name (e.g., 'HVAC', 'Electrical').
+    
+    Args:
+        project_id: The unique identifier of the project (UUID).
+        category: Filter by category name (e.g., 'HVAC', 'Electrical'). Optional.
     """
     items = get_project_assets(project_id, category)
     if not items:
