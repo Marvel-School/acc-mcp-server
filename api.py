@@ -281,6 +281,17 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url") -> List
         try:
             token = get_token()
             headers = {"Authorization": f"Bearer {token}"}
+            
+            # Auto-inject x-user-id for 2-legged flows (Required for Admin/Issues/Assets)
+            try:
+                hub_id = get_cached_hub_id()
+                if hub_id:
+                    admin_uid = get_acting_user_id(clean_id(hub_id))
+                    if admin_uid:
+                        headers["x-user-id"] = admin_uid
+            except Exception:
+                pass # Proceed without header if resolution fails
+
             # Add params for offset style
             params = {}
             if style == 'offset':
