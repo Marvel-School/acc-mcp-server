@@ -351,58 +351,24 @@ def create_project(
 # ==========================================
 
 @mcp.tool()
-def list_issues(project_id: str, status: str = "") -> str:
-    """
-    Lists operational issues in a project.
+def list_issues(project_id: str, status_filter: str = "open") -> str:
+    """Lists project issues. status_filter can be 'open', 'closed' or 'all'."""
+    # Logic: handle empty string or 'none'
+    pass_status = status_filter
+    if not status_filter or status_filter == "none" or status_filter == "all":
+        pass_status = None 
     
-    Args:
-        project_id: The unique identifier of the project (UUID).
-        status: Filter by status (e.g., 'open', 'closed'). Default is empty (all issues).
-    """
-    items = get_project_issues(project_id, status)
-    if not items:
-        status_msg = f" (Status: {status})" if status else ""
-        return f"📋 No issues found in project {project_id}{status_msg}."
-    
-    # Sort by ID descending (newest first usually)
-    items.sort(key=lambda x: x.get('displayId', 0), reverse=True)
-    
-    output = f"📋 **Found {len(items)} Issues:**\n"
-    output += "| ID | Title | Status | Assignee |\n"
-    output += "|---|---|---|---|\n"
-    
-    for i in items[:20]: # Show top 20
-        # Data extraction safety
-        title = i.get('title', 'Untitled').replace("|", "-")
-        stat = i.get('status', 'Unknown')
-        
-        assignee_data = i.get('assignedTo', {})
-        assignee = "Unassigned"
-        if assignee_data:
-            assignee = assignee_data.get('name', assignee_data.get('email', 'Unknown User'))
-        
-        display_id = i.get('displayId', i.get('identifier', '?'))
-        
-        output += f"| {display_id} | {title} | {stat} | {assignee} |\n"
-        
-    if len(items) > 20:
-        output += f"\n*(Displaying 20 of {len(items)} issues)*"
-        
-    return output
+    # Safe fallback if user strictly meant "Copy logic exactly", but "all" allows full list
+    if status_filter == "open": pass_status = "open"
+
+    return str(get_project_issues(project_id, pass_status))
 
 @mcp.tool()
-def list_assets(project_id: str, category: str = "") -> str:
-    """
-    Lists assets in a project.
-    
-    Args:
-        project_id: The unique identifier of the project (UUID).
-        category: Filter by category name (e.g., 'HVAC', 'Electrical'). Optional.
-    """
-    items = get_project_assets(project_id, category)
-    if not items:
-        cat_msg = f" (Category: {category})" if category else ""
-        return f"📦 No assets found in project {project_id}{cat_msg}."
+def list_assets(project_id: str, category_filter: str = "all") -> str:
+    """Lists project assets. category_filter is optional."""
+    # Logic: pass filter if it exists
+    cat = category_filter if category_filter and category_filter not in ["all", "none"] else None
+    return str(get_project_assets(project_id, cat))
         
     output = f"📦 **Found {len(items)} Assets:**\n"
     output += "| ID | Name | Category | Status |\n"
