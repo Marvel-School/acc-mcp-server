@@ -483,8 +483,8 @@ def fetch_project_users(project_id: str) -> list:
 
 def trigger_data_extraction(services: list = None) -> dict:
     """
-    Triggers a Data Connector extraction job.
-    Valid services: ['admin', 'issues', 'locations', 'submittals', 'cost', 'rfis', 'assets', 'forms']
+    Triggers a Data Connector export.
+    FORCE-IMPERSONATION: Acts as Account Admin to bypass user permission limits.
     """
     token = get_token()
     headers = {
@@ -495,51 +495,49 @@ def trigger_data_extraction(services: list = None) -> dict:
     # 1. Get Account Context
     hub_id = get_cached_hub_id()
     if not hub_id:
-        return {"error": "No Hub ID found. Cannot derive Account ID."}
-    
-    # Strip 'b.' to get Account ID (e.g. "b.123" -> "123")
+        return {"error": "No Hub ID found."}
     account_id = clean_id(hub_id)
     
-    # 2. Add Impersonation (Required for Data Connector)
-    acting_user = get_acting_user_id(account_id)
-    if acting_user:
-        headers["x-user-id"] = acting_user
+    # 2. FORCE ADMIN CONTEXT (The Fix)
+    # Passing account_id forces the system to find an Account Admin's ID
+    admin_id = get_acting_user_id(account_id)
+    
+    if admin_id:
+        headers["x-user-id"] = admin_id
+    else:
+        return {"error": "Could not resolve an Account Admin ID to run this export."}
         
-    # 3. Correct URL Structure
+    # 3. Request
     url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests"
     
-    # Construct Payload
     payload = {
         "description": "Export triggered via Copilot Agent",
-        "schedule": { "interval": "OneTime" } # Default to immediate run
+        "schedule": { "interval": "OneTime" }
     }
-    
-    # Map friendly names to API keys if necessary, or pass raw list
     if services:
         payload["serviceGroups"] = services
         
     response = requests.post(url, headers=headers, json=payload)
     
     if response.status_code in [200, 201, 202]:
-        return response.json() # Returns dict with "id"
+        return response.json()
     else:
         return {"error": f"Failed ({response.status_code}): {response.text}"}
 
 def get_extraction_status(request_id: str) -> dict:
-    """Checks the status of a Data Connector job."""
+    """Checks Data Connector status using Admin Context."""
     token = get_token()
     headers = { "Authorization": f"Bearer {token}" }
     
     hub_id = get_cached_hub_id()
-    if not hub_id:
-        return {"error": "No Hub ID found."}
+    if not hub_id: return {"error": "No Hub ID found."}
     account_id = clean_id(hub_id)
     
-    acting_user = get_acting_user_id(account_id)
-    if acting_user:
-        headers["x-user-id"] = acting_user
+    # Force Admin Context
+    admin_id = get_acting_user_id(account_id)
+    if admin_id:
+        headers["x-user-id"] = admin_id
 
-    # Correct URL Structure
     url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests/{request_id}"
     
     response = requests.get(url, headers=headers)
