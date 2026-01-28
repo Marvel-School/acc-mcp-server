@@ -405,9 +405,9 @@ def get_account_users(search_term: str = "") -> List[Dict[str, Any]]:
         
     return all_users
 
-def invite_user_to_project(project_id: str, email: str) -> str:
+def invite_user_to_project(project_id: str, email: str, products: Optional[List[Dict[str, Any]]] = None) -> str:
     """
-    Adds a user to a project.
+    Adds a user to a project with default 'Docs Member' access if unspecified.
     """
     token = get_token()
     p_id = clean_id(project_id)
@@ -429,18 +429,18 @@ def invite_user_to_project(project_id: str, email: str) -> str:
     # Endpoint: POST /construction/admin/v1/projects/{projectId}/users
     url = f"{BASE_URL_ACC}/admin/v1/projects/{p_id}/users"
     
-    # Basic payload - assigning 'project_member' role (usually default)
-    # Using 'products' list is often required. 'projectAdministration' is a common one, or 'docs'.
-    # Let's try a minimal add.
+    # Default Access: Docs Member
+    if not products:
+        products = [{
+            "key": "docs",
+            "access": "member"
+        }]
+
+    # Payload must be a LIST of user objects according to documentation
     payload = [
         {
             "email": email,
-            "products": [
-                {
-                    "key": "docs", # Build/Docs is standard
-                    "access": "member"
-                }
-            ]
+            "products": products
         }
     ]
     
