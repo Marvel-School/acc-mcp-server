@@ -1,5 +1,6 @@
 import os
 import requests
+import json
 import logging
 import time
 from typing import Optional
@@ -19,7 +20,12 @@ from api import (
     resolve_to_version_id,
     safe_b64encode,
     get_viewer_domain,
-    search_project_folder
+    search_project_folder,
+    fetch_paginated_data,
+    get_project_issues,
+    get_project_assets,
+    get_account_users,
+    invite_user_to_project
 )
 
 # Initialize Logging
@@ -44,20 +50,36 @@ def list_hubs() -> str:
 
 @mcp.tool()
 def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 20) -> str:
+    """
+    Finds projects.
+    AI INSTRUCTIONS:
+    1. If the user asks for a specific project (e.g. "Find the Marvel project"), pass that name to 'name_filter'.
+    2. If the user asks for "all projects", leave arguments empty.
+    3. Use this tool FIRST to find a 'project_id' before calling other tools.
+    """
     if not hub_id:
         hub_id = get_cached_hub_id()
         if not hub_id: return "Error: No Hubs found."
         
-    data = make_api_request(f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects")
-    if isinstance(data, str): return data
+    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
     
-    all_projs = data.get("data", [])
+    # Use shared pagination logic (Style 'url' for Data Management API)
+    all_projs = fetch_paginated_data(url, style='url')
+    
+    # Client-side filtering
     if name_filter:
         all_projs = [p for p in all_projs if name_filter.lower() in p['attributes']['name'].lower()]
     
+    # Sort by name
+    all_projs.sort(key=lambda x: x['attributes'].get('name', ''))
+
     output = f"📂 **Found {len(all_projs)} Projects:**\n"
     for p in all_projs[:limit]: 
         output += f"- **{p['attributes']['name']}**\n  ID: `{p['id']}`\n"
+        
+    if len(all_projs) > limit:
+        output += f"\n*(Displaying {limit} of {len(all_projs)} results. Use 'name_filter' to refine.)*"
+        
     return output
 
 # ==========================================
@@ -249,8 +271,11 @@ def create_project(
     job_number: Optional[str] = None
 ) -> str:
     """
-    Creates a new project in the ACC Account.
-    Arguments like dates and address are optional; if left blank, I will auto-generate them.
+    Creates a new project.
+    AI INSTRUCTIONS:
+    1. Extract the project name from the user's request.
+    2. If the user provides a type, start/end date, or address, include them.
+    3. If details are missing, do NOT ask the user. Use the defaults provided in the function.
     """
     # 1. Get Authentication
     try:
@@ -329,6 +354,71 @@ def create_project(
     else:
         logger.error(f"Failed to create project: {response.text}")
         return f"❌ Failed to create project. (Status: {response.status_code})\nError Details: {response.text}"
+
+# ==========================================
+# QUALITY & ASSETS TOOLS
+# ==========================================
+
+@mcp.tool()
+def list_issues(project_id: str, status_filter: str = "open") -> str:
+    """
+    Lists issues in a project.
+    AI INSTRUCTIONS:
+    1. You MUST have a 'project_id' first. If you don't, call list_projects.
+    2. Map user terms to filters: "Active"->"open", "Fixed"->"closed", "Everything"->"all".
+    """
+    # Logic: handle empty string or 'none'
+    pass_status = status_filter
+    if not status_filter or status_filter == "none" or status_filter == "all":
+        pass_status = None 
+    
+    # Safe fallback if user strictly meant "Copy logic exactly", but "all" allows full list
+    if status_filter == "open": pass_status = "open"
+
+    return str(get_project_issues(project_id, pass_status))
+
+@mcp.tool()
+def list_assets(project_id: str, category_filter: str = "all") -> str:
+    """Lists project assets. category_filter is optional."""
+    # Logic: pass filter if it exists
+    cat = category_filter if category_filter and category_filter not in ["all", "none"] else None
+    return str(get_project_assets(project_id, cat))
+
+# ==========================================
+# ADMIN TOOLS
+# ==========================================
+
+@mcp.tool()
+def list_users() -> str:
+    """List all users in the account. No arguments."""
+    return str(get_account_users(""))
+
+@mcp.tool()
+def manage_project_users(json_payload: str) -> str:
+    """
+    Add a user to a project.
+    
+    IMPORTANT INSTRUCTIONS FOR AI:
+    1. When a user says "Add [EMAIL] to [PROJECT]", you must first find the 'project_id'.
+    2. Then, construct a JSON string internally: '{"project_id": "...", "email": "..."}'.
+    3. Pass ONLY this JSON string as the 'json_payload' argument.
+    4. Do NOT ask the user to format JSON. Do it silently.
+    """
+    try:
+        data = json.loads(json_payload)
+        p_id = data.get("project_id")
+        email = data.get("email")
+        
+        if not p_id or not email:
+            return "Error: JSON must contain 'project_id' and 'email'."
+            
+        # Call the API function
+        return str(invite_user_to_project(p_id, email))
+        
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON format. Please provide a valid JSON string."
+    except Exception as e:
+        return f"Error processing request: {str(e)}"
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")

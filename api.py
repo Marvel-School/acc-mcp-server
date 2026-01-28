@@ -1,6 +1,7 @@
 import os
 import requests
 import logging
+import time
 import base64
 from functools import lru_cache
 from urllib.parse import quote
@@ -260,9 +261,206 @@ def search_project_folder(project_id: str, query: str, limit: int = 20) -> List[
     except Exception as e:
         logger.error(f"Search Exception: {e}")
         return []
-        url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/items/{encode_urn(item_id)}"
-        r = requests.get(url, headers=headers)
-        if r.status_code == 200:
-            return r.json()["data"]["relationships"]["tip"]["data"]["id"]
-    except Exception: pass
-    return item_id
+
+# --- NEW: FEATURES API (Issues/Assets) ---
+
+def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", impersonate: bool = False) -> List[Dict[str, Any]]:
+    """
+    Generic pagination helper for ACC APIs.
+    styles: 
+      - 'url': uses data['links']['next']['href'] (Data Management API)
+      - 'offset': uses 'offset' and 'limit' query params (Admin/Issues API)
+    """
+    all_items = []
+    page_count = 0
+    MAX_PAGES = 50
+    current_url = url
+    offset = 0
+    
+    while current_url and page_count < MAX_PAGES:
+        try:
+            token = get_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            
+            # Auto-inject x-user-id for 2-legged flows (Required for Admin/Issues/Assets)
+            if impersonate:
+                try:
+                    hub_id = get_cached_hub_id()
+                    if hub_id:
+                        admin_uid = get_acting_user_id(clean_id(hub_id))
+                        if admin_uid:
+                            headers["x-user-id"] = admin_uid
+                except Exception:
+                    pass # Proceed without header if resolution fails
+
+            # Add params for offset style
+            params = {}
+            if style == 'offset':
+                params = {"offset": offset, "limit": limit}
+
+            resp = requests.get(current_url, headers=headers, params=params if style == 'offset' else None)
+            
+            if resp.status_code in [403, 404]:
+                logger.warning(f"Endpoint returned {resp.status_code} (Module inactive?).")
+                break
+            if resp.status_code != 200:
+                logger.error(f"Pagination Error {resp.status_code} at {current_url}: {resp.text}")
+                break
+                
+            data = resp.json()
+            
+            # Determine list key
+            batch = []
+            if isinstance(data, list):
+                batch = data
+            elif isinstance(data, dict):
+                if "data" in data and isinstance(data["data"], list):
+                    batch = data["data"]
+                elif "results" in data and isinstance(data["results"], list):
+                    batch = data["results"]
+            
+            all_items.extend(batch)
+            
+            # Navigate
+            if style == 'url':
+                links = data.get("links", {})
+                next_obj = links.get("next")
+                if isinstance(next_obj, dict):
+                    current_url = next_obj.get("href")
+                else:
+                    current_url = None
+            elif style == 'offset':
+                if len(batch) < limit:
+                     current_url = None
+                else:
+                     offset += limit
+            
+            page_count += 1
+            time.sleep(0.5) # Rate limit protection
+
+        except Exception as e:
+            logger.error(f"Pagination Loop Exception: {e}")
+            break
+            
+    return all_items
+
+def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    p_id = clean_id(project_id)
+    url = f"{BASE_URL_ACC}/issues/v1/projects/{p_id}/issues"
+    # Issues API uses offset/limit
+    items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
+    
+    if status:
+        items = [i for i in items if i.get("status", "").lower() == status.lower()]
+        
+    return items
+
+def get_project_assets(project_id: str, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    p_id = clean_id(project_id)
+    url = f"{BASE_URL_ACC}/assets/v2/projects/{p_id}/assets" # Assets V2
+    items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
+    
+    if category:
+        items = [i for i in items if category.lower() in i.get("category", {}).get("name", "").lower()]
+        
+    return items
+
+# --- ADMIN API (Users) ---
+
+def get_account_users(search_term: str = "") -> List[Dict[str, Any]]:
+    """
+    Fetches users from the Account Admin.
+    Defaults to HQ US API as fallbacks proved necessary for this account.
+    """
+    hub_id = get_cached_hub_id()
+    if not hub_id: return []
+    account_id = clean_id(hub_id)
+    
+    # Use HQ US endpoint based on previous successful debugging
+    # We could make this adaptive, but keeping it simple for now as we know what works.
+    url = f"{BASE_URL_HQ_US}/{account_id}/users"
+    
+    # HQ API handles basic list, but searching might need client side filtering 
+    # if the API search param isn't strictly 'name'.
+    # HQ API supports ?name=... but simple list + filter is safer.
+    
+    all_users = fetch_paginated_data(url, limit=100, style='url') # HQ often uses offset, but let's check fetch_paginated_data...
+    # Actually HQ usually returns a list at the top level or inside results?
+    # fetch_paginated_data handles "results" key.
+    # But HQ pagination is usually limit/offset? 
+    # Let's try style='offset' just to be safe if it follows common patterns, 
+    # BUT wait, read_file of api.py showed logic in get_user_id_by_email dealing with this.
+    # It used params={"limit": limit, "offset": offset}, so it IS offset based.
+    
+    if not all_users:
+         # Retry with offset style explicitly
+         all_users = fetch_paginated_data(url, limit=100, style='offset')
+
+    if search_term and search_term.lower() != "all":
+        term = search_term.lower()
+        all_users = [
+            u for u in all_users 
+            if term in u.get("name", "").lower() or term in u.get("email", "").lower()
+        ]
+        
+    return all_users
+
+def invite_user_to_project(project_id: str, email: str, products: list = None) -> str:
+    """
+    Invites a user to a project.
+    Always ensures 'products' list exists (defaults to 'docs' -> 'member').
+    """
+    try:
+        # 1. Get Token & Headers
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        
+        # 1b. Resolve Account context for impersonation
+        hub_id = get_cached_hub_id()
+        account_id = clean_id(hub_id)
+
+        # 2. Add Impersonation (Required for Admin Write operations)
+        acting_user = get_acting_user_id(account_id)
+        if acting_user:
+            headers["x-user-id"] = acting_user
+            
+        # 3. Clean ID
+        p_id = clean_id(project_id)
+        
+        # 4. SAFETY NET: Force Default Product if missing
+        if not products:
+            products = [{
+                "key": "docs",
+                "access": "member"
+            }]
+            
+        # 5. Construct Payload
+        payload = {
+            "email": email,
+            "products": products
+        }
+        
+        url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{p_id}/users"
+        
+        # 6. Execute
+        response = requests.post(url, headers=headers, json=payload)
+        
+        # 7. Handle Common Responses
+        if response.status_code == 200 or response.status_code == 201:
+            return f"✅ Success: Added {email} to project {p_id} with access: {[p['key'] for p in products]}."
+            
+        elif response.status_code == 409:
+            # Handle "User already exists" gracefully
+            return f"ℹ️ User {email} is already active in project {p_id}."
+            
+        elif response.status_code == 400:
+            return f"❌ Bad Request (400): {response.text} (Check payload format)"
+            
+        else:
+            return f"❌ Error {response.status_code}: {response.text}"
+            
+    except Exception as e:
+        return f"❌ Exception in invite_user_to_project: {str(e)}"
