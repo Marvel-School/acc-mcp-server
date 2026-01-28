@@ -292,10 +292,9 @@ def create_project(
     account_id = clean_id(raw_hub_id) 
     logger.info(f"Targeting Account ID: {account_id}")
 
-    # Resolve Acting Admin ID for 2-legged Auth
+    # Resolve Acting Admin ID for 2-legged Auth (Required).
     admin_id = get_acting_user_id(account_id)
     if not admin_id:
-        # Without x-user-id, Admin API often returns 401/403 for 2-legged tokens
         logger.warning("⚠️ Could not resolve Admin User ID. Request might fail with 401.")
     else:
         logger.info(f"Acting as Admin User ID: {admin_id}")
@@ -318,10 +317,8 @@ def create_project(
     
     final_job_num = job_number if job_number else f"JN-{int(time.time())}"
 
-    # Minimal + Essential payload based on verified documentation (NO currency/language)
-    # The API explicitly rejected 'currency' and 'language' as unknown properties.
+    # Minimal payload required by ACC Admin API.
     # Uses environment variables for defaults if not provided in arguments.
-    # Updated to remove specific real-world test addresses in favor of generic defaults.
     payload = {
         "name": project_name,
         "type": project_type,  
@@ -367,12 +364,12 @@ def list_issues(project_id: str, status_filter: str = "open") -> str:
     1. You MUST have a 'project_id' first. If you don't, call list_projects.
     2. Map user terms to filters: "Active"->"open", "Fixed"->"closed", "Everything"->"all".
     """
-    # Logic: handle empty string or 'none'
+    # Normalize filter arguments.
     pass_status = status_filter
     if not status_filter or status_filter == "none" or status_filter == "all":
         pass_status = None 
     
-    # Safe fallback if user strictly meant "Copy logic exactly", but "all" allows full list
+    # Defaults to 'open' if specified.
     if status_filter == "open": pass_status = "open"
 
     return str(get_project_issues(project_id, pass_status))
@@ -380,7 +377,7 @@ def list_issues(project_id: str, status_filter: str = "open") -> str:
 @mcp.tool()
 def list_assets(project_id: str, category_filter: str = "all") -> str:
     """Lists project assets. category_filter is optional."""
-    # Logic: pass filter if it exists
+    # Normalize category filter.
     cat = category_filter if category_filter and category_filter not in ["all", "none"] else None
     return str(get_project_assets(project_id, cat))
 
