@@ -51,8 +51,11 @@ def list_hubs() -> str:
 @mcp.tool()
 def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = None, limit: int = 20) -> str:
     """
-    Lists projects in the Hub (Pagination enabled).
-    Fetches ALL projects via pagination, then filters and returns up to 'limit' results.
+    Finds projects.
+    AI INSTRUCTIONS:
+    1. If the user asks for a specific project (e.g. "Find the Marvel project"), pass that name to 'name_filter'.
+    2. If the user asks for "all projects", leave arguments empty.
+    3. Use this tool FIRST to find a 'project_id' before calling other tools.
     """
     if not hub_id:
         hub_id = get_cached_hub_id()
@@ -268,8 +271,11 @@ def create_project(
     job_number: Optional[str] = None
 ) -> str:
     """
-    Creates a new project in the ACC Account.
-    Arguments like dates and address are optional; if left blank, I will auto-generate them.
+    Creates a new project.
+    AI INSTRUCTIONS:
+    1. Extract the project name from the user's request.
+    2. If the user provides a type, start/end date, or address, include them.
+    3. If details are missing, do NOT ask the user. Use the defaults provided in the function.
     """
     # 1. Get Authentication
     try:
@@ -355,7 +361,12 @@ def create_project(
 
 @mcp.tool()
 def list_issues(project_id: str, status_filter: str = "open") -> str:
-    """Lists project issues. status_filter can be 'open', 'closed' or 'all'."""
+    """
+    Lists issues in a project.
+    AI INSTRUCTIONS:
+    1. You MUST have a 'project_id' first. If you don't, call list_projects.
+    2. Map user terms to filters: "Active"->"open", "Fixed"->"closed", "Everything"->"all".
+    """
     # Logic: handle empty string or 'none'
     pass_status = status_filter
     if not status_filter or status_filter == "none" or status_filter == "all":
