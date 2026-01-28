@@ -3,6 +3,7 @@ import requests
 import json
 import logging
 import time
+from difflib import SequenceMatcher
 from typing import Optional
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -18,6 +19,7 @@ from api import (
     encode_urn,
     get_cached_hub_id,
     resolve_to_version_id,
+    fetch_project_users,
     safe_b64encode,
     get_viewer_domain,
     search_project_folder,
@@ -66,9 +68,28 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
     # Use shared pagination logic (Style 'url' for Data Management API)
     all_projs = fetch_paginated_data(url, style='url')
     
-    # Client-side filtering
+    # Client-side filtering with Fuzzy Logic (Substring + difflib)
     if name_filter:
-        all_projs = [p for p in all_projs if name_filter.lower() in p['attributes']['name'].lower()]
+        nf = name_filter.lower()
+        clean_nf = nf.replace(" ", "")
+        filtered_projs = []
+        
+        for p in all_projs:
+            p_name = p.get('attributes', {}).get('name', '')
+            pn = p_name.lower()
+            clean_pn = pn.replace(" ", "")
+            
+            # 1. Strict Substring Match (Fastest & Safest)
+            if nf in pn or clean_nf in clean_pn:
+                filtered_projs.append(p)
+                continue
+                
+            # 2. Fuzzy Match (For Typos)
+            similarity = SequenceMatcher(None, nf, pn).ratio()
+            if similarity > 0.6:
+                filtered_projs.append(p)
+                
+        all_projs = filtered_projs
     
     # Sort by name
     all_projs.sort(key=lambda x: x['attributes'].get('name', ''))
@@ -389,6 +410,32 @@ def list_assets(project_id: str, category_filter: str = "all") -> str:
 def list_users() -> str:
     """List all users in the account. No arguments."""
     return str(get_account_users(""))
+
+@mcp.tool()
+def list_project_users(project_id: str) -> str:
+    """
+    Lists valid users assigned to a specific project.
+    AI INSTRUCTIONS: Use this instead of 'list_users' when the user asks about a specific project.
+    """
+    try:
+        users = fetch_project_users(project_id)
+        if not users:
+            return f"ℹ️ No users found in project {project_id} (or Access Denied)."
+        
+        output = f"👥 **Project Members ({len(users)}):**\n"
+        for u in users[:20]: # Limit to avoid huge context
+            # Handle potential missing keys safely
+            name = u.get("name", u.get("email", "Unknown"))
+            role = u.get("jobTitle", "Member") 
+            # Note: ACC Admin API returns 'products' list which implies access
+            output += f"- {name} ({role})\n"
+            
+        if len(users) > 20:
+            output += f"\n*(Showing 20 of {len(users)} users)*"
+            
+        return output
+    except Exception as e:
+        return f"❌ Error listing project users: {str(e)}"
 
 @mcp.tool()
 def manage_project_users(json_payload: str) -> str:
