@@ -386,8 +386,12 @@ def list_users() -> str:
 def manage_project_users(json_payload: str) -> str:
     """
     Add a user to a project.
-    REQUIRED: Pass a JSON string with keys "project_id" and "email".
-    Example: '{"project_id": "b.123", "email": "user@test.com"}'
+    
+    IMPORTANT INSTRUCTIONS FOR AI:
+    1. When a user says "Add [EMAIL] to [PROJECT]", you must first find the 'project_id'.
+    2. Then, construct a JSON string internally: '{"project_id": "...", "email": "..."}'.
+    3. Pass ONLY this JSON string as the 'json_payload' argument.
+    4. Do NOT ask the user to format JSON. Do it silently.
     """
     try:
         data = json.loads(json_payload)
