@@ -264,7 +264,7 @@ def search_project_folder(project_id: str, query: str, limit: int = 20) -> List[
 
 # --- NEW: FEATURES API (Issues/Assets) ---
 
-def fetch_paginated_data(url: str, limit: int = 100, style: str = "url") -> List[Dict[str, Any]]:
+def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", impersonate: bool = False) -> List[Dict[str, Any]]:
     """
     Generic pagination helper for ACC APIs.
     styles: 
@@ -283,14 +283,15 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url") -> List
             headers = {"Authorization": f"Bearer {token}"}
             
             # Auto-inject x-user-id for 2-legged flows (Required for Admin/Issues/Assets)
-            try:
-                hub_id = get_cached_hub_id()
-                if hub_id:
-                    admin_uid = get_acting_user_id(clean_id(hub_id))
-                    if admin_uid:
-                        headers["x-user-id"] = admin_uid
-            except Exception:
-                pass # Proceed without header if resolution fails
+            if impersonate:
+                try:
+                    hub_id = get_cached_hub_id()
+                    if hub_id:
+                        admin_uid = get_acting_user_id(clean_id(hub_id))
+                        if admin_uid:
+                            headers["x-user-id"] = admin_uid
+                except Exception:
+                    pass # Proceed without header if resolution fails
 
             # Add params for offset style
             params = {}
@@ -347,7 +348,7 @@ def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Di
     p_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/issues/v1/projects/{p_id}/issues"
     # Issues API uses offset/limit
-    items = fetch_paginated_data(url, limit=50, style='offset')
+    items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
     
     if status:
         items = [i for i in items if i.get("status", "").lower() == status.lower()]
@@ -357,7 +358,7 @@ def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Di
 def get_project_assets(project_id: str, category: Optional[str] = None) -> List[Dict[str, Any]]:
     p_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/assets/v2/projects/{p_id}/assets" # Assets V2
-    items = fetch_paginated_data(url, limit=50, style='offset')
+    items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
     
     if category:
         items = [i for i in items if category.lower() in i.get("category", {}).get("name", "").lower()]
