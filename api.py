@@ -481,68 +481,78 @@ def fetch_project_users(project_id: str) -> list:
 
 # --- DATA CONNECTOR API ---
 
-def trigger_data_extraction(services: list = None) -> dict:
-    """
-    Triggers a Data Connector export.
-    FORCE-IMPERSONATION: Acts as Account Admin to bypass user permission limits.
-    """
+def _get_admin_headers(account_id: str):
+    """Helper to get headers with Admin Impersonation."""
     token = get_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    
-    # 1. Get Account Context
-    hub_id = get_cached_hub_id()
-    if not hub_id:
-        return {"error": "No Hub ID found."}
-    account_id = clean_id(hub_id)
-    
-    # 2. FORCE ADMIN CONTEXT (The Fix)
-    # Passing account_id forces the system to find an Account Admin's ID
+    headers = { "Authorization": f"Bearer {token}", "Content-Type": "application/json" }
     admin_id = get_acting_user_id(account_id)
-    
     if admin_id:
         headers["x-user-id"] = admin_id
-    else:
-        return {"error": "Could not resolve an Account Admin ID to run this export."}
-        
-    # 3. Request
+    return headers
+
+def trigger_data_extraction(services: list = None) -> dict:
+    """Triggers Data Export (Admin Context)."""
+    hub_id = get_cached_hub_id()
+    if not hub_id: return {"error": "No Hub ID found."}
+    account_id = clean_id(hub_id)
+    
+    headers = _get_admin_headers(account_id)
+    if "x-user-id" not in headers:
+        return {"error": "Could not resolve Account Admin ID."}
+
     url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests"
     
     payload = {
-        "description": "Export triggered via Copilot Agent",
+        "description": "Copilot Export",
         "schedule": { "interval": "OneTime" }
     }
     if services:
         payload["serviceGroups"] = services
         
     response = requests.post(url, headers=headers, json=payload)
-    
-    if response.status_code in [200, 201, 202]:
+    if response.status_code in [200, 201]:
         return response.json()
-    else:
-        return {"error": f"Failed ({response.status_code}): {response.text}"}
+    return {"error": f"Failed {response.status_code}: {response.text}"}
 
-def get_extraction_status(request_id: str) -> dict:
-    """Checks Data Connector status using Admin Context."""
-    token = get_token()
-    headers = { "Authorization": f"Bearer {token}" }
-    
+def check_request_job_status(request_id: str) -> dict:
+    """Gets the JOB status associated with a REQUEST."""
     hub_id = get_cached_hub_id()
     if not hub_id: return {"error": "No Hub ID found."}
     account_id = clean_id(hub_id)
     
-    # Force Admin Context
-    admin_id = get_acting_user_id(account_id)
-    if admin_id:
-        headers["x-user-id"] = admin_id
-
-    url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests/{request_id}"
+    headers = _get_admin_headers(account_id)
     
+    # 1. Get Jobs for this Request
+    url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests/{request_id}/jobs"
     response = requests.get(url, headers=headers)
     
+    if response.status_code != 200:
+        return {"error": f"Failed to get jobs: {response.text}"}
+        
+    data = response.json()
+    jobs = data.get("results", [])
+    if not jobs:
+        return {"status": "QUEUED", "job_id": None}
+        
+    # Get latest job
+    latest_job = jobs[0]
+    return {
+        "status": latest_job.get("completionStatus", "PROCESSING"), # success, failed
+        "job_id": latest_job.get("id"),
+        "progress": latest_job.get("progress", 0)
+    }
+
+def get_data_download_url(job_id: str) -> str:
+    """Gets signed URL for the ZIP file."""
+    hub_id = get_cached_hub_id()
+    account_id = clean_id(hub_id)
+    headers = _get_admin_headers(account_id)
+    
+    # We request the master ZIP file specifically
+    filename = "autodesk_data_extract.zip"
+    url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/jobs/{job_id}/data/{filename}"
+    
+    response = requests.get(url, headers=headers)
     if response.status_code == 200:
-        return response.json()
-    else:
-        return {"error": f"Failed ({response.status_code}): {response.text}"}
+        return response.json().get("signedUrl")
+    return None

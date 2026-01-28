@@ -21,7 +21,8 @@ from api import (
     resolve_to_version_id,
     fetch_project_users,
     trigger_data_extraction,
-    get_extraction_status,
+    check_request_job_status,
+    get_data_download_url,
     safe_b64encode,
     get_viewer_domain,
     search_project_folder,
@@ -494,25 +495,31 @@ def run_data_export(data_types: str = "all") -> str:
     return f"✅ **Data Export Started!**\nJob ID: `{job_id}`\n\nThis process happens in the background. You can check progress using 'check_export_status' with this ID, or look for an email from Autodesk when complete."
 
 @mcp.tool()
-def check_export_status(job_id: str) -> str:
-    """Checks the status of a Data Connector export job."""
-    result = get_extraction_status(job_id)
+def check_export_status(request_id: str) -> str:
+    """
+    Checks status of Data Connector request.
+    If complete, returns a DOWNLOAD LINK.
+    """
+    result = check_request_job_status(request_id)
     
     if "error" in result:
-        return f"❌ Error checking status: {result['error']}"
+        return f"❌ Error: {result['error']}"
         
-    status = result.get("status", "Unknown")
+    status = result.get("status")
+    job_id = result.get("job_id")
     
-    output = f"📊 **Job Status:** {status}\n"
-    
-    if status == "SUCCESS":
-        output += "✅ Export complete! The data is now available in the 'Insight' module of your ACC Account, or via the email notification sent to the Admin."
+    if status == "SUCCESS" and job_id:
+        # Fetch Link
+        link = get_data_download_url(job_id)
+        if link:
+            return f"✅ **Export Complete!**\n\n⬇️ [Click here to Download ZIP]({link})\n*(Link expires in 60 seconds)*"
+        else:
+            return "✅ Export complete, but failed to generate download link."
+            
     elif status == "FAILED":
-        output += "❌ The export failed."
-    else:
-        output += "⏳ Processing... (Please check again in a few minutes)"
+        return "❌ Export Job Failed."
         
-    return output
+    return f"⏳ Export Processing... (Job ID: {job_id})"
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
