@@ -471,3 +471,10 @@ def invite_user_to_project(project_id: str, email: str, products: list = None) -
             
     except Exception as e:
         return f"❌ Exception in invite_user_to_project: {str(e)}"
+
+def fetch_project_users(project_id: str) -> list:
+    """Fetches users specific to a project using ACC Admin API."""
+    p_id = clean_id(project_id)
+    url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{p_id}/users"
+    # Admin API requires impersonation
+    return fetch_paginated_data(url, limit=100, style='offset', impersonate=True)
