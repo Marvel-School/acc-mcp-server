@@ -405,60 +405,62 @@ def get_account_users(search_term: str = "") -> List[Dict[str, Any]]:
         
     return all_users
 
-def invite_user_to_project(project_id: str, email: str, products: Optional[List[Dict[str, Any]]] = None) -> str:
+def invite_user_to_project(project_id: str, email: str, products: list = None) -> str:
     """
-    Adds a user to a project with default 'Docs Member' access if unspecified.
+    Invites a user to a project.
+    Always ensures 'products' list exists (defaults to 'docs' -> 'member').
     """
-    token = get_token()
-    p_id = clean_id(project_id)
-    
-    # 1. Resolve Account parameters
-    hub_id = get_cached_hub_id()
-    account_id = clean_id(hub_id)
-    
-    # 2. Get Admin Context (x-user-id)
-    admin_id = get_acting_user_id(account_id)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    if admin_id:
-        headers["x-user-id"] = admin_id
+    try:
+        # 1. Get Token & Headers
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
         
-    # 3. Import/Assign
-    # Endpoint: POST /construction/admin/v1/projects/{projectId}/users
-    url = f"{BASE_URL_ACC}/admin/v1/projects/{p_id}/users"
-    
-    # Default Access: Docs Member
-    if not products:
-        products = [{
-            "key": "docs",
-            "access": "member"
-        }]
+        # 1b. Resolve Account context for impersonation
+        hub_id = get_cached_hub_id()
+        account_id = clean_id(hub_id)
 
-    # Payload must be a LIST of user objects according to documentation
-    payload = [
-        {
+        # 2. Add Impersonation (Required for Admin Write operations)
+        acting_user = get_acting_user_id(account_id)
+        if acting_user:
+            headers["x-user-id"] = acting_user
+            
+        # 3. Clean ID
+        p_id = clean_id(project_id)
+        
+        # 4. SAFETY NET: Force Default Product if missing
+        if not products:
+            products = [{
+                "key": "docs",
+                "access": "member"
+            }]
+            
+        # 5. Construct Payload
+        payload = {
             "email": email,
             "products": products
         }
-    ]
-    
-    try:
-        resp = requests.post(url, headers=headers, json=payload)
         
-        if resp.status_code in [200, 201]:
-            return f"✅ User {email} successfully added/invited to project {p_id}."
-        elif resp.status_code == 207: # Multi-status
-             # Check distinct results
-             data = resp.json()
-             if data.get("success") and data.get("success") > 0:
-                 return f"✅ User {email} added (Status 207)."
-             errors = data.get("errors", [])
-             err_msg = str(errors[0]) if errors else "Unknown error"
-             return f"⚠️ Partial failure adding user: {err_msg}"
+        url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{p_id}/users"
+        
+        # 6. Execute
+        response = requests.post(url, headers=headers, json=payload)
+        
+        # 7. Handle Common Responses
+        if response.status_code == 200 or response.status_code == 201:
+            return f"✅ Success: Added {email} to project {p_id} with access: {[p['key'] for p in products]}."
+            
+        elif response.status_code == 409:
+            # Handle "User already exists" gracefully
+            return f"ℹ️ User {email} is already active in project {p_id}."
+            
+        elif response.status_code == 400:
+            return f"❌ Bad Request (400): {response.text} (Check payload format)"
+            
         else:
-            return f"❌ Failed to add user. Status: {resp.status_code} - {resp.text}"
+            return f"❌ Error {response.status_code}: {response.text}"
             
     except Exception as e:
-        return f"❌ Exception adding user: {str(e)}"
+        return f"❌ Exception in invite_user_to_project: {str(e)}"
