@@ -20,6 +20,8 @@ from api import (
     get_cached_hub_id,
     resolve_to_version_id,
     fetch_project_users,
+    trigger_data_extraction,
+    get_extraction_status,
     safe_b64encode,
     get_viewer_domain,
     search_project_folder,
@@ -463,6 +465,54 @@ def manage_project_users(json_payload: str) -> str:
         return "Error: Invalid JSON format. Please provide a valid JSON string."
     except Exception as e:
         return f"Error processing request: {str(e)}"
+
+
+@mcp.tool()
+def run_data_export(data_types: str = "all") -> str:
+    """
+    Triggers a full account data export via Data Connector.
+    Arguments:
+      data_types: Comma-separated list of services. 
+                  Options: admin, issues, locations, submittals, cost, rfis.
+                  Default: "all" (exports everything).
+    
+    AI INSTRUCTIONS:
+    1. If user says "Export everything", pass "all".
+    2. If user specifies (e.g., "just costs"), pass "cost".
+    3. Tell the user this is an async job and give them the Job ID to check later.
+    """
+    services = None
+    if data_types and data_types.lower() != "all":
+        services = [s.strip().lower() for s in data_types.split(",")]
+        
+    result = trigger_data_extraction(services)
+    
+    if "error" in result:
+        return f"❌ Error starting export: {result['error']}"
+        
+    job_id = result.get("id")
+    return f"✅ **Data Export Started!**\nJob ID: `{job_id}`\n\nThis process happens in the background. You can check progress using 'check_export_status' with this ID, or look for an email from Autodesk when complete."
+
+@mcp.tool()
+def check_export_status(job_id: str) -> str:
+    """Checks the status of a Data Connector export job."""
+    result = get_extraction_status(job_id)
+    
+    if "error" in result:
+        return f"❌ Error checking status: {result['error']}"
+        
+    status = result.get("status", "Unknown")
+    
+    output = f"📊 **Job Status:** {status}\n"
+    
+    if status == "SUCCESS":
+        output += "✅ Export complete! The data is now available in the 'Insight' module of your ACC Account, or via the email notification sent to the Admin."
+    elif status == "FAILED":
+        output += "❌ The export failed."
+    else:
+        output += "⏳ Processing... (Please check again in a few minutes)"
+        
+    return output
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")

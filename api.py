@@ -478,3 +478,65 @@ def fetch_project_users(project_id: str) -> list:
     url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{p_id}/users"
     # Admin API requires impersonation
     return fetch_paginated_data(url, limit=100, style='offset', impersonate=True)
+
+# --- DATA CONNECTOR API ---
+
+def trigger_data_extraction(services: list = None) -> dict:
+    """
+    Triggers a Data Connector extraction job.
+    Valid services: ['admin', 'issues', 'locations', 'submittals', 'cost', 'rfis', 'assets', 'forms']
+    """
+    token = get_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    # Data Connector requires Account Admin context
+    hub_id = get_cached_hub_id()
+    if hub_id:
+        account_id = clean_id(hub_id)
+        acting_user = get_acting_user_id(account_id)
+        if acting_user:
+            headers["x-user-id"] = acting_user
+        
+    url = "https://developer.api.autodesk.com/data-connector/v1/requests"
+    
+    # Construct Payload
+    payload = {
+        "description": "Export triggered via Copilot Agent",
+        "schedule": { "interval": "OneTime" } # Default to immediate run
+    }
+    
+    # Map friendly names to API keys if necessary, or pass raw list
+    if services:
+        payload["serviceGroups"] = services
+        
+    response = requests.post(url, headers=headers, json=payload)
+    
+    if response.status_code in [200, 201, 202]:
+        return response.json() # Returns dict with "id"
+    else:
+        return {"error": f"Failed ({response.status_code}): {response.text}"}
+
+def get_extraction_status(request_id: str) -> dict:
+    """Checks the status of a Data Connector job."""
+    token = get_token()
+    headers = { "Authorization": f"Bearer {token}" }
+    
+    # Include Impersonation just in case (best practice for consistency)
+    hub_id = get_cached_hub_id()
+    if hub_id:
+        account_id = clean_id(hub_id)
+        acting_user = get_acting_user_id(account_id)
+        if acting_user:
+            headers["x-user-id"] = acting_user
+
+    url = f"https://developer.api.autodesk.com/data-connector/v1/requests/{request_id}"
+    
+    response = requests.get(url, headers=headers)
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        return {"error": f"Failed ({response.status_code}): {response.text}"}
