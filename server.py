@@ -3,6 +3,7 @@ import requests
 import json
 import logging
 import time
+from difflib import SequenceMatcher
 from typing import Optional
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -67,15 +68,27 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
     # Use shared pagination logic (Style 'url' for Data Management API)
     all_projs = fetch_paginated_data(url, style='url')
     
-    # Client-side filtering with Fuzzy Logic (Ignore spaces)
+    # Client-side filtering with Fuzzy Logic (Substring + difflib)
     if name_filter:
-        clean_filter = name_filter.lower().replace(" ", "")
+        nf = name_filter.lower()
+        clean_nf = nf.replace(" ", "")
         filtered_projs = []
+        
         for p in all_projs:
             p_name = p.get('attributes', {}).get('name', '')
-            clean_name = p_name.lower().replace(" ", "")
-            if clean_filter in clean_name:
+            pn = p_name.lower()
+            clean_pn = pn.replace(" ", "")
+            
+            # 1. Strict Substring Match (Fastest & Safest)
+            if nf in pn or clean_nf in clean_pn:
                 filtered_projs.append(p)
+                continue
+                
+            # 2. Fuzzy Match (For Typos)
+            similarity = SequenceMatcher(None, nf, pn).ratio()
+            if similarity > 0.6:
+                filtered_projs.append(p)
+                
         all_projs = filtered_projs
     
     # Sort by name
