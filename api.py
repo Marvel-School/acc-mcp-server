@@ -111,7 +111,7 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
                 
                 if resp.status_code != 200:
                     logger.warning(f"⚠️ {name} Search failed: {resp.status_code} {resp.text}")
-                    break # API Error, but endpoint exists. Probably stop? Or try next? safer to break loop and let fallback happen if appropriate or return None.
+                    break # Stop search on this endpoint if API error occurs.
                 
                 data = resp.json()
                 results = []
@@ -124,12 +124,12 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
                         results = data
                     elif isinstance(data, dict):
                         results = data.get("results", [])
-                        if not results and "id" in data: # Single user? Unlikely for list endpoint
+                        if not results and "id" in data: 
                              pass
                 
                 if not results:
                     if offset == 0:
-                        logger.info(f"Endpoint {name} returned empty list. Account exists but has no users?")
+                        logger.info(f"Endpoint {name} returned empty list.")
                     break
                     
                 for u in results:
@@ -143,8 +143,7 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
                     
                 offset += limit
                 
-            # If we finished the while loop (and didn't break due to 404), 
-            # and didn't return, it means we scanned the valid account and didn't find the user.
+            # If loop finishes without returning, user was not found in this region.
             if resp.status_code == 200:
                 logger.info(f"Scanned {name} and did NOT find user. Stopping search.")
                 return None 
@@ -175,7 +174,7 @@ def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -
 
         # 2. Try Fallback Service Account (Global Admin)
         if ACC_ADMIN_EMAIL:
-            # Check for configured email
+            # Resolves Admin ID from configured email using LRU cache optimization.
             logger.info(f"Resolving Admin ID for configured email: {ACC_ADMIN_EMAIL}")
             uid = get_user_id_by_email(account_id, ACC_ADMIN_EMAIL)
             if uid: 
