@@ -272,6 +272,7 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
     MAX_PAGES = 50
     current_url = url
     offset = 0
+    first_request = True # Flag for "Fail Loudly"
     
     while current_url and page_count < MAX_PAGES:
         try:
@@ -304,12 +305,20 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
             
             if resp.status_code in [403, 404]:
                 logger.warning(f"Endpoint returned {resp.status_code} (Module inactive?).")
+                # Treat as empty result, not hard error
                 break
+                
             if resp.status_code != 200:
                 logger.error(f"Pagination Error {resp.status_code} at {current_url}: {resp.text}")
+                
+                 # CRITICAL FIX: If this is the very first attempt, FAIL LOUDLY.
+                if first_request:
+                     return f"❌ API Error {resp.status_code}: {resp.text}"
+                
                 break
                 
             data = resp.json()
+            first_request = False # Mark first attempt complete
             
             # Determine list key
             batch = []
@@ -352,6 +361,8 @@ def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Di
     # Issues API uses offset/limit
     items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
     
+    if isinstance(items, str): return items
+
     if status:
         items = [i for i in items if i.get("status", "").lower() == status.lower()]
         
@@ -362,6 +373,8 @@ def get_project_assets(project_id: str, category: Optional[str] = None) -> List[
     url = f"{BASE_URL_ACC}/assets/v2/projects/{p_id}/assets" # Assets V2
     items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
     
+    if isinstance(items, str): return items
+
     if category:
         items = [i for i in items if category.lower() in i.get("category", {}).get("name", "").lower()]
         
@@ -385,9 +398,11 @@ def get_account_users(search_term: str = "") -> List[Dict[str, Any]]:
     # Attempt to fetch with 'url' style first, falling back to 'offset' if needed.
     all_users = fetch_paginated_data(url, limit=100, style='url')
     
-    if not all_users:
+    if isinstance(all_users, str) or not all_users:
          # Retry with offset style explicitly
          all_users = fetch_paginated_data(url, limit=100, style='offset')
+    
+    if isinstance(all_users, str): return [] # Fail silently/empty for User Search to avoid crash
 
     if search_term and search_term.lower() != "all":
         term = search_term.lower()
