@@ -111,7 +111,7 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
                 
                 if resp.status_code != 200:
                     logger.warning(f"⚠️ {name} Search failed: {resp.status_code} {resp.text}")
-                    break # API Error, but endpoint exists. Probably stop? Or try next? safer to break loop and let fallback happen if appropriate or return None.
+                    break # Stop search on this endpoint if API error occurs.
                 
                 data = resp.json()
                 results = []
@@ -124,12 +124,12 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
                         results = data
                     elif isinstance(data, dict):
                         results = data.get("results", [])
-                        if not results and "id" in data: # Single user? Unlikely for list endpoint
+                        if not results and "id" in data: 
                              pass
                 
                 if not results:
                     if offset == 0:
-                        logger.info(f"Endpoint {name} returned empty list. Account exists but has no users?")
+                        logger.info(f"Endpoint {name} returned empty list.")
                     break
                     
                 for u in results:
@@ -143,8 +143,7 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
                     
                 offset += limit
                 
-            # If we finished the while loop (and didn't break due to 404), 
-            # and didn't return, it means we scanned the valid account and didn't find the user.
+            # If loop finishes without returning, user was not found in this region.
             if resp.status_code == 200:
                 logger.info(f"Scanned {name} and did NOT find user. Stopping search.")
                 return None 
@@ -175,7 +174,7 @@ def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -
 
         # 2. Try Fallback Service Account (Global Admin)
         if ACC_ADMIN_EMAIL:
-            # Check for configured email
+            # Resolves Admin ID from configured email using LRU cache optimization.
             logger.info(f"Resolving Admin ID for configured email: {ACC_ADMIN_EMAIL}")
             uid = get_user_id_by_email(account_id, ACC_ADMIN_EMAIL)
             if uid: 
@@ -272,6 +271,7 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
     MAX_PAGES = 50
     current_url = url
     offset = 0
+    first_request = True # Flag for "Fail Loudly"
     
     while current_url and page_count < MAX_PAGES:
         try:
@@ -304,12 +304,20 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
             
             if resp.status_code in [403, 404]:
                 logger.warning(f"Endpoint returned {resp.status_code} (Module inactive?).")
+                # Treat as empty result, not hard error
                 break
+                
             if resp.status_code != 200:
                 logger.error(f"Pagination Error {resp.status_code} at {current_url}: {resp.text}")
+                
+                 # CRITICAL FIX: If this is the very first attempt, FAIL LOUDLY.
+                if first_request:
+                     return f"❌ API Error {resp.status_code}: {resp.text}"
+                
                 break
                 
             data = resp.json()
+            first_request = False # Mark first attempt complete
             
             # Determine list key
             batch = []
@@ -352,6 +360,8 @@ def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Di
     # Issues API uses offset/limit
     items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
     
+    if isinstance(items, str): return items
+
     if status:
         items = [i for i in items if i.get("status", "").lower() == status.lower()]
         
@@ -362,6 +372,8 @@ def get_project_assets(project_id: str, category: Optional[str] = None) -> List[
     url = f"{BASE_URL_ACC}/assets/v2/projects/{p_id}/assets" # Assets V2
     items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
     
+    if isinstance(items, str): return items
+
     if category:
         items = [i for i in items if category.lower() in i.get("category", {}).get("name", "").lower()]
         
@@ -385,9 +397,11 @@ def get_account_users(search_term: str = "") -> List[Dict[str, Any]]:
     # Attempt to fetch with 'url' style first, falling back to 'offset' if needed.
     all_users = fetch_paginated_data(url, limit=100, style='url')
     
-    if not all_users:
+    if isinstance(all_users, str) or not all_users:
          # Retry with offset style explicitly
          all_users = fetch_paginated_data(url, limit=100, style='offset')
+    
+    if isinstance(all_users, str): return [] # Fail silently/empty for User Search to avoid crash
 
     if search_term and search_term.lower() != "all":
         term = search_term.lower()
