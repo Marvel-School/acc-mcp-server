@@ -492,15 +492,21 @@ def trigger_data_extraction(services: list = None) -> dict:
         "Content-Type": "application/json"
     }
     
-    # Data Connector requires Account Admin context
+    # 1. Get Account Context
     hub_id = get_cached_hub_id()
-    if hub_id:
-        account_id = clean_id(hub_id)
-        acting_user = get_acting_user_id(account_id)
-        if acting_user:
-            headers["x-user-id"] = acting_user
+    if not hub_id:
+        return {"error": "No Hub ID found. Cannot derive Account ID."}
+    
+    # Strip 'b.' to get Account ID (e.g. "b.123" -> "123")
+    account_id = clean_id(hub_id)
+    
+    # 2. Add Impersonation (Required for Data Connector)
+    acting_user = get_acting_user_id(account_id)
+    if acting_user:
+        headers["x-user-id"] = acting_user
         
-    url = "https://developer.api.autodesk.com/data-connector/v1/requests"
+    # 3. Correct URL Structure
+    url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests"
     
     # Construct Payload
     payload = {
@@ -524,15 +530,17 @@ def get_extraction_status(request_id: str) -> dict:
     token = get_token()
     headers = { "Authorization": f"Bearer {token}" }
     
-    # Include Impersonation just in case (best practice for consistency)
     hub_id = get_cached_hub_id()
-    if hub_id:
-        account_id = clean_id(hub_id)
-        acting_user = get_acting_user_id(account_id)
-        if acting_user:
-            headers["x-user-id"] = acting_user
+    if not hub_id:
+        return {"error": "No Hub ID found."}
+    account_id = clean_id(hub_id)
+    
+    acting_user = get_acting_user_id(account_id)
+    if acting_user:
+        headers["x-user-id"] = acting_user
 
-    url = f"https://developer.api.autodesk.com/data-connector/v1/requests/{request_id}"
+    # Correct URL Structure
+    url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests/{request_id}"
     
     response = requests.get(url, headers=headers)
     
