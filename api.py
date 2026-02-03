@@ -155,11 +155,19 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
     return None
 
 @lru_cache(maxsize=16)
-def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -> Optional[str]:
+def get_acting_user_id(account_id: Optional[str] = None, requester_email: Optional[str] = None) -> Optional[str]:
     """
     Robustly resolves a User ID for 2-legged auth impersonation.
     Cached to prevent repeated API hits for the same account/email.
     """
+    # Resolve account_id if missing
+    if not account_id:
+        account_id = get_cached_hub_id()
+        
+    if not account_id:
+         logger.warning("No Account ID available for resolving Acting User.")
+         return None
+
     try:
         # 0. Check for explicit Admin ID in env (Fastest path)
         env_admin_id = os.environ.get("ACC_ADMIN_ID")
@@ -490,7 +498,7 @@ def _get_admin_headers(account_id: str):
         headers["x-user-id"] = admin_id
     return headers
 
-def trigger_data_extraction(services: list = None) -> dict:
+def trigger_data_extraction(services: List[str] = []) -> dict:
     """Triggers Data Export (Admin Context)."""
     hub_id = get_cached_hub_id()
     if not hub_id: return {"error": "No Hub ID found."}
@@ -498,12 +506,12 @@ def trigger_data_extraction(services: list = None) -> dict:
     
     headers = _get_admin_headers(account_id)
     if "x-user-id" not in headers:
-        return {"error": "Could not resolve Account Admin ID."}
+        return {"error": "Could not resolve Account Admin ID. Data Connector requires Admin Impersonation."}
 
     url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests"
     
     payload = {
-        "description": "Copilot Export",
+        "description": f"MCP Agent Export - {time.strftime('%Y-%m-%d')}",
         "schedule": { "interval": "OneTime" }
     }
     if services:
