@@ -27,11 +27,12 @@ from api import (
     get_viewer_domain,
     search_project_folder,
     fetch_paginated_data,
-    get_project_issues,
+    get_project_issues, 
     get_project_assets,
     get_account_users,
     invite_user_to_project
 )
+import api # Import api module explicitly for the new tools
 
 # Initialize Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -517,6 +518,58 @@ def check_export_status(request_id: str) -> str:
             return "✅ Export complete, but failed to generate download link."
             
     elif status == "FAILED":
+        return "❌ Export Job Failed."
+        
+    return f"⏳ Export Processing... (Job ID: {job_id})"
+@mcp.tool()
+def run_data_export(data_types: str = "all") -> str:
+    """
+    Triggers a full account data export (Data Connector).
+    Arguments:
+      data_types: Comma-separated list (e.g. "issues,admin,locations"). Default is "all".
+    AI INSTRUCTIONS:
+    1. Tell the user this is a background job.
+    2. Return the Job ID clearly.
+    """
+    services = None
+    if data_types and data_types.lower() != "all":
+        services = [s.strip() for s in data_types.split(",")]
+        
+    # Call the EXISTING backend function
+    result = api.trigger_data_extraction(services)
+
+    result = api.trigger_data_extraction(services)
+    
+    if "error" in result:
+        return f"❌ Error starting export: {result['error']}"
+        
+    job_id = result.get("id")
+    return f"✅ **Data Export Started!**\nJob ID: `{job_id}`\n\nUse 'check_export_status' with this ID to track progress."
+
+@mcp.tool()
+def check_export_status(request_id: str) -> str:
+    """
+    Checks status of Data Connector request.
+    If complete, returns a DOWNLOAD LINK.
+    """
+    # Call the EXISTING backend function
+    result = api.check_request_job_status(request_id)
+    
+    if "error" in result:
+        return f"❌ Error: {result['error']}"
+        
+    status = result.get("status")
+    job_id = result.get("job_id")
+    
+    if status == "success" and job_id:
+        # Call the EXISTING backend function
+        link = api.get_data_download_url(job_id)
+        if link:
+            return f"✅ **Export Complete!**\n\n⬇️ [Click here to Download ZIP]({link})\n*(Link expires in 60 seconds)*"
+        else:
+            return "✅ Export complete, but failed to generate download link."
+            
+    elif status == "failed":
         return "❌ Export Job Failed."
         
     return f"⏳ Export Processing... (Job ID: {job_id})"
