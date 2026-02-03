@@ -591,17 +591,36 @@ def get_data_download_url(job_id: str) -> str:
         return response.json().get("signedUrl")
     return None
 
-def get_my_permissions() -> dict:
-    """Checks the effective permissions of the impersonated user."""
+def get_account_user_details(email: str) -> dict:
+    """
+    Fetches full details for a specific user from HQ API (EMEA).
+    Does NOT use impersonation.
+    """
     hub_id = get_cached_hub_id()
     if not hub_id: return {"error": "No Hub ID found."}
     account_id = clean_id(hub_id)
     
-    headers = _get_admin_headers(account_id)
-    url = "https://developer.api.autodesk.com/construction/admin/v1/users/me"
+    token = get_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "x-ads-region": "EMEA"
+    }
+    
+    # HQ API User Search
+    url = f"https://developer.api.autodesk.com/hq/v1/accounts/{account_id}/users"
+    params = {"filter[email]": email}
     
     try:
-        response = requests.get(url, headers=headers)
-        return response.json()
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code != 200:
+             return {"error": f"HQ API returned {resp.status_code}: {resp.text}"}
+             
+        data = resp.json()
+        # HQ API usually returns list
+        if isinstance(data, list) and len(data) > 0:
+            return data[0]
+        
+        return {"error": "User not found via HQ Search."}
+
     except Exception as e:
         return {"error": str(e)}

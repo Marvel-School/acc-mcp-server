@@ -560,12 +560,16 @@ def check_export_status(request_id: str) -> str:
     return f"⏳ Export Processing... (Job ID: {job_id})"
 
 @mcp.tool()
-def check_permissions() -> str:
+def check_admin_status() -> str:
     """
-    Diagnostic: Checks effective permissions of the impersonated Admin.
+    Diagnostic: Use HQ API to find the Admin's configured permissions.
     """
-    result = api.get_my_permissions()
-    return f"🔍 **Admin Permissions Diagnostic:**\n```json\n{json.dumps(result, indent=2)}\n```"
+    email = os.environ.get("ACC_ADMIN_EMAIL")
+    if not email:
+        return "❌ `ACC_ADMIN_EMAIL` is not set in environment."
+        
+    result = api.get_account_user_details(email)
+    return f"🔍 **Admin User Details ({email}):**\n```json\n{json.dumps(result, indent=2)}\n```"
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
