@@ -42,7 +42,7 @@ def get_token() -> str:
         "client_id": APS_CLIENT_ID,
         "client_secret": APS_CLIENT_SECRET,
         "grant_type": "client_credentials", 
-        "scope": "data:read data:write account:read account:write bucket:read"
+        "scope": "data:read data:write data:create account:read account:write bucket:read"
     }
 
     try:

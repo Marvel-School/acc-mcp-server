@@ -521,22 +521,7 @@ def check_export_status(request_id: str) -> str:
         return "❌ Export Job Failed."
         
     return f"⏳ Export Processing... (Job ID: {job_id})"
-@mcp.tool()
-def run_data_export(data_types: str = "all") -> str:
-    """
-    Triggers a full account data export (Data Connector).
-    Arguments:
-      data_types: Comma-separated list (e.g. "issues,admin,locations"). Default is "all".
-    AI INSTRUCTIONS:
-    1. Tell the user this is a background job.
-    2. Return the Job ID clearly.
-    """
-    services = None
-    if data_types and data_types.lower() != "all":
-        services = [s.strip() for s in data_types.split(",")]
-        
-    # Call the EXISTING backend function
-    result = api.trigger_data_extraction(services)
+
 
     result = api.trigger_data_extraction(services)
     
