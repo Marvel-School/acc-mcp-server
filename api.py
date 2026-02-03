@@ -512,28 +512,23 @@ def fetch_project_users(project_id: str) -> list:
 # --- DATA CONNECTOR API ---
 
 def _get_admin_headers(account_id: str):
-    """Helper to get headers with Admin Impersonation."""
+    """Helper to get headers for Native Export (Service Account)."""
     token = get_token()
-    headers = { 
+    # Data Connector V1 works best as Service Account (Native), avoiding 403 on Impersonation.
+    return { 
         "Authorization": f"Bearer {token}", 
         "Content-Type": "application/json",
         "x-ads-region": "EMEA"
     }
-    admin_id = get_acting_user_id(account_id)
-    if admin_id:
-        headers["x-user-id"] = admin_id
-    return headers
 
 def trigger_data_extraction(services: List[str] = []) -> dict:
-    """Triggers Data Export (Admin Context)."""
+    """Triggers Data Export (Service Account Context)."""
     hub_id = get_cached_hub_id()
     if not hub_id: return {"error": "No Hub ID found."}
     account_id = clean_id(hub_id)
     
     headers = _get_admin_headers(account_id)
-    if "x-user-id" not in headers:
-        return {"error": "Could not resolve Account Admin ID. Data Connector requires Admin Impersonation."}
-
+    
     url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests"
     
     payload = {
