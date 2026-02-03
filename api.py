@@ -304,11 +304,32 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
 
             resp = requests.get(current_url, headers=headers, params=params if style == 'offset' else None)
             
-            # RETRY LOGIC: If Impersonation blocked us, try as Raw Service Account
-            if resp.status_code == 401 and impersonate and "x-user-id" in headers:
-                logger.warning(f"⚠️ Impersonation denied (401) for {current_url}. Retrying as Service Account (No x-user-id)...")
-                headers.pop("x-user-id", None)
-                resp = requests.get(current_url, headers=headers, params=params if style == 'offset' else None)
+            # ESCALATION LOGIC: If 401, we might be missing x-user-id or using a non-admin.
+            # Issues API strictly forbids Service-to-Service (missing header).
+            if resp.status_code == 401 and impersonate:
+                logger.warning(f"⚠️ 401 Unauthorized at {current_url}. Escalating: Verifying Admin Context.")
+                
+                try:
+                    # 1. Resolve the definitive Admin ID
+                    hub_id = get_cached_hub_id()
+                    admin_id = get_acting_user_id(clean_id(hub_id)) if hub_id else None
+                    
+                    current_header_id = headers.get("x-user-id")
+                    
+                    # 2. Check if we are already using it
+                    if admin_id and current_header_id == admin_id:
+                         logger.error("❌ Already failed as Admin. Cannot escalate further.")
+                         # Allow it to fall through to the error handler
+                    elif admin_id:
+                         # 3. Apply Escalation
+                         logger.info(f"🔄 Retrying with Admin ID: {admin_id}")
+                         headers["x-user-id"] = admin_id
+                         resp = requests.get(current_url, headers=headers, params=params if style == 'offset' else None)
+                    else:
+                         logger.warning("❌ Could not resolve Admin ID for escalation.")
+                         
+                except Exception as e:
+                    logger.error(f"Escalation failed: {e}")
             
             if resp.status_code in [403, 404]:
                 logger.warning(f"Endpoint returned {resp.status_code} (Module inactive?).")
