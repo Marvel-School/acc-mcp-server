@@ -513,12 +513,12 @@ def fetch_project_users(project_id: str) -> list:
 
 def _get_admin_headers(account_id: str):
     """Helper to get headers with Admin Impersonation."""
-    token = get_
+    token = get_token()
+    headers = { 
         "Authorization": f"Bearer {token}", 
         "Content-Type": "application/json",
         "x-ads-region": "EMEA"
-   
-    headers = { "Authorization": f"Bearer {token}", "Content-Type": "application/json" }
+    }
     admin_id = get_acting_user_id(account_id)
     if admin_id:
         headers["x-user-id"] = admin_id
