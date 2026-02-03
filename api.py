@@ -590,3 +590,18 @@ def get_data_download_url(job_id: str) -> str:
     if response.status_code == 200:
         return response.json().get("signedUrl")
     return None
+
+def get_my_permissions() -> dict:
+    """Checks the effective permissions of the impersonated user."""
+    hub_id = get_cached_hub_id()
+    if not hub_id: return {"error": "No Hub ID found."}
+    account_id = clean_id(hub_id)
+    
+    headers = _get_admin_headers(account_id)
+    url = "https://developer.api.autodesk.com/construction/admin/v1/users/me"
+    
+    try:
+        response = requests.get(url, headers=headers)
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
