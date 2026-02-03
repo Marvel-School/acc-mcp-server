@@ -42,7 +42,7 @@ def get_token() -> str:
     # project:read/write are often not supported in 2-legged auth for this endpoint or app config
     data = {
         "grant_type": "client_credentials", 
-        "scope": "data:read data:write account:read account:write bucket:read"
+        "scope": "data:read data:write account:read account:write bucket:read issues:read issues:write"
     }
 
     try:
