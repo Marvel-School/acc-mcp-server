@@ -284,7 +284,7 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
     while current_url and page_count < MAX_PAGES:
         try:
             token = get_token()
-            headers = {"Authorization": f"Bearer {token}"}
+            headers = {"Authorization": f"Bearer {token}", "x-ads-region": "EMEA"}
             
             # Auto-inject x-user-id for 2-legged flows (Required for Admin/Issues/Assets)
             if impersonate:
@@ -451,7 +451,8 @@ def invite_user_to_project(project_id: str, email: str, products: list = None) -
         token = get_token()
         headers = {
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "x-ads-region": "EMEA"
         }
         
         # 1b. Resolve Account context for impersonation
@@ -512,7 +513,11 @@ def fetch_project_users(project_id: str) -> list:
 
 def _get_admin_headers(account_id: str):
     """Helper to get headers with Admin Impersonation."""
-    token = get_token()
+    token = get_
+        "Authorization": f"Bearer {token}", 
+        "Content-Type": "application/json",
+        "x-ads-region": "EMEA"
+   
     headers = { "Authorization": f"Bearer {token}", "Content-Type": "application/json" }
     admin_id = get_acting_user_id(account_id)
     if admin_id:
