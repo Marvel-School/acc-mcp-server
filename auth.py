@@ -2,7 +2,6 @@ import os
 import requests
 import time
 import logging
-from requests.auth import HTTPBasicAuth
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,7 +16,6 @@ ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL")
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
 BASE_URL_HQ_US = "https://developer.api.autodesk.com/hq/v1/accounts"
 BASE_URL_HQ_EU = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts"
-BASE_URL_HQ = BASE_URL_HQ_US # Default to US, fallback logic will handle EU
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # Global token cache

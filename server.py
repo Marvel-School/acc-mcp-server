@@ -10,12 +10,12 @@ from urllib.parse import quote
 from fastmcp import FastMCP
 from auth import get_token, BASE_URL_ACC
 from api import (
-    make_api_request, 
-    make_graphql_request, 
-    get_user_id_by_email, 
+    make_api_request,
+    make_graphql_request,
+    get_user_id_by_email,
     get_acting_user_id,
-    clean_id, 
-    ensure_b_prefix, 
+    clean_id,
+    ensure_b_prefix,
     encode_urn,
     get_cached_hub_id,
     resolve_to_version_id,
@@ -27,12 +27,12 @@ from api import (
     get_viewer_domain,
     search_project_folder,
     fetch_paginated_data,
-    get_project_issues, 
+    get_project_issues,
     get_project_assets,
     get_account_users,
-    invite_user_to_project
+    invite_user_to_project,
+    get_account_user_details
 )
-import api # Import api module explicitly for the new tools
 
 # Initialize Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -407,7 +407,7 @@ def list_assets(project_id: str, category_filter: str = "all") -> str:
     return str(get_project_assets(project_id, cat))
 
 # ==========================================
-# ADMIN TOOLS
+# USER MANAGEMENT TOOLS
 # ==========================================
 
 @mcp.tool()
@@ -502,61 +502,23 @@ def check_export_status(request_id: str) -> str:
     If complete, returns a DOWNLOAD LINK.
     """
     result = check_request_job_status(request_id)
-    
+
     if "error" in result:
         return f"❌ Error: {result['error']}"
-        
-    status = result.get("status")
+
+    status = result.get("status", "").upper()
     job_id = result.get("job_id")
-    
+
     if status == "SUCCESS" and job_id:
-        # Fetch Link
         link = get_data_download_url(job_id)
         if link:
             return f"✅ **Export Complete!**\n\n⬇️ [Click here to Download ZIP]({link})\n*(Link expires in 60 seconds)*"
         else:
             return "✅ Export complete, but failed to generate download link."
-            
+
     elif status == "FAILED":
         return "❌ Export Job Failed."
-        
-    return f"⏳ Export Processing... (Job ID: {job_id})"
 
-
-    result = api.trigger_data_extraction(services)
-    
-    if "error" in result:
-        return f"❌ Error starting export: {result['error']}"
-        
-    job_id = result.get("id")
-    return f"✅ **Data Export Started!**\nJob ID: `{job_id}`\n\nUse 'check_export_status' with this ID to track progress."
-
-@mcp.tool()
-def check_export_status(request_id: str) -> str:
-    """
-    Checks status of Data Connector request.
-    If complete, returns a DOWNLOAD LINK.
-    """
-    # Call the EXISTING backend function
-    result = api.check_request_job_status(request_id)
-    
-    if "error" in result:
-        return f"❌ Error: {result['error']}"
-        
-    status = result.get("status")
-    job_id = result.get("job_id")
-    
-    if status == "success" and job_id:
-        # Call the EXISTING backend function
-        link = api.get_data_download_url(job_id)
-        if link:
-            return f"✅ **Export Complete!**\n\n⬇️ [Click here to Download ZIP]({link})\n*(Link expires in 60 seconds)*"
-        else:
-            return "✅ Export complete, but failed to generate download link."
-            
-    elif status == "failed":
-        return "❌ Export Job Failed."
-        
     return f"⏳ Export Processing... (Job ID: {job_id})"
 
 @mcp.tool()
@@ -568,7 +530,7 @@ def check_admin_status() -> str:
     if not email:
         return "❌ `ACC_ADMIN_EMAIL` is not set in environment."
         
-    result = api.get_account_user_details(email)
+    result = get_account_user_details(email)
     return f"🔍 **Admin User Details ({email}):**\n```json\n{json.dumps(result, indent=2)}\n```"
 
 if __name__ == "__main__":

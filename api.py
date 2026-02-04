@@ -5,7 +5,7 @@ import time
 import base64
 from functools import lru_cache
 from urllib.parse import quote
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from auth import get_token, BASE_URL_ACC, BASE_URL_HQ_US, BASE_URL_HQ_EU, BASE_URL_GRAPHQL, ACC_ADMIN_EMAIL
 
 logger = logging.getLogger(__name__)
@@ -124,8 +124,6 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
                         results = data
                     elif isinstance(data, dict):
                         results = data.get("results", [])
-                        if not results and "id" in data: 
-                             pass
                 
                 if not results:
                     if offset == 0:
@@ -267,7 +265,7 @@ def search_project_folder(project_id: str, query: str, limit: int = 20) -> List[
 
 # --- NEW: FEATURES API (Issues/Assets) ---
 
-def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", impersonate: bool = False) -> List[Dict[str, Any]]:
+def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", impersonate: bool = False) -> Union[List[Dict[str, Any]], str]:
     """
     Generic pagination helper for ACC APIs.
     styles: 
@@ -359,10 +357,10 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
                     batch = data["results"]
             
             all_items.extend(batch)
-            
+
             # Navigate
             if style == 'url':
-                links = data.get("links", {})
+                links = data.get("links", {}) if isinstance(data, dict) else {}
                 next_obj = links.get("next")
                 if isinstance(next_obj, dict):
                     current_url = next_obj.get("href")
@@ -383,7 +381,7 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
             
     return all_items
 
-def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_project_issues(project_id: str, status: Optional[str] = None) -> Union[List[Dict[str, Any]], str]:
     p_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/issues/v1/projects/{p_id}/issues"
     # Issues API uses offset/limit
@@ -396,7 +394,7 @@ def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Di
         
     return items
 
-def get_project_assets(project_id: str, category: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_project_assets(project_id: str, category: Optional[str] = None) -> Union[List[Dict[str, Any]], str]:
     p_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/assets/v2/projects/{p_id}/assets" # Assets V2
     items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
@@ -441,7 +439,7 @@ def get_account_users(search_term: str = "") -> List[Dict[str, Any]]:
         
     return all_users
 
-def invite_user_to_project(project_id: str, email: str, products: list = None) -> str:
+def invite_user_to_project(project_id: str, email: str, products: Optional[List[Dict[str, str]]] = None) -> str:
     """
     Invites a user to a project.
     Always ensures 'products' list exists (defaults to 'docs' -> 'member').
@@ -502,7 +500,7 @@ def invite_user_to_project(project_id: str, email: str, products: list = None) -
     except Exception as e:
         return f"❌ Exception in invite_user_to_project: {str(e)}"
 
-def fetch_project_users(project_id: str) -> list:
+def fetch_project_users(project_id: str) -> Union[List[Dict[str, Any]], str]:
     """Fetches users specific to a project using ACC Admin API."""
     p_id = clean_id(project_id)
     url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{p_id}/users"
@@ -524,7 +522,7 @@ def _get_admin_headers(account_id: str):
         headers["x-user-id"] = admin_id
     return headers
 
-def trigger_data_extraction(services: List[str] = []) -> dict:
+def trigger_data_extraction(services: Optional[List[str]] = None) -> dict:
     """Triggers Data Export (Admin Context)."""
     hub_id = get_cached_hub_id()
     if not hub_id: return {"error": "No Hub ID found."}
@@ -576,7 +574,7 @@ def check_request_job_status(request_id: str) -> dict:
         "progress": latest_job.get("progress", 0)
     }
 
-def get_data_download_url(job_id: str) -> str:
+def get_data_download_url(job_id: str) -> Optional[str]:
     """Gets signed URL for the ZIP file."""
     hub_id = get_cached_hub_id()
     account_id = clean_id(hub_id)
