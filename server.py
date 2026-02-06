@@ -33,7 +33,9 @@ from api import (
     invite_user_to_project,
     get_account_user_details,
     get_hubs_aec,
-    get_projects_aec
+    get_projects_aec,
+    get_hubs_rest,
+    get_projects_rest
 )
 
 # Initialize Logging
@@ -112,10 +114,10 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
 @mcp.tool()
 def list_aec_hubs() -> str:
     """
-    Lists all hubs using AEC Data Model GraphQL API.
-    Alternative to list_hubs() using GraphQL instead of REST.
+    Lists all hubs using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
     """
-    result = get_hubs_aec()
+    result = get_hubs_rest()
 
     if isinstance(result, str):
         return f"❌ Error: {result}"
@@ -123,7 +125,7 @@ def list_aec_hubs() -> str:
     if not result:
         return "No hubs found."
 
-    output = "🏢 **Hubs (via AEC GraphQL):**\n"
+    output = "🏢 **Hubs (via REST API):**\n"
     for hub in result:
         output += f"- {hub.get('name', 'Unknown')} (ID: `{hub.get('id')}`)\n"
 
@@ -132,10 +134,10 @@ def list_aec_hubs() -> str:
 @mcp.tool()
 def list_aec_projects(hub_id: str) -> str:
     """
-    Lists all projects for a hub using AEC Data Model GraphQL API.
-    Alternative to list_projects() using GraphQL instead of REST.
+    Lists all projects for a hub using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
     """
-    result = get_projects_aec(hub_id)
+    result = get_projects_rest(hub_id)
 
     if isinstance(result, str):
         return f"❌ Error: {result}"
@@ -143,7 +145,7 @@ def list_aec_projects(hub_id: str) -> str:
     if not result:
         return f"No projects found for hub {hub_id}."
 
-    output = f"📂 **Projects for Hub {hub_id} (via AEC GraphQL):**\n"
+    output = f"📂 **Projects for Hub {hub_id} (via REST API):**\n"
     for project in result:
         output += f"- **{project.get('name', 'Unknown')}**\n  ID: `{project.get('id')}`\n"
 

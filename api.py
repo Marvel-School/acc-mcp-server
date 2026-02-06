@@ -131,6 +131,70 @@ def get_projects_aec(hub_id: str) -> Union[List[Dict[str, Any]], str]:
 
     return result["projects"].get("results", [])
 
+def get_hubs_rest() -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches all hubs using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+        url = "https://developer.api.autodesk.com/project/v1/hubs"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(f"REST API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: {resp.text}"
+
+        data = resp.json()
+        hubs = data.get("data", [])
+
+        # Extract relevant fields
+        result = []
+        for hub in hubs:
+            result.append({
+                "id": hub.get("id"),
+                "name": hub.get("attributes", {}).get("name")
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"REST Hub Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def get_projects_rest(hub_id: str) -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches all projects for a given hub using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    try:
+        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
+
+        # Use pagination to get all projects
+        all_projects = fetch_paginated_data(url, style='url', impersonate=False)
+
+        if isinstance(all_projects, str):
+            return all_projects
+
+        # Extract relevant fields
+        result = []
+        for project in all_projects:
+            result.append({
+                "id": project.get("id"),
+                "name": project.get("attributes", {}).get("name"),
+                "hubId": hub_id
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"REST Project Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
 # --- CACHE ---
 # Cache for hub_id to avoid repeated calls
 hub_cache = {"id": None}
