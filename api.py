@@ -3,6 +3,7 @@ import requests
 import logging
 import time
 import base64
+import re
 from functools import lru_cache
 from urllib.parse import quote
 from typing import Optional, Dict, Any, List, Union
@@ -1620,6 +1621,90 @@ def get_view_guid_only(version_urn: str) -> str:
 
     # Should never reach here, but just in case
     raise ValueError("❌ Unexpected error in retry loop.")
+
+
+def stream_count_elements(version_urn: str, category_name: str) -> int:
+    """
+    Streams metadata and counts elements matching a category using regex pattern matching.
+    Avoids loading the full JSON into memory by processing the HTTP stream in chunks.
+
+    Args:
+        version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf...)
+        category_name: Category to search for (e.g., "Walls", "Doors", "Windows")
+
+    Returns:
+        Count of matching elements (int)
+
+    Raises:
+        ValueError: If model not found or metadata fetch fails
+    """
+    logger.info(f"[Streaming Element Counter] Counting elements matching: {category_name}")
+
+    # Step 1: Get View GUID (lightweight - no object tree download)
+    guid = get_view_guid_only(version_urn)
+    logger.info(f"  Using View GUID: {guid}")
+
+    # Step 2: Encode URN for metadata endpoint
+    urn_b64 = safe_b64encode(version_urn)
+    metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata/{guid}"
+
+    # Step 3: Get auth token
+    token = get_token()
+
+    # Step 4: Prepare headers
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "x-ads-region": "EMEA"
+    }
+
+    logger.info(f"  Streaming metadata to scan for: {category_name}")
+    logger.info(f"  URL: {metadata_url}")
+
+    # Step 5: Regex pattern to find "name" fields containing the category
+    # Pattern: "name"\s*:\s*"[^"]*CategoryName[^"]*"
+    # Case insensitive flag (?i)
+    # Use re.escape to properly handle special regex characters in category_name
+    pattern = re.compile(rb'"name"\s*:\s*"[^"]*' + re.escape(category_name).encode() + rb'[^"]*"', re.IGNORECASE)
+
+    count = 0
+    buffer = b""
+
+    try:
+        # Step 6: Stream the response
+        with requests.get(metadata_url, headers=headers, stream=True, timeout=60) as r:
+            r.raise_for_status()
+
+            # Process in 64KB chunks
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:  # Filter out keep-alive chunks
+                    buffer += chunk
+
+                    # Find all matches in current buffer
+                    matches = pattern.findall(buffer)
+                    count += len(matches)
+
+                    # Keep the last 512 bytes of buffer to handle matches split across chunks
+                    # This prevents cutting patterns like "Wa|ll" in half
+                    buffer = buffer[-512:]
+
+        logger.info(f"✅ Streaming scan complete. Found {count} elements matching '{category_name}'.")
+        return count
+
+    except requests.exceptions.HTTPError as http_err:
+        error_msg = f"❌ HTTP Error while streaming metadata: {http_err}"
+        logger.error(error_msg)
+        logger.error(f"  Response: {http_err.response.text if http_err.response else 'No response'}")
+        raise ValueError(error_msg)
+
+    except requests.exceptions.Timeout:
+        error_msg = "❌ Timeout while streaming metadata (60s limit exceeded)."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    except Exception as e:
+        error_msg = f"❌ Error during streaming scan: {str(e)}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
 
 
 def query_model_elements(project_id: str, file_identifier: str, category_name: str) -> Union[int, str]:

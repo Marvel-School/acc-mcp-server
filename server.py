@@ -46,7 +46,7 @@ from api import (
     get_model_manifest,
     get_model_metadata,
     inspect_generic_file,
-    query_model_elements,
+    stream_count_elements,
     trigger_translation
 )
 
@@ -607,7 +607,7 @@ def get_model_tree(project_id: str, file_id: str) -> str:
 def count_elements(project_id: str, file_id: str, category_name: str) -> str:
     """
     Counts elements in a model that match a specific category.
-    Uses server-side filtering via Model Derivative Query API - no memory limits!
+    Uses streaming regex scanner to process metadata without loading full JSON - no memory limits!
     Accepts file by ID OR Name!
 
     Args:
@@ -619,25 +619,38 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
         count_elements(proj_id, "Grasbaan102026.rvt", "Walls")  ← Use filename!
         count_elements(proj_id, "urn:adsk.wipp...", "Doors")     ← Or URN
 
-    Note: Search is case-insensitive and uses server-side filtering.
+    Note: Search is case-insensitive and uses streaming pattern matching.
     """
     try:
-        logger.info(f"Initiating server-side query for category: {category_name}")
+        logger.info(f"Initiating streaming scan for category: {category_name}")
 
-        # Use server-side query API - filters on Autodesk's servers, not locally
-        result = query_model_elements(project_id, file_id, category_name)
+        # Step 1: Resolve file_id to lineage URN
+        lineage_urn = resolve_file_to_urn(project_id, file_id)
 
-        # Check if we got an error message instead of a count
-        if isinstance(result, str):
-            return result
+        if not lineage_urn or not lineage_urn.startswith("urn:"):
+            return f"❌ Error: Could not resolve '{file_id}' to a valid URN."
 
-        # Result is an integer count
-        logger.info(f"✅ Cloud query complete. Found {result} elements.")
-        return f"✅ Cloud Query Complete. Found {result} elements matching '{category_name}'."
+        # Step 2: Get version URN
+        version_urn = get_latest_version_urn(project_id, lineage_urn)
+
+        if not version_urn or not version_urn.startswith("urn:"):
+            return f"❌ Error: Could not resolve to version URN."
+
+        # Step 3: Stream and count using regex pattern matching
+        count = stream_count_elements(version_urn, category_name)
+
+        # Return success message
+        logger.info(f"✅ Streaming scan complete. Found {count} elements.")
+        return f"✅ Scanned model data stream (SVF). Found {count} items matching '{category_name}'."
+
+    except ValueError as ve:
+        # These are user-friendly errors from the API functions
+        logger.error(f"Stream scan failed: {str(ve)}")
+        return str(ve)
 
     except Exception as e:
-        logger.error(f"Query failed: {str(e)}")
-        return "⚠️ Error: The model data is too large to process in this environment."
+        logger.error(f"Stream scan failed: {str(e)}")
+        return f"❌ Error: Failed to scan model data: {str(e)}"
 
 @mcp.tool()
 def reprocess_file(project_id: str, file_id: str) -> str:
