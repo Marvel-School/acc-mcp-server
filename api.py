@@ -298,6 +298,72 @@ def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str,
         logger.error(f"Folder Contents Exception: {str(e)}")
         return f"Error: {str(e)}"
 
+def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> Union[List[Dict[str, Any]], str]:
+    """
+    Smart search for design files in a project.
+    Automatically navigates to 'Project Files' folder and searches for files by extension.
+
+    Args:
+        hub_id: The hub/account ID
+        project_id: The project ID
+        extensions: Comma-separated file extensions (e.g., "rvt,dwg,nwc")
+
+    Returns:
+        List of matching files with name and URN, or error string
+    """
+    try:
+        # Step 1: Get top folders
+        logger.info(f"Searching for design files with extensions: {extensions}")
+        top_folders = get_top_folders(hub_id, project_id)
+
+        if isinstance(top_folders, str):
+            return f"Failed to get top folders: {top_folders}"
+
+        # Step 2: Find "Project Files" folder
+        project_files_folder = None
+        for folder in top_folders:
+            if folder.get("name") == "Project Files":
+                project_files_folder = folder.get("id")
+                logger.info(f"Found 'Project Files' folder: {project_files_folder}")
+                break
+
+        # Fallback: if "Project Files" not found, try the first folder
+        if not project_files_folder and top_folders:
+            project_files_folder = top_folders[0].get("id")
+            logger.warning(f"'Project Files' not found, using first folder: {project_files_folder}")
+
+        if not project_files_folder:
+            return "No folders found in project"
+
+        # Step 3: Get folder contents
+        contents = get_folder_contents(project_id, project_files_folder)
+
+        if isinstance(contents, str):
+            return f"Failed to get folder contents: {contents}"
+
+        # Step 4: Filter by file extensions
+        ext_list = [ext.strip().lower() for ext in extensions.split(",")]
+        matching_files = []
+
+        for item in contents:
+            if item.get("itemType") == "file":
+                name = item.get("name", "")
+                # Check if file ends with any of the specified extensions
+                if any(name.lower().endswith(f".{ext}") for ext in ext_list):
+                    matching_files.append({
+                        "name": name,
+                        "id": item.get("id"),
+                        "tipVersionUrn": item.get("tipVersionUrn"),
+                        "type": item.get("type")
+                    })
+
+        logger.info(f"Found {len(matching_files)} matching files")
+        return matching_files
+
+    except Exception as e:
+        logger.error(f"Design File Search Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
 # --- CACHE ---
 # Cache for hub_id to avoid repeated calls
 hub_cache = {"id": None}

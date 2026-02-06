@@ -37,7 +37,8 @@ from api import (
     get_hubs_rest,
     get_projects_rest,
     get_top_folders as fetch_top_folders,
-    get_folder_contents as fetch_folder_contents
+    get_folder_contents as fetch_folder_contents,
+    find_design_files
 )
 
 # Initialize Logging
@@ -279,29 +280,45 @@ def get_model_viewer_link(project_id: str, item_id: str) -> str:
 @mcp.tool()
 def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
     """
-    Finds models in the Project Files folder.
-    file_types: Comma-separated list of file extensions (e.g. "rvt,dwg")
+    Automatically searches the 'Project Files' folder for design files (RVT, DWG, etc.).
+    Smart search that navigates to Project Files folder autonomously.
+
+    Args:
+        project_id: The project ID
+        file_types: Comma-separated list of file extensions (e.g. "rvt,dwg,nwc")
     """
     hub_id = get_cached_hub_id()
-    if not hub_id: return "Error: No Hubs."
-    p_id = ensure_b_prefix(project_id)
-    top_data = make_api_request(f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{p_id}/topFolders")
-    if isinstance(top_data, str): return top_data
-    proj_files_folder = next((f["id"] for f in top_data.get("data", []) if f["attributes"]["name"] == "Project Files"), None)
-    if not proj_files_folder: return "Error: Could not find 'Project Files' folder."
-    extensions = [ext.strip().lower() for ext in file_types.split(",")]
-    search_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/folders/{proj_files_folder}/search?filter[extension.type]={','.join(extensions)}"
-    search_results = make_api_request(search_url)
-    if isinstance(search_results, str): return search_results
-    items = search_results.get("data", [])
-    if not items: return "❌ No models found matching those extensions."
-    output = f"🔍 **Found {len(items)} Models:**\n"
-    for i in items:
-        name = i["attributes"]["displayName"]
-        item_id = i['id']
-        domain = get_viewer_domain(item_id)
-        viewer_link = f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(item_id, safe='')}"
-        output += f"- **{name}**\n  [Open in Viewer]({viewer_link}) (ID: `{item_id}`)\n"
+    if not hub_id:
+        return "❌ Error: No Hubs found."
+
+    # Use smart search function
+    result = find_design_files(hub_id, project_id, file_types)
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return "❌ No models found matching those extensions."
+
+    output = f"🔍 **Found {len(result)} Models:**\n"
+    for file in result:
+        name = file.get("name", "Unknown")
+        file_id = file.get("id", "")
+        tip_urn = file.get("tipVersionUrn") or file_id
+
+        # Generate viewer link only if we have a valid URN
+        if tip_urn:
+            domain = get_viewer_domain(tip_urn)
+            viewer_link = f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(tip_urn, safe='')}"
+
+            output += f"- **{name}**\n"
+            output += f"  [Open in Viewer]({viewer_link})\n"
+            output += f"  ID: `{file_id}`\n"
+            if tip_urn != file_id:
+                output += f"  Version URN: `{tip_urn}`\n"
+        else:
+            output += f"- **{name}** (ID: `{file_id}`)\n"
+
     return output
 
 @mcp.tool()
