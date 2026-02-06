@@ -1556,6 +1556,13 @@ def get_view_guid_only(version_urn: str) -> str:
         resp = requests.get(metadata_url, headers=headers, timeout=30)
 
         # Step 5: Handle response with specific error messages
+        if resp.status_code == 401:
+            error_msg = "❌ CRITICAL: 401 Unauthorized. Verify 'viewables:read' scope is active in the OAuth token."
+            logger.error(error_msg)
+            logger.error(f"  Response: {resp.text}")
+            logger.error(f"  Required scopes: data:read data:write data:create bucket:read viewables:read")
+            raise ValueError(error_msg)
+
         if resp.status_code == 404:
             error_msg = "❌ Error: Model found in Data Management but NOT in Model Derivative. Translation might be missing."
             logger.error(error_msg)

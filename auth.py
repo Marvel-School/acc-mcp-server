@@ -35,12 +35,13 @@ def get_token() -> str:
     url = "https://developer.api.autodesk.com/authentication/v2/token"
     
     # Scopes required for the tool's operations
+    # CRITICAL: viewables:read is required for Model Derivative API (metadata endpoint)
     # Using POST Body for credentials to avoid 400 Bad Request
     data = {
         "client_id": APS_CLIENT_ID,
         "client_secret": APS_CLIENT_SECRET,
-        "grant_type": "client_credentials", 
-        "scope": "data:read data:write data:create account:read account:write bucket:read"
+        "grant_type": "client_credentials",
+        "scope": "data:read data:write data:create bucket:read viewables:read"
     }
 
     try:
