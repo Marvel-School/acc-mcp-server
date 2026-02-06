@@ -1517,9 +1517,8 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
 
 def get_view_guid_only(version_urn: str) -> str:
     """
-    Lightweight function to fetch only the view GUID from a model.
-    Does NOT download the full object tree - only fetches the metadata list.
-    Strictly enforces EMEA region headers.
+    Fetches view GUID with automatic token healing.
+    Retries ONCE on 401 errors by forcing a token refresh.
 
     Args:
         version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf...)
@@ -1528,78 +1527,103 @@ def get_view_guid_only(version_urn: str) -> str:
         View GUID (str)
 
     Raises:
-        ValueError: If model not found or no 3D views available
+        ValueError: If model not found, no 3D views available, or auth fails after retry
     """
-    try:
-        logger.info(f"[Lightweight GUID Fetch - EMEA Region] Getting view GUID for model...")
+    logger.info(f"[Lightweight GUID Fetch - EMEA Region] Getting view GUID for model...")
 
-        # Step 1: Clean URN - remove query parameters if present (e.g., ?version=2)
-        clean_urn = version_urn.split("?")[0]
-        logger.info(f"  Original URN: {version_urn[:80]}...")
-        if "?" in version_urn:
-            logger.info(f"  Cleaned URN: {clean_urn[:80]}... (removed query parameters)")
+    # Clean URN - remove query parameters if present (e.g., ?version=2)
+    clean_urn = version_urn.split("?")[0]
+    logger.info(f"  Original URN: {version_urn[:80]}...")
+    if "?" in version_urn:
+        logger.info(f"  Cleaned URN: {clean_urn[:80]}... (removed query parameters)")
 
-        # Step 2: Encode the URN (Base64, no padding)
-        urn_b64 = safe_b64encode(clean_urn)
+    # Encode the URN (Base64, no padding)
+    urn_b64 = safe_b64encode(clean_urn)
+    metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata"
 
-        # Step 3: Get auth token and prepare headers with EXPLICIT EMEA region
-        token = get_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-ads-region": "EMEA"  # CRITICAL: Must route to European data center
-        }
+    # RETRY LOOP (The Fix) - Up to 2 attempts
+    for attempt in range(2):
+        try:
+            # Attempt 0: Normal token (cached if available)
+            # Attempt 1: Force refresh token
+            is_retry = (attempt == 1)
+            if is_retry:
+                logger.info("⚠️ 401 received on first attempt. Force-refreshing token and retrying...")
 
-        # Step 4: Call metadata endpoint (LIGHTWEIGHT - returns only view list, not object tree)
-        metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata"
+            # Get token (force refresh on second attempt)
+            token = get_token(force_refresh=is_retry)
 
-        logger.info(f"  Fetching Metadata from EMEA for URN: {clean_urn[:80]}...")
-        logger.info(f"  Request URL: {metadata_url}")
-        logger.info(f"  Request Headers: Authorization=Bearer *****, x-ads-region={headers.get('x-ads-region')}")
+            # Prepare headers with EMEA region
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "x-ads-region": "EMEA"  # CRITICAL: Must route to European data center
+            }
 
-        resp = requests.get(metadata_url, headers=headers, timeout=30)
+            logger.info(f"  Attempt {attempt + 1}/2: Fetching Metadata from EMEA...")
+            logger.info(f"  Request URL: {metadata_url}")
+            logger.info(f"  Request Headers: Authorization=Bearer *****, x-ads-region={headers.get('x-ads-region')}")
 
-        # Step 5: Handle response with specific error messages
-        if resp.status_code == 401:
-            error_msg = "❌ CRITICAL: 401 Unauthorized. Verify 'viewables:read' scope is active in the OAuth token."
-            logger.error(error_msg)
-            logger.error(f"  Response: {resp.text}")
-            logger.error(f"  Required scopes: data:read data:write data:create bucket:read viewables:read")
-            raise ValueError(error_msg)
+            # Make the request
+            resp = requests.get(metadata_url, headers=headers, timeout=30)
 
-        if resp.status_code == 404:
-            error_msg = "❌ Error: Model found in Data Management but NOT in Model Derivative. Translation might be missing."
-            logger.error(error_msg)
-            logger.error(f"  Response: {resp.text}")
-            raise ValueError(error_msg)
+            # If 401 and it's the first attempt, CONTINUE to next loop iteration (retry)
+            if resp.status_code == 401 and attempt == 0:
+                logger.warning("  Received 401 on first attempt. Will retry with fresh token...")
+                continue
 
-        if resp.status_code != 200:
-            error_msg = f"Metadata API Error {resp.status_code}: {resp.text}"
-            logger.error(error_msg)
-            raise ValueError(f"❌ {error_msg}")
+            # If 401 on second attempt after token refresh, raise error
+            if resp.status_code == 401:
+                error_msg = "❌ Critical Auth Failure: 401 Unauthorized even after token refresh. Verify 'viewables:read' scope is configured."
+                logger.error(error_msg)
+                logger.error(f"  Response: {resp.text}")
+                logger.error(f"  Required scopes: data:read data:write data:create bucket:read viewables:read")
+                raise ValueError(error_msg)
 
-        # Step 6: Extract the first view GUID from the metadata list
-        metadata = resp.json()
-        views = metadata.get("data", {}).get("metadata", [])
+            # Handle 404 - model not found or not translated
+            if resp.status_code == 404:
+                error_msg = "❌ Model not found (404). Translation might be missing or file doesn't exist in Model Derivative."
+                logger.error(error_msg)
+                logger.error(f"  Response: {resp.text}")
+                raise ValueError(error_msg)
 
-        if not views:
-            error_msg = "❌ No 3D views found in model metadata. Model may not contain extractable geometry."
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            # Raise for any other non-200 status
+            if resp.status_code != 200:
+                error_msg = f"Metadata API Error {resp.status_code}: {resp.text}"
+                logger.error(error_msg)
+                raise ValueError(f"❌ {error_msg}")
 
-        guid = views[0].get("guid")
-        view_name = views[0].get("name", "Unknown")
+            # Success - parse the response
+            data = resp.json()
+            views = data.get("data", {}).get("metadata", [])
 
-        logger.info(f"✅ Found view: {view_name} (GUID: {guid})")
-        return guid
+            if not views:
+                error_msg = "❌ No 3D views found in model metadata. Model may not contain extractable geometry."
+                logger.error(error_msg)
+                raise ValueError(error_msg)
 
-    except ValueError:
-        # Re-raise ValueError with original message
-        raise
+            # Extract GUID and view name
+            guid = views[0].get("guid")
+            view_name = views[0].get("name", "Unknown")
 
-    except Exception as e:
-        error_msg = f"❌ Error fetching view GUID: {str(e)}"
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+            logger.info(f"✅ Found view: {view_name} (GUID: {guid})")
+            return guid
+
+        except ValueError:
+            # Re-raise ValueError (already has user-friendly message)
+            if attempt == 1:
+                raise
+            # On first attempt, continue to retry
+            continue
+
+        except Exception as e:
+            # Only raise on final attempt
+            if attempt == 1:
+                error_msg = f"❌ Error fetching view GUID: {str(e)}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+    # Should never reach here, but just in case
+    raise ValueError("❌ Unexpected error in retry loop.")
 
 
 def query_model_elements(project_id: str, file_identifier: str, category_name: str) -> Union[int, str]:

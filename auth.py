@@ -24,16 +24,28 @@ BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 # Global token cache
 token_cache = {"access_token": None, "expires_at": 0}
 
-def get_token() -> str:
-    """Retrieves or refreshes the 2-legged access token."""
+def get_token(force_refresh: bool = False) -> str:
+    """
+    Retrieves or refreshes the 2-legged access token.
+
+    Args:
+        force_refresh: If True, ignores cached token and fetches a fresh one
+
+    Returns:
+        Access token string
+    """
     global token_cache
     if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
         logger.error("APS credentials missing.")
         raise ValueError("Error: APS credentials missing.")
 
-    if time.time() < token_cache["expires_at"]:
+    # Check cache only if not forcing refresh
+    if not force_refresh and time.time() < token_cache["expires_at"]:
         logger.debug(f"Using cached token (expires in {int(token_cache['expires_at'] - time.time())}s)")
         return token_cache["access_token"]
+
+    if force_refresh:
+        logger.info("🔄 Force refreshing token (requested by caller)")
 
     logger.info("🔄 Authenticating with scopes: " + APS_SCOPES)
     url = "https://developer.api.autodesk.com/authentication/v2/token"
