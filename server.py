@@ -39,7 +39,10 @@ from api import (
     get_top_folders as fetch_top_folders,
     get_folder_contents as fetch_folder_contents,
     find_design_files,
-    resolve_project
+    resolve_project,
+    get_latest_version_urn,
+    get_model_manifest,
+    get_model_metadata
 )
 
 # Initialize Logging
@@ -365,13 +368,91 @@ def search_files(project_id: str, query: str) -> str:
     items = search_project_folder(project_id, query)
     if not items:
         return f"🔍 No files found matching '{query}' in Project {project_id}."
-        
+
     output = f"🔍 **Search Results for '{query}':**\n"
     for i in items:
         name = i["attributes"]["displayName"]
         item_id = i['id']
         item_type = "📁" if i.get("type") == "folders" else "📄"
         output += f"{item_type} **{name}** (ID: `{item_id}`)\n"
+    return output
+
+@mcp.tool()
+def inspect_model(project_id: str, file_id: str, show_tree: bool = False) -> str:
+    """
+    Comprehensive model inspection using Model Derivative API.
+    Shows translation status, available formats, and optionally the object tree.
+
+    Args:
+        project_id: The project ID
+        file_id: The file/item ID or version URN
+        show_tree: If True, includes detailed object tree summary (default: False)
+    """
+    # Step 1: Resolve to version URN
+    version_urn = get_latest_version_urn(project_id, file_id)
+
+    if not version_urn or not version_urn.startswith("urn:"):
+        return f"❌ Error: Could not resolve file ID to a valid version URN. Please check the file ID."
+
+    logger.info(f"Inspecting model with version URN: {version_urn}")
+
+    # Step 2: Get manifest (translation status)
+    manifest = get_model_manifest(version_urn)
+
+    if isinstance(manifest, str):
+        return f"❌ Manifest Error: {manifest}"
+
+    # Parse manifest
+    status = manifest.get("status", "unknown")
+    progress = manifest.get("progress", "unknown")
+
+    output = "🔍 **Model Inspection Report**\n\n"
+    output += f"**Version URN:** `{version_urn}`\n"
+    output += f"**Translation Status:** {status}\n"
+    output += f"**Progress:** {progress}\n\n"
+
+    # Show available derivatives
+    derivatives = manifest.get("derivatives", [])
+    if derivatives:
+        output += "**Available Formats:**\n"
+        for deriv in derivatives:
+            output_type = deriv.get("outputType", "unknown")
+            deriv_status = deriv.get("status", "unknown")
+            output += f"- {output_type}: {deriv_status}\n"
+        output += "\n"
+
+    # Step 3: Get metadata if requested
+    if show_tree and status == "success":
+        metadata = get_model_metadata(version_urn)
+
+        if isinstance(metadata, str):
+            output += f"⚠️ Metadata: {metadata}\n"
+        else:
+            # Parse object tree for summary
+            try:
+                objects = metadata.get("data", {}).get("objects", [])
+                categories = {}
+
+                def traverse(nodes):
+                    for node in nodes:
+                        if "objects" in node:
+                            cat_name = node.get("name", "Unknown")
+                            categories[cat_name] = categories.get(cat_name, 0) + len(node["objects"])
+                        if "objects" in node and isinstance(node["objects"], list):
+                            traverse(node["objects"])
+
+                if objects:
+                    traverse(objects)
+
+                output += "**Object Tree Summary:**\n"
+                for cat, count in sorted(categories.items(), key=lambda x: x[1], reverse=True)[:15]:
+                    output += f"- {cat}: {count} items\n"
+            except Exception as e:
+                output += f"⚠️ Could not parse object tree: {str(e)}\n"
+
+    elif show_tree and status != "success":
+        output += "⚠️ Object tree not available until translation is complete.\n"
+
     return output
 
 @mcp.tool()

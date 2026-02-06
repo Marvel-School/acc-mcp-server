@@ -1005,28 +1005,133 @@ def get_account_user_details(email: str) -> dict:
     hub_id = get_cached_hub_id()
     if not hub_id: return {"error": "No Hub ID found."}
     account_id = clean_id(hub_id)
-    
+
     token = get_token()
     headers = {
         "Authorization": f"Bearer {token}",
         "x-ads-region": "EMEA"
     }
-    
+
     # HQ API User Search
     url = f"https://developer.api.autodesk.com/hq/v1/accounts/{account_id}/users"
     params = {"filter[email]": email}
-    
+
     try:
         resp = requests.get(url, headers=headers, params=params)
         if resp.status_code != 200:
              return {"error": f"HQ API returned {resp.status_code}: {resp.text}"}
-             
+
         data = resp.json()
         # HQ API usually returns list
         if isinstance(data, list) and len(data) > 0:
             return data[0]
-        
+
         return {"error": "User not found via HQ Search."}
 
     except Exception as e:
         return {"error": str(e)}
+
+# --- MODEL DERIVATIVE API ---
+
+def get_latest_version_urn(project_id: str, item_id: str) -> Optional[str]:
+    """
+    Resolves a File Item ID (Lineage URN) to its latest Version URN.
+    This is an alias for resolve_to_version_id() for clarity in Model Derivative context.
+
+    Args:
+        project_id: The project ID
+        item_id: The item ID (Lineage URN like urn:adsk.wipp:dm.lineage:...)
+
+    Returns:
+        Version URN or None on error
+    """
+    return resolve_to_version_id(project_id, item_id)
+
+def get_model_manifest(version_urn: str) -> Union[Dict[str, Any], str]:
+    """
+    Fetches the Model Derivative manifest for a file version.
+    Shows translation status and available formats.
+
+    Args:
+        version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf.xxx)
+
+    Returns:
+        Manifest data or error string
+    """
+    try:
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Base64 encode the URN (URL-safe, no padding)
+        encoded_urn = safe_b64encode(version_urn)
+
+        url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/manifest"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code == 404:
+            return "Model not found or not yet translated. Please check if the file has been processed in the viewer."
+
+        if resp.status_code != 200:
+            logger.error(f"Manifest API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: {resp.text}"
+
+        return resp.json()
+
+    except Exception as e:
+        logger.error(f"Manifest Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def get_model_metadata(version_urn: str, guid: Optional[str] = None) -> Union[Dict[str, Any], str]:
+    """
+    Fetches the Model Derivative metadata (object tree) for a file version.
+    Shows the hierarchical structure of objects in the model.
+
+    Args:
+        version_urn: The version URN
+        guid: Optional specific view GUID. If not provided, uses first available view.
+
+    Returns:
+        Metadata object tree or error string
+    """
+    try:
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Base64 encode the URN
+        encoded_urn = safe_b64encode(version_urn)
+
+        # If no GUID provided, fetch the manifest to get available views
+        if not guid:
+            manifest_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
+            resp = requests.get(manifest_url, headers=headers)
+
+            if resp.status_code == 404:
+                return "Model metadata not found. File may not be fully processed."
+
+            if resp.status_code != 200:
+                logger.error(f"Metadata API Error {resp.status_code}: {resp.text}")
+                return f"Error {resp.status_code}: {resp.text}"
+
+            data = resp.json().get("data", {}).get("metadata", [])
+            if not data:
+                return "No 3D views found in this model."
+
+            guid = data[0]["guid"]
+            logger.info(f"Using first available view GUID: {guid}")
+
+        # Fetch the object tree for this view
+        tree_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}"
+        resp_tree = requests.get(tree_url, headers=headers, params={"forceget": "true"})
+
+        if resp_tree.status_code == 202:
+            return "Model metadata is still processing. Please try again in a moment."
+
+        if resp_tree.status_code != 200:
+            logger.error(f"Object Tree API Error {resp_tree.status_code}: {resp_tree.text}")
+            return f"Error {resp_tree.status_code}: {resp_tree.text}"
+
+        return resp_tree.json()
+
+    except Exception as e:
+        logger.error(f"Metadata Exception: {str(e)}")
+        return f"Error: {str(e)}"
