@@ -605,7 +605,7 @@ def get_model_tree(project_id: str, file_id: str) -> str:
 def count_elements(project_id: str, file_id: str, category_name: str) -> str:
     """
     Counts elements in a model that match a specific category.
-    Traverses the full object tree hierarchy to find and count matching elements.
+    Traverses the full object tree hierarchy internally and returns only a summary count.
     Accepts file by ID OR Name!
 
     Args:
@@ -620,75 +620,55 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
     Note: Search is case-insensitive and matches partial names.
     """
     try:
-        logger.info(f"Counting elements in category: {category_name}")
+        logger.info(f"Analyzing model for category: {category_name}")
 
-        # Step 1: Fetch the object tree
+        # Step 1: Fetch the object tree (processed internally, not returned to LLM)
         tree_data = fetch_object_tree(project_id, file_id)
 
-        # Check if we got an error string instead of data
+        # Handle errors from fetch
         if isinstance(tree_data, str):
             return tree_data
 
-        # Safety check: Ensure we got valid data
         if not tree_data:
-            return "❌ Error: Could not retrieve model data. The response was empty."
+            return "⚠️ Error: The model data is too large to process in this environment."
 
-        # Step 2: Extract objects from the tree
+        # Step 2: Extract objects
         data_section = tree_data.get("data")
         if not data_section:
-            return "❌ Error: Invalid model data structure. Missing 'data' section."
+            return "⚠️ Error: The model data is too large to process in this environment."
 
         objects = data_section.get("objects", [])
-
         if not objects:
-            return "❌ No objects found in model. The model may be empty or not properly translated."
+            return "⚠️ Error: The model data is too large to process in this environment."
 
-        # Step 3: Recursive traversal to count matching elements (with depth limit for safety)
+        # Step 3: Count matching elements (internal processing only)
         category_lower = category_name.lower()
-        match_count = 0
-        total_objects = 0
-        max_depth = 100  # Safety limit to prevent infinite recursion
+        count = 0
 
-        def traverse(nodes, depth=0):
-            nonlocal match_count, total_objects
+        def traverse(node):
+            """Recursively count matching elements."""
+            nonlocal count
 
-            # Safety check: prevent excessive recursion
-            if depth > max_depth:
-                logger.warning(f"Reached maximum recursion depth ({max_depth}). Stopping traversal.")
-                return
+            # Check if this node matches
+            node_name = node.get("name", "").lower()
+            if category_lower in node_name:
+                count += 1
 
-            for node in nodes:
-                total_objects += 1
-                node_name = node.get("name", "").lower()
+            # Recurse through children
+            for child in node.get("objects", []):
+                traverse(child)
 
-                # Check if node name contains the category name
-                if category_lower in node_name:
-                    match_count += 1
-                    logger.debug(f"  Match found: {node.get('name', 'Unknown')} (depth {depth})")
+        # Process all root objects
+        for obj in objects:
+            traverse(obj)
 
-                # Traverse nested objects
-                if "objects" in node and isinstance(node["objects"], list):
-                    traverse(node["objects"], depth + 1)
-
-        # Start traversal from root
-        logger.info(f"  Starting recursive traversal (max depth: {max_depth})...")
-        traverse(objects)
-
-        # Step 4: Format output
-        if match_count == 0:
-            return f"❌ No elements found matching category '{category_name}'.\n\nSearched {total_objects} total objects. Try a different category name or check the model structure with get_model_tree."
-
-        output = f"✅ **Element Count Results:**\n\n"
-        output += f"**Category:** {category_name}\n"
-        output += f"**Matches Found:** {match_count}\n"
-        output += f"**Total Objects Searched:** {total_objects}\n"
-
-        logger.info(f"✅ Found {match_count} elements matching '{category_name}'")
-        return output
+        # Step 4: Return ONLY the final count (strict format)
+        logger.info(f"Analysis complete. Found {count} items.")
+        return f"✅ Analysis Complete. Found {count} items matching '{category_name}' in the model."
 
     except Exception as e:
-        logger.error(f"Element Count Exception: {str(e)}")
-        return f"❌ Error counting elements: {str(e)}"
+        logger.error(f"Analysis failed: {str(e)}")
+        return "⚠️ Error: The model data is too large to process in this environment."
 
 # ==========================================
 # ADMIN TOOLS

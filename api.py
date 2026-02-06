@@ -1488,7 +1488,7 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
 
         except ValueError as json_err:
             logger.error(f"JSON parsing failed: {str(json_err)}")
-            logger.error(f"Response content preview: {resp_tree.content[:500]}")
+            # DO NOT log response content - it may be huge
             return f"❌ Error: Failed to parse model data. The response may be corrupted or invalid JSON."
 
         except Exception as parse_err:
