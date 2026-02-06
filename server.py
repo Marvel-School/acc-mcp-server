@@ -41,6 +41,7 @@ from api import (
     find_design_files,
     resolve_project,
     find_project_globally,
+    resolve_file_to_urn,
     get_latest_version_urn,
     get_model_manifest,
     get_model_metadata,
@@ -655,17 +656,26 @@ def reprocess_file(project_id: str, file_id: str) -> str:
     Note: Translation takes 5-10 minutes. Check status with inspect_file after waiting.
     """
     try:
-        logger.info(f"Triggering translation for file: {file_id}")
+        # Step 1: Smart Resolve (Handles Name -> URN lookup automatically)
+        # This ensures we have a valid URN (urn:adsk.wipp...) before proceeding
+        logger.info(f"Resolving file '{file_id}' for reprocessing...")
+        lineage_urn = resolve_file_to_urn(project_id, file_id)
 
-        # Step 1: Resolve file_id to version URN
-        version_urn = get_latest_version_urn(project_id, file_id)
+        if not lineage_urn or not lineage_urn.startswith("urn:"):
+            return f"❌ Error: Could not resolve '{file_id}' to a valid lineage URN. Please check the file ID."
+
+        logger.info(f"  Resolved to lineage URN: {lineage_urn[:80]}...")
+
+        # Step 2: Get Latest Version (The translation requires the VERSION URN)
+        version_urn = get_latest_version_urn(project_id, lineage_urn)
 
         if not version_urn or not version_urn.startswith("urn:"):
-            return f"❌ Error: Could not resolve '{file_id}' to a valid version URN. Please check the file ID."
+            return f"❌ Error: Could not resolve lineage URN to version URN."
 
         logger.info(f"  Resolved to version URN: {version_urn[:80]}...")
 
-        # Step 2: Trigger translation job
+        # Step 3: Trigger Translation
+        logger.info(f"Triggering translation for version: {version_urn}")
         result = trigger_translation(version_urn)
 
         # Check if we got an error string
@@ -676,15 +686,15 @@ def reprocess_file(project_id: str, file_id: str) -> str:
         job_status = result.get("result", "unknown")
 
         if job_status == "success":
-            return "✅ Translation Job Started Successfully! Please wait 5-10 minutes for the Property Database to generate, then try counting again."
+            return f"✅ Translation Job Started for '{file_id}'.\nStatus: {job_status}\n\nPlease wait 5-10 minutes, then try counting elements again."
         elif job_status == "created":
-            return "✅ Translation Job Queued! Please wait 5-10 minutes for processing to complete, then try counting again."
+            return f"✅ Translation Job Started for '{file_id}'.\nStatus: {job_status}\n\nPlease wait 5-10 minutes, then try counting elements again."
         else:
-            return f"⚠️ Translation Job Submitted (Status: {job_status}). Wait 5-10 minutes, then check with inspect_file."
+            return f"✅ Translation Job Started for '{file_id}'.\nStatus: {job_status}\n\nPlease wait 5-10 minutes, then try counting elements again."
 
     except Exception as e:
         logger.error(f"Reprocess failed: {str(e)}")
-        return f"❌ Error: Failed to trigger translation job: {str(e)}"
+        return f"❌ Reprocess Failed: {str(e)}"
 
 # ==========================================
 # ADMIN TOOLS
