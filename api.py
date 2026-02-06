@@ -195,32 +195,34 @@ def get_projects_rest(hub_id: str) -> Union[List[Dict[str, Any]], str]:
         logger.error(f"REST Project Exception: {str(e)}")
         return f"Error: {str(e)}"
 
-def resolve_project(project_name_or_id: str) -> Union[Dict[str, Any], str]:
+def find_project_globally(name_query: str) -> Optional[tuple]:
     """
-    Globally searches for a project across all accessible hubs.
-    Matches by project name (case-insensitive) or exact project ID.
+    Universal project finder that searches across ALL accessible hubs.
+    Case-insensitive substring matching.
 
     Args:
-        project_name_or_id: Project name or ID to search for
+        name_query: Project name to search for (case-insensitive)
 
     Returns:
-        Dict with hub_id, project_id, and project_name, or error string
+        Tuple of (hub_id, project_id, project_name) if found, None otherwise
     """
     try:
-        logger.info(f"Searching globally for project: {project_name_or_id}")
+        logger.info(f"[Universal Explorer] Searching globally for project: {name_query}")
 
-        # Step 1: Get all accessible hubs
+        # Step 1: Get all accessible hubs (strict EMEA region)
         hubs = get_hubs_rest()
 
         if isinstance(hubs, str):
-            return f"Failed to get hubs: {hubs}"
+            logger.error(f"Failed to get hubs: {hubs}")
+            return None
 
         if not hubs:
-            return "No hubs found. Check if your app has access to any accounts."
+            logger.error("No hubs found. Check if your app has access to any accounts.")
+            return None
 
-        search_term = project_name_or_id.lower().strip()
+        search_term = name_query.lower().strip()
 
-        # Step 2: Search through each hub
+        # Step 2: Search through every hub
         for hub in hubs:
             hub_id = hub.get("id")
             hub_name = hub.get("name", "Unknown")
@@ -230,40 +232,56 @@ def resolve_project(project_name_or_id: str) -> Union[Dict[str, Any], str]:
                 logger.warning(f"Skipping hub with no ID: {hub_name}")
                 continue
 
-            logger.info(f"Searching in hub: {hub_name} ({hub_id})")
+            logger.info(f"  Searching in hub: {hub_name}")
 
             # Step 3: Get projects for this hub
             projects = get_projects_rest(hub_id)
 
             if isinstance(projects, str):
-                logger.warning(f"Failed to get projects for hub {hub_name}: {projects}")
+                logger.warning(f"  Failed to get projects for hub {hub_name}: {projects}")
                 continue
 
-            # Step 4: Check for matching project
+            # Step 4: Check for matching project (case-insensitive substring match)
             for project in projects:
                 project_id = project.get("id", "")
                 project_name = project.get("name", "")
 
-                # Match by name (case-insensitive) or exact ID
-                if (search_term == project_name.lower() or
-                    search_term in project_name.lower() or
-                    project_name_or_id == project_id):
-
+                # Case-insensitive substring match
+                if search_term in project_name.lower():
                     logger.info(f"✅ Found project '{project_name}' in hub '{hub_name}'")
-                    return {
-                        "hub_id": hub_id,
-                        "project_id": project_id,
-                        "project_name": project_name,
-                        "hub_name": hub_name
-                    }
+                    return (hub_id, project_id, project_name)
 
         # Not found in any hub
-        logger.warning(f"Project '{project_name_or_id}' not found in any accessible hub")
-        return f"Project '{project_name_or_id}' not found in any accessible hub. Please check the name or ID."
+        logger.warning(f"Project '{name_query}' not found in any accessible hub")
+        return None
 
     except Exception as e:
-        logger.error(f"Project Resolution Exception: {str(e)}")
-        return f"Error: {str(e)}"
+        logger.error(f"Project Search Exception: {str(e)}")
+        return None
+
+def resolve_project(project_name_or_id: str) -> Union[Dict[str, Any], str]:
+    """
+    Legacy wrapper for find_project_globally() that returns dict format.
+    Kept for backward compatibility with existing tools.
+
+    Args:
+        project_name_or_id: Project name or ID to search for
+
+    Returns:
+        Dict with hub_id, project_id, and project_name, or error string
+    """
+    result = find_project_globally(project_name_or_id)
+
+    if result is None:
+        return f"Project '{project_name_or_id}' not found in any accessible hub. Please check the name or ID."
+
+    hub_id, project_id, project_name = result
+    return {
+        "hub_id": hub_id,
+        "project_id": project_id,
+        "project_name": project_name,
+        "hub_name": "Unknown"  # Legacy field
+    }
 
 def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]], str]:
     """
@@ -370,7 +388,7 @@ def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str,
 
 def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> Union[List[Dict[str, Any]], str]:
     """
-    Smart recursive search for design files in a project using BFS.
+    Universal recursive file finder using BFS with depth limit.
     Automatically navigates to 'Project Files' folder and searches nested subfolders.
 
     Args:
@@ -379,11 +397,11 @@ def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> 
         extensions: Comma-separated file extensions (e.g., "rvt,dwg,nwc")
 
     Returns:
-        List of matching files with name and URN, or error string
+        List of files with format: {name, item_id, version_id, folder_path}
     """
     try:
         # Step 1: Get top folders
-        logger.info(f"Starting recursive search for design files with extensions: {extensions}")
+        logger.info(f"[Universal Explorer] Searching for files with extensions: {extensions}")
         top_folders = get_top_folders(hub_id, project_id)
 
         if isinstance(top_folders, str):
@@ -394,40 +412,42 @@ def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> 
         for folder in top_folders:
             if folder.get("name") == "Project Files":
                 project_files_folder = folder.get("id")
-                logger.info(f"Found 'Project Files' folder: {project_files_folder}")
+                logger.info(f"  Found 'Project Files' folder: {project_files_folder}")
                 break
 
         # Fallback: if "Project Files" not found, try the first folder
         if not project_files_folder and top_folders:
             project_files_folder = top_folders[0].get("id")
-            logger.warning(f"'Project Files' not found, using first folder: {project_files_folder}")
+            logger.warning(f"  'Project Files' not found, using first folder")
 
         if not project_files_folder:
             return "No folders found in project"
 
-        # Step 3: Initialize BFS queue and results
-        folder_queue = [{"id": project_files_folder, "name": "Project Files"}]
+        # Step 3: Initialize BFS queue with depth tracking
+        folder_queue = [{"id": project_files_folder, "name": "Project Files", "depth": 0}]
         matching_files = []
         ext_list = [ext.strip().lower() for ext in extensions.split(",")]
 
         # Safety limits
         max_folders_to_scan = 50
+        max_depth = 3
         folders_scanned = 0
 
-        # Step 4: BFS Loop
+        # Step 4: BFS Loop with depth limit
         while folder_queue and folders_scanned < max_folders_to_scan:
             current_folder = folder_queue.pop(0)
             folder_id = current_folder["id"]
             folder_name = current_folder["name"]
+            depth = current_folder["depth"]
 
             folders_scanned += 1
-            logger.info(f"Scanning folder {folders_scanned}/{max_folders_to_scan}: '{folder_name}'")
+            logger.info(f"  Scanning folder {folders_scanned}/{max_folders_to_scan} (depth {depth}): '{folder_name}'")
 
             # Get folder contents
             contents = get_folder_contents(project_id, folder_id)
 
             if isinstance(contents, str):
-                logger.warning(f"Failed to get contents of folder '{folder_name}': {contents}")
+                logger.warning(f"  Failed to get contents of folder '{folder_name}': {contents}")
                 continue
 
             # Process items in this folder
@@ -441,27 +461,27 @@ def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> 
                     if any(name.lower().endswith(f".{ext}") for ext in ext_list):
                         matching_files.append({
                             "name": name,
-                            "id": item.get("id"),
-                            "tipVersionUrn": item.get("tipVersionUrn"),
-                            "type": item.get("type"),
-                            "folder": folder_name
+                            "item_id": item.get("id"),
+                            "version_id": item.get("tipVersionUrn"),
+                            "folder_path": folder_name
                         })
-                        logger.info(f"  Found matching file: {name}")
+                        logger.info(f"    Found: {name}")
 
-                # If it's a subfolder, add to queue for scanning
-                elif item_type == "folder":
+                # If it's a subfolder and we haven't reached max depth, add to queue
+                elif item_type == "folder" and depth < max_depth:
                     subfolder_name = item.get("name", "Unknown")
                     folder_queue.append({
                         "id": item.get("id"),
-                        "name": f"{folder_name}/{subfolder_name}"
+                        "name": f"{folder_name}/{subfolder_name}",
+                        "depth": depth + 1
                     })
-                    logger.info(f"  Queued subfolder: {subfolder_name}")
+                    logger.info(f"    Queued subfolder: {subfolder_name} (depth {depth + 1})")
 
         # Log summary
         if folders_scanned >= max_folders_to_scan:
             logger.warning(f"Reached maximum folder scan limit ({max_folders_to_scan})")
 
-        logger.info(f"Search complete: Scanned {folders_scanned} folders, found {len(matching_files)} matching files")
+        logger.info(f"✅ Search complete: Scanned {folders_scanned} folders, found {len(matching_files)} matching files")
         return matching_files
 
     except Exception as e:
@@ -1134,4 +1154,60 @@ def get_model_metadata(version_urn: str, guid: Optional[str] = None) -> Union[Di
 
     except Exception as e:
         logger.error(f"Metadata Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def inspect_generic_file(project_id: str, version_id: str) -> str:
+    """
+    Universal file inspector that checks Model Derivative translation status.
+    Works for any file type that can be translated.
+
+    Args:
+        project_id: The project ID (unused, kept for API consistency)
+        version_id: The version URN to inspect
+
+    Returns:
+        Status message string
+    """
+    try:
+        logger.info(f"[Universal Explorer] Inspecting file with version: {version_id}")
+
+        # Encode the URN (Base64, no padding)
+        encoded_urn = safe_b64encode(version_id)
+
+        # Call Model Derivative API to get manifest
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/manifest"
+
+        resp = requests.get(url, headers=headers)
+
+        # Handle different status codes
+        if resp.status_code == 404:
+            return "File not found or not yet translated. Please check if the file has been processed."
+
+        if resp.status_code == 202:
+            return "Processing - Translation in progress. Please check again later."
+
+        if resp.status_code != 200:
+            logger.error(f"Manifest API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: Unable to inspect file."
+
+        # Parse the manifest
+        manifest = resp.json()
+        status = manifest.get("status", "unknown").lower()
+        progress = manifest.get("progress", "unknown")
+
+        if status == "success":
+            return f"✅ Ready for Extraction (Translation complete, progress: {progress})"
+        elif status == "inprogress":
+            return f"⏳ Processing (Translation {progress}% complete)"
+        elif status == "failed":
+            return "❌ Translation Failed"
+        elif status == "timeout":
+            return "⏱️ Translation Timeout - File may be too large or complex"
+        else:
+            return f"Status: {status} (Progress: {progress})"
+
+    except Exception as e:
+        logger.error(f"File Inspection Exception: {str(e)}")
         return f"Error: {str(e)}"

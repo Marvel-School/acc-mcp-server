@@ -40,9 +40,11 @@ from api import (
     get_folder_contents as fetch_folder_contents,
     find_design_files,
     resolve_project,
+    find_project_globally,
     get_latest_version_urn,
     get_model_manifest,
-    get_model_metadata
+    get_model_metadata,
+    inspect_generic_file
 )
 
 # Initialize Logging
@@ -158,6 +160,26 @@ def list_aec_projects(hub_id: str) -> str:
 
     return output
 
+@mcp.tool()
+def find_project(name_query: str) -> str:
+    """
+    Universal project finder that searches across ALL accessible hubs.
+    No need to specify hub_id - searches everywhere automatically.
+
+    Args:
+        name_query: Project name to search for (case-insensitive substring match)
+
+    Example: find_project("Marvel") will find "Marvel Office Building"
+    """
+    result = find_project_globally(name_query)
+
+    if result is None:
+        return f"❌ Project '{name_query}' not found in any accessible hub.\n\nPlease check the project name and try again."
+
+    hub_id, project_id, project_name = result
+
+    return f"✅ **Found Project:**\n\n**Name:** {project_name}\n**Project ID:** `{project_id}`\n**Hub ID:** `{hub_id}`\n\nYou can now use this project_id with other tools."
+
 # ==========================================
 # FILE & FOLDER TOOLS
 # ==========================================
@@ -231,15 +253,90 @@ def get_download_url(project_id: str, file_id: str) -> str:
         target_version_id = resolve_to_version_id(project_id, file_id)
         r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encode_urn(target_version_id)}", headers=headers)
         if r.status_code != 200: return f"Error finding file version: {r.text}"
-        
+
         storage_urn = r.json()["data"]["relationships"]["storage"]["data"]["id"]
         parts = storage_urn.split("/")
         bucket_key, object_key = parts[-2].split(":")[-1], parts[-1]
-        
+
         oss_url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_key}/objects/{object_key}/signeds3download"
         r = requests.get(oss_url, headers=headers, params={"minutesExpiration": 60})
         return f"⬇️ **[Click to Download File]({r.json()['url']})**" if r.status_code == 200 else f"Error: {r.text}"
     except Exception as e: return str(e)
+
+@mcp.tool()
+def find_files(project_name: Optional[str] = None, project_id: Optional[str] = None, extension: str = "rvt") -> str:
+    """
+    Universal file finder that works across any project.
+    Automatically searches recursively through folders (max depth 3).
+
+    Args:
+        project_name: Project name to search for (triggers automatic project lookup)
+        project_id: Direct project ID (use if you already know it)
+        extension: File extension to find (e.g., "rvt", "dwg", "nwc"). Can be comma-separated.
+
+    You must provide either project_name OR project_id.
+    """
+    # Step 1: Resolve project if name is provided
+    if project_name:
+        logger.info(f"Looking up project: {project_name}")
+        result = find_project_globally(project_name)
+
+        if result is None:
+            return f"❌ Project '{project_name}' not found. Please check the name and try again."
+
+        hub_id, resolved_project_id, resolved_project_name = result
+        logger.info(f"Found project: {resolved_project_name}")
+
+    elif project_id:
+        # Use cached hub_id if project_id is provided directly
+        hub_id = get_cached_hub_id()
+        if not hub_id:
+            return "❌ Error: Could not determine hub_id. Please use project_name instead."
+        resolved_project_id = project_id
+        resolved_project_name = project_id
+    else:
+        return "❌ Error: You must provide either 'project_name' or 'project_id'."
+
+    # Step 2: Search for files
+    files = find_design_files(hub_id, resolved_project_id, extension)
+
+    if isinstance(files, str):
+        return f"❌ Error: {files}"
+
+    if not files:
+        return f"❌ No files with extension '.{extension}' found in project."
+
+    # Step 3: Format output
+    output = f"🔍 **Found {len(files)} Files in '{resolved_project_name}':**\n\n"
+
+    for file in files:
+        name = file.get("name", "Unknown")
+        item_id = file.get("item_id", "")
+        version_id = file.get("version_id", "")
+        folder_path = file.get("folder_path", "Unknown")
+
+        output += f"📄 **{name}**\n"
+        output += f"   Location: `{folder_path}`\n"
+        output += f"   Item ID: `{item_id}`\n"
+        if version_id:
+            output += f"   Version URN: `{version_id}`\n"
+        output += "\n"
+
+    return output
+
+@mcp.tool()
+def inspect_file(project_id: str, version_id: str) -> str:
+    """
+    Universal file inspector that checks translation status.
+    Works for any file type that can be processed by Model Derivative API.
+
+    Args:
+        project_id: The project ID
+        version_id: The version URN (from find_files output)
+
+    Returns translation status (Ready, Processing, Failed, etc.)
+    """
+    return inspect_generic_file(project_id, version_id)
 
 # ==========================================
 # 3D MODEL TOOLS
@@ -338,9 +435,9 @@ def find_models(project_name_or_id: str, file_types: str = "rvt,rcp,dwg,nwc") ->
     output = f"🔍 **Found {len(result)} Models:**\n"
     for file in result:
         name = file.get("name", "Unknown")
-        file_id = file.get("id", "")
-        tip_urn = file.get("tipVersionUrn") or file_id
-        folder_path = file.get("folder", "Unknown")
+        file_id = file.get("item_id", "")
+        tip_urn = file.get("version_id") or file_id
+        folder_path = file.get("folder_path", "Unknown")
 
         # Generate viewer link only if we have a valid URN
         if tip_urn:
