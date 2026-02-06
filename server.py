@@ -605,7 +605,7 @@ def get_model_tree(project_id: str, file_id: str) -> str:
 def count_elements(project_id: str, file_id: str, category_name: str) -> str:
     """
     Counts elements in a model that match a specific category.
-    Traverses the full object tree hierarchy internally and returns only a summary count.
+    Uses iterative stack-based traversal to handle large models efficiently.
     Accepts file by ID OR Name!
 
     Args:
@@ -641,30 +641,33 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
         if not objects:
             return "⚠️ Error: The model data is too large to process in this environment."
 
-        # Step 3: Count matching elements (internal processing only)
+        # Step 3: Count matching elements using iterative traversal (prevents RecursionError)
         category_lower = category_name.lower()
         count = 0
 
-        def traverse(node):
-            """Recursively count matching elements."""
-            nonlocal count
+        # Use stack-based iteration instead of recursion for memory efficiency
+        stack = list(objects)  # Initialize stack with root objects
 
-            # Check if this node matches
+        while stack:
+            node = stack.pop()
+
+            # Check if this node matches the category
             node_name = node.get("name", "").lower()
             if category_lower in node_name:
                 count += 1
 
-            # Recurse through children
-            for child in node.get("objects", []):
-                traverse(child)
-
-        # Process all root objects
-        for obj in objects:
-            traverse(obj)
+            # Add child objects to stack for processing
+            child_objects = node.get("objects", [])
+            if child_objects:
+                stack.extend(child_objects)
 
         # Step 4: Return ONLY the final count (strict format)
         logger.info(f"Analysis complete. Found {count} items.")
         return f"✅ Analysis Complete. Found {count} items matching '{category_name}' in the model."
+
+    except MemoryError:
+        logger.error("MemoryError: Model data exceeds available memory")
+        return "⚠️ Error: The model data is too large to process in this environment."
 
     except Exception as e:
         logger.error(f"Analysis failed: {str(e)}")

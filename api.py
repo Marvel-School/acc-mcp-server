@@ -1396,7 +1396,10 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
 
         # Get auth token
         token = get_token()
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
 
         # Step 3: Get metadata to find the view GUID
         metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
@@ -1423,10 +1426,11 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
         # Step 4: Get the object tree for this view (with safe GZIP handling)
         tree_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}"
 
-        # Prepare headers with explicit GZIP support
+        # Prepare headers with explicit GZIP support and EMEA region
         tree_headers = {
             "Authorization": f"Bearer {token}",
-            "Accept-Encoding": "gzip, deflate"  # Explicitly request compression
+            "Accept-Encoding": "gzip, deflate",  # Explicitly request compression
+            "x-ads-region": "EMEA"  # EMEA region support
         }
 
         logger.info(f"  Requesting object tree from Model Derivative API...")
