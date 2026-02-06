@@ -195,6 +195,109 @@ def get_projects_rest(hub_id: str) -> Union[List[Dict[str, Any]], str]:
         logger.error(f"REST Project Exception: {str(e)}")
         return f"Error: {str(e)}"
 
+def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches top-level folders for a project using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Ensure proper ID formatting
+        hub_id_clean = ensure_b_prefix(hub_id)
+        project_id_clean = ensure_b_prefix(project_id)
+
+        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id_clean}/projects/{project_id_clean}/topFolders"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(f"Top Folders API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: {resp.text}"
+
+        data = resp.json()
+        folders = data.get("data", [])
+
+        # Extract relevant fields
+        result = []
+        for folder in folders:
+            result.append({
+                "id": folder.get("id"),
+                "name": folder.get("attributes", {}).get("displayName"),
+                "type": folder.get("type")
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Top Folders Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches contents of a folder using Data Management REST API.
+    Returns files and subfolders with proper URN extraction for files.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Ensure proper ID formatting
+        project_id_clean = ensure_b_prefix(project_id)
+        folder_id_encoded = encode_urn(folder_id)
+
+        url = f"https://developer.api.autodesk.com/data/v1/projects/{project_id_clean}/folders/{folder_id_encoded}/contents"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(f"Folder Contents API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: {resp.text}"
+
+        data = resp.json()
+        items = data.get("data", [])
+
+        # Parse items with detailed information
+        result = []
+        for item in items:
+            item_type = item.get("type")
+            attributes = item.get("attributes", {})
+
+            parsed_item = {
+                "id": item.get("id"),
+                "name": attributes.get("displayName"),
+                "type": item_type
+            }
+
+            # For files, extract the tip version URN (needed for Model Derivative API)
+            if item_type == "items":
+                relationships = item.get("relationships", {})
+                tip = relationships.get("tip", {})
+                tip_data = tip.get("data", {})
+                tip_id = tip_data.get("id")
+
+                if tip_id:
+                    parsed_item["tipVersionUrn"] = tip_id
+                    parsed_item["itemType"] = "file"
+                else:
+                    parsed_item["itemType"] = "file"
+            elif item_type == "folders":
+                parsed_item["itemType"] = "folder"
+
+            result.append(parsed_item)
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Folder Contents Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
 # --- CACHE ---
 # Cache for hub_id to avoid repeated calls
 hub_cache = {"id": None}

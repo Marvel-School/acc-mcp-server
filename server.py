@@ -35,7 +35,9 @@ from api import (
     get_hubs_aec,
     get_projects_aec,
     get_hubs_rest,
-    get_projects_rest
+    get_projects_rest,
+    get_top_folders as fetch_top_folders,
+    get_folder_contents as fetch_folder_contents
 )
 
 # Initialize Logging
@@ -157,29 +159,62 @@ def list_aec_projects(hub_id: str) -> str:
 
 @mcp.tool()
 def get_top_folders(project_id: str) -> str:
+    """
+    Lists top-level folders in a project.
+    Uses Data Management REST API with EMEA region support.
+    """
     hub_id = get_cached_hub_id()
-    if not hub_id: return "Error: No Hubs."
-    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{ensure_b_prefix(project_id)}/topFolders"
-    data = make_api_request(url)
-    if isinstance(data, str): return data
-    output = "root_folders:\n"
-    for i in data.get("data", []): output += f"- {i['attributes']['displayName']} (ID: {i['id']})\n"
+    if not hub_id:
+        return "❌ Error: No Hubs found."
+
+    result = fetch_top_folders(hub_id, project_id)
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return "No top folders found."
+
+    output = "📁 **Top Folders:**\n"
+    for folder in result:
+        output += f"- {folder.get('name', 'Unknown')} (ID: `{folder.get('id')}`)\n"
+
     return output
 
 @mcp.tool()
 def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> str:
-    safe_folder = encode_urn(folder_id)
-    safe_proj = ensure_b_prefix(project_id)
-    url = f"https://developer.api.autodesk.com/data/v1/projects/{safe_proj}/folders/{safe_folder}/contents"
-    data = make_api_request(url)
-    if isinstance(data, str): return data
-    items = data.get("data", [])
-    if not items: return "📂 Folder is empty."
-    output = f"**Contents ({len(items)} items):**\n"
-    for i in items[:limit]:
-        name = i.get("attributes", {}).get("displayName", "Unnamed")
-        icon = "📁" if i["type"] == "folders" else "📄"
-        output += f"{icon} {name} (ID: `{i['id']}`)\n"
+    """
+    Lists contents of a folder (files and subfolders).
+    Uses Data Management REST API with EMEA region support.
+    Extracts tip version URNs for files (needed for Model Derivative API).
+    """
+    result = fetch_folder_contents(project_id, folder_id)
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return "📂 Folder is empty."
+
+    output = f"📂 **Folder Contents ({len(result)} items):**\n"
+    for item in result[:limit]:
+        name = item.get("name", "Unnamed")
+        item_type = item.get("itemType", "unknown")
+        item_id = item.get("id")
+
+        # Use appropriate icon
+        icon = "📁" if item_type == "folder" else "📄"
+
+        output += f"{icon} **{name}**\n"
+        output += f"   ID: `{item_id}`\n"
+
+        # Include tip version URN for files (needed for Model Derivative API)
+        if item_type == "file" and item.get("tipVersionUrn"):
+            output += f"   Version URN: `{item.get('tipVersionUrn')}`\n"
+
+    if len(result) > limit:
+        output += f"\n*(Showing {limit} of {len(result)} items)*"
+
     return output
 
 @mcp.tool()
