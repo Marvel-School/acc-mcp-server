@@ -1756,7 +1756,7 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
         }
 
         # Step 4: Prepare translation job payload
-        # Request SVF2 format with 2D and 3D views
+        # Request SVF (Classic) format with 2D and 3D views
         payload = {
             "input": {
                 "urn": encoded_urn
@@ -1764,7 +1764,7 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
             "output": {
                 "formats": [
                     {
-                        "type": "svf2",
+                        "type": "svf",  # CHANGED FROM 'svf2' TO 'svf' (406: SVF2 not supported)
                         "views": ["2d", "3d"]
                     }
                 ]
@@ -1775,6 +1775,7 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
         job_url = "https://developer.api.autodesk.com/modelderivative/v2/designdata/job"
 
         logger.info(f"  Submitting translation job to Model Derivative API...")
+        logger.info(f"  Requesting 'svf' (Classic) translation format...")
         logger.info(f"  Endpoint: POST {job_url}")
         logger.info(f"  Headers: x-ads-region=EMEA, x-ads-force=true")
 
