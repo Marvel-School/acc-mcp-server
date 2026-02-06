@@ -629,19 +629,33 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
         if isinstance(tree_data, str):
             return tree_data
 
+        # Safety check: Ensure we got valid data
+        if not tree_data:
+            return "❌ Error: Could not retrieve model data. The response was empty."
+
         # Step 2: Extract objects from the tree
-        objects = tree_data.get("data", {}).get("objects", [])
+        data_section = tree_data.get("data")
+        if not data_section:
+            return "❌ Error: Invalid model data structure. Missing 'data' section."
+
+        objects = data_section.get("objects", [])
 
         if not objects:
             return "❌ No objects found in model. The model may be empty or not properly translated."
 
-        # Step 3: Recursive traversal to count matching elements
+        # Step 3: Recursive traversal to count matching elements (with depth limit for safety)
         category_lower = category_name.lower()
         match_count = 0
         total_objects = 0
+        max_depth = 100  # Safety limit to prevent infinite recursion
 
         def traverse(nodes, depth=0):
             nonlocal match_count, total_objects
+
+            # Safety check: prevent excessive recursion
+            if depth > max_depth:
+                logger.warning(f"Reached maximum recursion depth ({max_depth}). Stopping traversal.")
+                return
 
             for node in nodes:
                 total_objects += 1
@@ -657,7 +671,7 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
                     traverse(node["objects"], depth + 1)
 
         # Start traversal from root
-        logger.info(f"  Starting recursive traversal...")
+        logger.info(f"  Starting recursive traversal (max depth: {max_depth})...")
         traverse(objects)
 
         # Step 4: Format output

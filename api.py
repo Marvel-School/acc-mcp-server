@@ -1420,12 +1420,25 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
         view_name = views[0].get("name", "Unknown")
         logger.info(f"  Using view: {view_name} (GUID: {guid})")
 
-        # Step 4: Get the object tree for this view
+        # Step 4: Get the object tree for this view (with safe GZIP handling)
         tree_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}"
 
-        # Important: Add forceget=true to ensure we get the full tree
-        # The API handles GZIP compression automatically via requests library
-        resp_tree = requests.get(tree_url, headers=headers, params={"forceget": "true"})
+        # Prepare headers with explicit GZIP support
+        tree_headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept-Encoding": "gzip, deflate"  # Explicitly request compression
+        }
+
+        logger.info(f"  Requesting object tree from Model Derivative API...")
+
+        # Use stream=True for large payloads and proper GZIP handling
+        resp_tree = requests.get(
+            tree_url,
+            headers=tree_headers,
+            params={"forceget": "true"},
+            stream=True,
+            timeout=120  # 2 minute timeout for large models
+        )
 
         if resp_tree.status_code == 202:
             return "⏳ Object tree is still being processed. Please wait a moment and try again."
@@ -1434,12 +1447,61 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
             logger.error(f"Object Tree API Error {resp_tree.status_code}: {resp_tree.text}")
             return f"❌ Error {resp_tree.status_code}: Failed to fetch object tree"
 
-        # Return the full JSON data
-        tree_data = resp_tree.json()
-        object_count = len(tree_data.get("data", {}).get("objects", []))
-        logger.info(f"✅ Successfully fetched object tree with {object_count} root objects")
+        # Debug: Log response details
+        content_encoding = resp_tree.headers.get('Content-Encoding', 'none')
+        content_length = resp_tree.headers.get('Content-Length', 'unknown')
+        logger.info(f"  Response encoding: {content_encoding}, Content-Length: {content_length}")
 
-        return tree_data
+        # Step 5: Safely parse the JSON response
+        try:
+            # requests automatically handles GZIP decompression when using .json()
+            tree_data = resp_tree.json()
+
+            if not tree_data:
+                logger.error("Received empty JSON response")
+                return "❌ Error: Received empty response from API"
+
+            # Extract and log statistics
+            data_section = tree_data.get("data", {})
+            objects = data_section.get("objects", [])
+            object_count = len(objects)
+
+            # Calculate approximate data size for logging
+            if objects:
+                total_nodes = 0
+
+                def count_nodes(nodes):
+                    nonlocal total_nodes
+                    for node in nodes:
+                        total_nodes += 1
+                        if "objects" in node and isinstance(node["objects"], list):
+                            count_nodes(node["objects"])
+
+                count_nodes(objects)
+                logger.info(f"✅ Successfully fetched object tree:")
+                logger.info(f"   - Root objects: {object_count}")
+                logger.info(f"   - Total nodes: {total_nodes}")
+            else:
+                logger.warning("Object tree has no objects - model may be empty")
+
+            return tree_data
+
+        except ValueError as json_err:
+            logger.error(f"JSON parsing failed: {str(json_err)}")
+            logger.error(f"Response content preview: {resp_tree.content[:500]}")
+            return f"❌ Error: Failed to parse model data. The response may be corrupted or invalid JSON."
+
+        except Exception as parse_err:
+            logger.error(f"Unexpected parsing error: {str(parse_err)}")
+            return f"❌ Error: Unexpected error while processing model data: {str(parse_err)}"
+
+    except requests.exceptions.Timeout:
+        logger.error("Request timed out while fetching object tree")
+        return "❌ Error: Request timed out. The model may be too large or the server is slow to respond."
+
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"Request Exception: {str(req_err)}")
+        return f"❌ Error: Network error while fetching object tree: {str(req_err)}"
 
     except Exception as e:
         logger.error(f"Object Tree Exception: {str(e)}")
