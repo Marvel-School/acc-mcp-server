@@ -45,7 +45,8 @@ from api import (
     get_model_manifest,
     get_model_metadata,
     inspect_generic_file,
-    query_model_elements
+    query_model_elements,
+    trigger_translation
 )
 
 # Initialize Logging
@@ -636,6 +637,54 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
     except Exception as e:
         logger.error(f"Query failed: {str(e)}")
         return "⚠️ Error: The model data is too large to process in this environment."
+
+@mcp.tool()
+def reprocess_file(project_id: str, file_id: str) -> str:
+    """
+    Triggers a fresh Model Derivative translation job for a file.
+    Use this when a file exists but shows "No Property Database" or other translation errors.
+
+    Args:
+        project_id: The project ID
+        file_id: Filename (e.g., "MyFile.rvt") OR URN (Lineage/Version)
+
+    Examples:
+        reprocess_file(proj_id, "Grasbaan102026.rvt")  ← Use filename!
+        reprocess_file(proj_id, "urn:adsk.wipp...")     ← Or URN
+
+    Note: Translation takes 5-10 minutes. Check status with inspect_file after waiting.
+    """
+    try:
+        logger.info(f"Triggering translation for file: {file_id}")
+
+        # Step 1: Resolve file_id to version URN
+        version_urn = get_latest_version_urn(project_id, file_id)
+
+        if not version_urn or not version_urn.startswith("urn:"):
+            return f"❌ Error: Could not resolve '{file_id}' to a valid version URN. Please check the file ID."
+
+        logger.info(f"  Resolved to version URN: {version_urn[:80]}...")
+
+        # Step 2: Trigger translation job
+        result = trigger_translation(version_urn)
+
+        # Check if we got an error string
+        if isinstance(result, str):
+            return result
+
+        # Success - result is a dictionary
+        job_status = result.get("result", "unknown")
+
+        if job_status == "success":
+            return "✅ Translation Job Started Successfully! Please wait 5-10 minutes for the Property Database to generate, then try counting again."
+        elif job_status == "created":
+            return "✅ Translation Job Queued! Please wait 5-10 minutes for processing to complete, then try counting again."
+        else:
+            return f"⚠️ Translation Job Submitted (Status: {job_status}). Wait 5-10 minutes, then check with inspect_file."
+
+    except Exception as e:
+        logger.error(f"Reprocess failed: {str(e)}")
+        return f"❌ Error: Failed to trigger translation job: {str(e)}"
 
 # ==========================================
 # ADMIN TOOLS

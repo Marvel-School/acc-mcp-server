@@ -1723,3 +1723,107 @@ def query_model_elements(project_id: str, file_identifier: str, category_name: s
     except Exception as e:
         logger.error(f"Query Exception: {str(e)}")
         return f"❌ Error: {str(e)}"
+
+
+def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
+    """
+    Triggers a fresh Model Derivative translation job for a file.
+    Forces re-processing even if partial data exists.
+
+    Args:
+        version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf...)
+
+    Returns:
+        Job result dictionary or error message string
+    """
+    try:
+        logger.info(f"[Translation Trigger] Starting fresh translation job for model...")
+        logger.info(f"  Version URN: {version_urn[:80]}...")
+
+        # Step 1: Encode the full URN (Base64, no padding)
+        # Do NOT strip query parameters - use the raw version URN
+        encoded_urn = safe_b64encode(version_urn)
+
+        # Step 2: Get auth token
+        token = get_token()
+
+        # Step 3: Prepare headers with EMEA region and force flag
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA",  # EMEA region support
+            "x-ads-force": "true",   # CRITICAL: Forces overwrite of existing partial data
+            "Content-Type": "application/json"
+        }
+
+        # Step 4: Prepare translation job payload
+        # Request SVF2 format with 2D and 3D views
+        payload = {
+            "input": {
+                "urn": encoded_urn
+            },
+            "output": {
+                "formats": [
+                    {
+                        "type": "svf2",
+                        "views": ["2d", "3d"]
+                    }
+                ]
+            }
+        }
+
+        # Step 5: Submit translation job
+        job_url = "https://developer.api.autodesk.com/modelderivative/v2/designdata/job"
+
+        logger.info(f"  Submitting translation job to Model Derivative API...")
+        logger.info(f"  Endpoint: POST {job_url}")
+        logger.info(f"  Headers: x-ads-region=EMEA, x-ads-force=true")
+
+        resp = requests.post(
+            job_url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        # Handle response
+        if resp.status_code == 400:
+            error_msg = f"❌ Translation job rejected (400): {resp.text}"
+            logger.error(error_msg)
+            return error_msg
+
+        if resp.status_code == 404:
+            error_msg = "❌ File not found (404). The URN may be invalid or the file doesn't exist."
+            logger.error(error_msg)
+            logger.error(f"  Response: {resp.text}")
+            return error_msg
+
+        if resp.status_code not in [200, 201]:
+            error_msg = f"❌ Translation API Error {resp.status_code}: {resp.text}"
+            logger.error(error_msg)
+            return error_msg
+
+        # Success - parse job result
+        job_result = resp.json()
+        result_status = job_result.get("result", "unknown")
+        urn_output = job_result.get("urn", "unknown")
+
+        logger.info(f"✅ Translation job submitted successfully!")
+        logger.info(f"  Result: {result_status}")
+        logger.info(f"  URN: {urn_output}")
+
+        return job_result
+
+    except requests.exceptions.Timeout:
+        error_msg = "❌ Error: Translation job request timed out."
+        logger.error(error_msg)
+        return error_msg
+
+    except requests.exceptions.RequestException as req_err:
+        error_msg = f"❌ Error: Network error during translation job: {str(req_err)}"
+        logger.error(error_msg)
+        return error_msg
+
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        logger.error(f"Translation Trigger Exception: {str(e)}")
+        return error_msg
