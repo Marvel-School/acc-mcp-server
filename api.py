@@ -1512,51 +1512,69 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
         return f"❌ Error: {str(e)}"
 
 
-def get_view_guid_only(version_urn: str) -> Union[str, None]:
+def get_view_guid_only(version_urn: str) -> str:
     """
     Lightweight function to fetch only the view GUID from a model.
     Does NOT download the full object tree - only fetches the metadata list.
+    Strictly enforces EMEA region headers.
 
     Args:
         version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf...)
 
     Returns:
-        View GUID (str) or None if not found
+        View GUID (str)
+
+    Raises:
+        ValueError: If model not found or no 3D views available
     """
     try:
-        logger.info(f"[Lightweight GUID Fetch] Getting view GUID for model...")
+        logger.info(f"[Lightweight GUID Fetch - EMEA Region] Getting view GUID for model...")
 
-        # Step 1: Encode the URN (Base64, no padding)
-        encoded_urn = safe_b64encode(version_urn)
+        # Step 1: Clean URN - remove query parameters if present (e.g., ?version=2)
+        clean_urn = version_urn.split("?")[0]
+        logger.info(f"  Original URN: {version_urn[:80]}...")
+        if "?" in version_urn:
+            logger.info(f"  Cleaned URN: {clean_urn[:80]}... (removed query parameters)")
 
-        # Step 2: Get auth token
+        # Step 2: Encode the URN (Base64, no padding)
+        urn_b64 = safe_b64encode(clean_urn)
+
+        # Step 3: Get auth token and prepare headers with EXPLICIT EMEA region
         token = get_token()
         headers = {
             "Authorization": f"Bearer {token}",
-            "x-ads-region": "EMEA"
+            "x-ads-region": "EMEA"  # CRITICAL: Must route to European data center
         }
 
-        # Step 3: Call metadata endpoint (LIGHTWEIGHT - returns only view list, not object tree)
-        metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
+        # Step 4: Call metadata endpoint (LIGHTWEIGHT - returns only view list, not object tree)
+        metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata"
 
-        logger.info(f"  Calling: GET {metadata_url}")
+        logger.info(f"  Fetching Metadata from EMEA for URN: {clean_urn[:80]}...")
+        logger.info(f"  Request URL: {metadata_url}")
+        logger.info(f"  Request Headers: Authorization=Bearer *****, x-ads-region={headers.get('x-ads-region')}")
+
         resp = requests.get(metadata_url, headers=headers, timeout=30)
 
+        # Step 5: Handle response with specific error messages
         if resp.status_code == 404:
-            logger.error("Model not found or not yet translated")
-            return None
+            error_msg = "❌ Error: Model found in Data Management but NOT in Model Derivative. Translation might be missing."
+            logger.error(error_msg)
+            logger.error(f"  Response: {resp.text}")
+            raise ValueError(error_msg)
 
         if resp.status_code != 200:
-            logger.error(f"Metadata API Error {resp.status_code}: {resp.text}")
-            return None
+            error_msg = f"Metadata API Error {resp.status_code}: {resp.text}"
+            logger.error(error_msg)
+            raise ValueError(f"❌ {error_msg}")
 
-        # Step 4: Extract the first view GUID from the metadata list
+        # Step 6: Extract the first view GUID from the metadata list
         metadata = resp.json()
         views = metadata.get("data", {}).get("metadata", [])
 
         if not views:
-            logger.error("No 3D views found in model metadata")
-            return None
+            error_msg = "❌ No 3D views found in model metadata. Model may not contain extractable geometry."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         guid = views[0].get("guid")
         view_name = views[0].get("name", "Unknown")
@@ -1564,9 +1582,14 @@ def get_view_guid_only(version_urn: str) -> Union[str, None]:
         logger.info(f"✅ Found view: {view_name} (GUID: {guid})")
         return guid
 
+    except ValueError:
+        # Re-raise ValueError with original message
+        raise
+
     except Exception as e:
-        logger.error(f"Error fetching view GUID: {str(e)}")
-        return None
+        error_msg = f"❌ Error fetching view GUID: {str(e)}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
 
 
 def query_model_elements(project_id: str, file_identifier: str, category_name: str) -> Union[int, str]:
@@ -1600,13 +1623,15 @@ def query_model_elements(project_id: str, file_identifier: str, category_name: s
                 return "❌ Error: Could not resolve URN to version"
 
         # Step 3: Get view GUID (lightweight - no object tree download)
-        guid = get_view_guid_only(resolved_urn)
+        try:
+            guid = get_view_guid_only(resolved_urn)
+        except ValueError as e:
+            # get_view_guid_only raises ValueError with user-friendly message
+            return str(e)
 
-        if not guid:
-            return "❌ Could not get view GUID. Model may not be translated or may not contain 3D views."
-
-        # Step 4: Encode the URN for the query endpoint
-        encoded_urn = safe_b64encode(resolved_urn)
+        # Step 4: Encode the URN for the query endpoint (clean URN, no query params)
+        clean_urn = resolved_urn.split("?")[0]
+        encoded_urn = safe_b64encode(clean_urn)
 
         # Get auth token
         token = get_token()
