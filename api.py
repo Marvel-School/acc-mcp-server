@@ -1510,3 +1510,124 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
     except Exception as e:
         logger.error(f"Object Tree Exception: {str(e)}")
         return f"❌ Error: {str(e)}"
+
+
+def query_model_elements(project_id: str, file_identifier: str, category_name: str) -> Union[int, str]:
+    """
+    Queries a model for elements matching a category using server-side filtering.
+    Uses the Model Derivative Query API to avoid downloading the full object tree.
+
+    Args:
+        project_id: The project ID
+        file_identifier: Filename (e.g., "MyFile.rvt"), Lineage URN, or Version URN
+        category_name: Category to search for (e.g., "Walls", "Doors", "Windows")
+
+    Returns:
+        Count of matching elements (int) or error message (str)
+    """
+    try:
+        logger.info(f"[Server-Side Query] Querying model for category: {category_name}")
+
+        # Step 1: Resolve filename to URN if needed
+        try:
+            resolved_id = resolve_file_to_urn(project_id, file_identifier)
+        except ValueError as e:
+            return f"❌ {str(e)}"
+
+        # Step 2: Auto-resolve if this is a Lineage URN
+        resolved_urn = resolved_id
+        if "lineage" in resolved_id:
+            logger.info("  Resolving Lineage URN to Version URN...")
+            resolved_urn = get_latest_version_urn(project_id, resolved_id)
+            if not resolved_urn:
+                return "❌ Error: Could not resolve URN to version"
+
+        # Step 3: Encode the URN (Base64, no padding)
+        encoded_urn = safe_b64encode(resolved_urn)
+
+        # Get auth token
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Step 4: Get metadata to find the view GUID
+        metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
+        resp = requests.get(metadata_url, headers=headers)
+
+        if resp.status_code == 404:
+            return "❌ Model not found or not yet translated. Run inspect_file first to check translation status."
+
+        if resp.status_code != 200:
+            logger.error(f"Metadata API Error {resp.status_code}: {resp.text}")
+            return f"❌ Error {resp.status_code}: {resp.text}"
+
+        # Extract the first view GUID
+        metadata = resp.json()
+        views = metadata.get("data", {}).get("metadata", [])
+
+        if not views:
+            return "❌ No 3D views found in this model. It may not contain extractable geometry."
+
+        guid = views[0].get("guid")
+        view_name = views[0].get("name", "Unknown")
+        logger.info(f"  Using view: {view_name} (GUID: {guid})")
+
+        # Step 5: Execute server-side query
+        query_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}/properties:query"
+
+        query_headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA",
+            "Content-Type": "application/json"
+        }
+
+        # Build query payload - filter by name containing category
+        query_payload = {
+            "query": {
+                "$contains": ["name", category_name]
+            }
+        }
+
+        logger.info(f"  Executing server-side query: {query_payload}")
+
+        resp_query = requests.post(
+            query_url,
+            headers=query_headers,
+            json=query_payload,
+            timeout=60
+        )
+
+        # Handle specific error cases
+        if resp_query.status_code == 400:
+            logger.warning(f"Query API returned 400: {resp_query.text}")
+            return "⚠️ Query Failed. The model might not support advanced querying yet."
+
+        if resp_query.status_code == 404:
+            return "❌ Model metadata not found. The model may not be fully translated yet."
+
+        if resp_query.status_code != 200:
+            logger.error(f"Query API Error {resp_query.status_code}: {resp_query.text}")
+            return f"❌ Query Error {resp_query.status_code}: {resp_query.text}"
+
+        # Step 6: Extract count from results
+        query_data = resp_query.json()
+        collection = query_data.get("data", {}).get("collection", [])
+
+        count = len(collection)
+        logger.info(f"✅ Server-side query complete. Found {count} matching elements.")
+
+        return count
+
+    except requests.exceptions.Timeout:
+        logger.error("Query request timed out")
+        return "❌ Error: Query request timed out. The model may be too large or the server is slow to respond."
+
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"Request Exception during query: {str(req_err)}")
+        return f"❌ Error: Network error during query: {str(req_err)}"
+
+    except Exception as e:
+        logger.error(f"Query Exception: {str(e)}")
+        return f"❌ Error: {str(e)}"

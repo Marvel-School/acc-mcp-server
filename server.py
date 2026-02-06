@@ -45,7 +45,7 @@ from api import (
     get_model_manifest,
     get_model_metadata,
     inspect_generic_file,
-    fetch_object_tree
+    query_model_elements
 )
 
 # Initialize Logging
@@ -605,7 +605,7 @@ def get_model_tree(project_id: str, file_id: str) -> str:
 def count_elements(project_id: str, file_id: str, category_name: str) -> str:
     """
     Counts elements in a model that match a specific category.
-    Uses iterative stack-based traversal to handle large models efficiently.
+    Uses server-side filtering via Model Derivative Query API - no memory limits!
     Accepts file by ID OR Name!
 
     Args:
@@ -617,60 +617,24 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
         count_elements(proj_id, "Grasbaan102026.rvt", "Walls")  ← Use filename!
         count_elements(proj_id, "urn:adsk.wipp...", "Doors")     ← Or URN
 
-    Note: Search is case-insensitive and matches partial names.
+    Note: Search is case-insensitive and uses server-side filtering.
     """
     try:
-        logger.info(f"Analyzing model for category: {category_name}")
+        logger.info(f"Initiating server-side query for category: {category_name}")
 
-        # Step 1: Fetch the object tree (processed internally, not returned to LLM)
-        tree_data = fetch_object_tree(project_id, file_id)
+        # Use server-side query API - filters on Autodesk's servers, not locally
+        result = query_model_elements(project_id, file_id, category_name)
 
-        # Handle errors from fetch
-        if isinstance(tree_data, str):
-            return tree_data
+        # Check if we got an error message instead of a count
+        if isinstance(result, str):
+            return result
 
-        if not tree_data:
-            return "⚠️ Error: The model data is too large to process in this environment."
-
-        # Step 2: Extract objects
-        data_section = tree_data.get("data")
-        if not data_section:
-            return "⚠️ Error: The model data is too large to process in this environment."
-
-        objects = data_section.get("objects", [])
-        if not objects:
-            return "⚠️ Error: The model data is too large to process in this environment."
-
-        # Step 3: Count matching elements using iterative traversal (prevents RecursionError)
-        category_lower = category_name.lower()
-        count = 0
-
-        # Use stack-based iteration instead of recursion for memory efficiency
-        stack = list(objects)  # Initialize stack with root objects
-
-        while stack:
-            node = stack.pop()
-
-            # Check if this node matches the category
-            node_name = node.get("name", "").lower()
-            if category_lower in node_name:
-                count += 1
-
-            # Add child objects to stack for processing
-            child_objects = node.get("objects", [])
-            if child_objects:
-                stack.extend(child_objects)
-
-        # Step 4: Return ONLY the final count (strict format)
-        logger.info(f"Analysis complete. Found {count} items.")
-        return f"✅ Analysis Complete. Found {count} items matching '{category_name}' in the model."
-
-    except MemoryError:
-        logger.error("MemoryError: Model data exceeds available memory")
-        return "⚠️ Error: The model data is too large to process in this environment."
+        # Result is an integer count
+        logger.info(f"✅ Cloud query complete. Found {result} elements.")
+        return f"✅ Cloud Query Complete. Found {result} elements matching '{category_name}'."
 
     except Exception as e:
-        logger.error(f"Analysis failed: {str(e)}")
+        logger.error(f"Query failed: {str(e)}")
         return "⚠️ Error: The model data is too large to process in this environment."
 
 # ==========================================
