@@ -1531,14 +1531,10 @@ def get_view_guid_only(version_urn: str) -> str:
     """
     logger.info(f"[Lightweight GUID Fetch - EMEA Region] Getting view GUID for model...")
 
-    # Clean URN - remove query parameters if present (e.g., ?version=2)
-    clean_urn = version_urn.split("?")[0]
-    logger.info(f"  Original URN: {version_urn[:80]}...")
-    if "?" in version_urn:
-        logger.info(f"  Cleaned URN: {clean_urn[:80]}... (removed query parameters)")
-
-    # Encode the URN (Base64, no padding)
-    urn_b64 = safe_b64encode(clean_urn)
+    # Step 1: Encode the RAW version URN (Do not strip query params)
+    # For ACC/BIM360, the URN must include the version suffix (e.g., ?version=X)
+    logger.info(f"  Using Full URN: {version_urn[:80]}...")
+    urn_b64 = safe_b64encode(version_urn)
     metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata"
 
     # RETRY LOOP (The Fix) - Up to 2 attempts
@@ -1663,9 +1659,9 @@ def query_model_elements(project_id: str, file_identifier: str, category_name: s
             # get_view_guid_only raises ValueError with user-friendly message
             return str(e)
 
-        # Step 4: Encode the URN for the query endpoint (clean URN, no query params)
-        clean_urn = resolved_urn.split("?")[0]
-        encoded_urn = safe_b64encode(clean_urn)
+        # Step 4: Encode the URN for the query endpoint (use raw URN)
+        # For ACC/BIM360, the URN must include the version suffix
+        encoded_urn = safe_b64encode(resolved_urn)
 
         # Get auth token
         token = get_token()
