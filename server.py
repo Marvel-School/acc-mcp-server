@@ -39,7 +39,15 @@ from api import (
     get_top_folders as fetch_top_folders,
     get_folder_contents as fetch_folder_contents,
     find_design_files,
-    resolve_project
+    resolve_project,
+    find_project_globally,
+    resolve_file_to_urn,
+    get_latest_version_urn,
+    get_model_manifest,
+    get_model_metadata,
+    inspect_generic_file,
+    stream_count_elements,
+    trigger_translation
 )
 
 # Initialize Logging
@@ -155,6 +163,26 @@ def list_aec_projects(hub_id: str) -> str:
 
     return output
 
+@mcp.tool()
+def find_project(name_query: str) -> str:
+    """
+    Universal project finder that searches across ALL accessible hubs.
+    No need to specify hub_id - searches everywhere automatically.
+
+    Args:
+        name_query: Project name to search for (case-insensitive substring match)
+
+    Example: find_project("Marvel") will find "Marvel Office Building"
+    """
+    result = find_project_globally(name_query)
+
+    if result is None:
+        return f"❌ Project '{name_query}' not found in any accessible hub.\n\nPlease check the project name and try again."
+
+    hub_id, project_id, project_name = result
+
+    return f"✅ **Found Project:**\n\n**Name:** {project_name}\n**Project ID:** `{project_id}`\n**Hub ID:** `{hub_id}`\n\nYou can now use this project_id with other tools."
+
 # ==========================================
 # FILE & FOLDER TOOLS
 # ==========================================
@@ -228,15 +256,100 @@ def get_download_url(project_id: str, file_id: str) -> str:
         target_version_id = resolve_to_version_id(project_id, file_id)
         r = requests.get(f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/versions/{encode_urn(target_version_id)}", headers=headers)
         if r.status_code != 200: return f"Error finding file version: {r.text}"
-        
+
         storage_urn = r.json()["data"]["relationships"]["storage"]["data"]["id"]
         parts = storage_urn.split("/")
         bucket_key, object_key = parts[-2].split(":")[-1], parts[-1]
-        
+
         oss_url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_key}/objects/{object_key}/signeds3download"
         r = requests.get(oss_url, headers=headers, params={"minutesExpiration": 60})
         return f"⬇️ **[Click to Download File]({r.json()['url']})**" if r.status_code == 200 else f"Error: {r.text}"
     except Exception as e: return str(e)
+
+@mcp.tool()
+def find_files(project_name: Optional[str] = None, project_id: Optional[str] = None, extension: str = "rvt") -> str:
+    """
+    Universal file finder that works across any project.
+    Automatically searches recursively through folders (max depth 3).
+
+    Args:
+        project_name: Project name to search for (triggers automatic project lookup)
+        project_id: Direct project ID (use if you already know it)
+        extension: File extension to find (e.g., "rvt", "dwg", "nwc"). Can be comma-separated.
+
+    You must provide either project_name OR project_id.
+    """
+    # Step 1: Resolve project if name is provided
+    if project_name:
+        logger.info(f"Looking up project: {project_name}")
+        result = find_project_globally(project_name)
+
+        if result is None:
+            return f"❌ Project '{project_name}' not found. Please check the name and try again."
+
+        hub_id, resolved_project_id, resolved_project_name = result
+        logger.info(f"Found project: {resolved_project_name}")
+
+    elif project_id:
+        # Use cached hub_id if project_id is provided directly
+        hub_id = get_cached_hub_id()
+        if not hub_id:
+            return "❌ Error: Could not determine hub_id. Please use project_name instead."
+        resolved_project_id = project_id
+        resolved_project_name = project_id
+    else:
+        return "❌ Error: You must provide either 'project_name' or 'project_id'."
+
+    # Step 2: Search for files
+    files = find_design_files(hub_id, resolved_project_id, extension)
+
+    if isinstance(files, str):
+        return f"❌ Error: {files}"
+
+    if not files:
+        return f"❌ No files with extension '.{extension}' found in project."
+
+    # Step 3: Format output
+    output = f"🔍 **Found {len(files)} Files in '{resolved_project_name}':**\n\n"
+
+    for file in files:
+        name = file.get("name", "Unknown")
+        item_id = file.get("item_id", "")
+        version_id = file.get("version_id", "")
+        folder_path = file.get("folder_path", "Unknown")
+
+        output += f"📄 **{name}**\n"
+        output += f"   Location: `{folder_path}`\n"
+        output += f"   Item ID: `{item_id}`\n"
+        if version_id:
+            output += f"   Version URN: `{version_id}`\n"
+        output += "\n"
+
+    return output
+
+@mcp.tool()
+def inspect_file(project_id: str, file_id: str) -> str:
+    """
+    Smart file inspector with automatic name and URN resolution.
+    Accepts file by **ID OR Name** - no need to find the URN manually!
+
+    Args:
+        project_id: The project ID
+        file_id: Can be ANY of the following:
+                 - Filename: "MyFile.rvt", "Grasbaan102026.rvt"
+                 - Lineage URN: urn:adsk.wipp:dm.lineage:...
+                 - Version URN: urn:adsk.wipp:fs.file:vf...
+
+    Examples:
+        inspect_file(proj_id, "Grasbaan102026.rvt")  ← Just use the filename!
+        inspect_file(proj_id, "urn:adsk.wipp:dm.lineage:...")  ← Or use the URN
+
+    The tool automatically:
+    - Searches for files by name if a filename is provided
+    - Converts Lineage URNs to Version URNs
+    - Returns translation status (Ready, Processing, Failed, Not Translated, etc.)
+    """
+    return inspect_generic_file(project_id, file_id)
 
 # ==========================================
 # 3D MODEL TOOLS
@@ -335,9 +448,9 @@ def find_models(project_name_or_id: str, file_types: str = "rvt,rcp,dwg,nwc") ->
     output = f"🔍 **Found {len(result)} Models:**\n"
     for file in result:
         name = file.get("name", "Unknown")
-        file_id = file.get("id", "")
-        tip_urn = file.get("tipVersionUrn") or file_id
-        folder_path = file.get("folder", "Unknown")
+        file_id = file.get("item_id", "")
+        tip_urn = file.get("version_id") or file_id
+        folder_path = file.get("folder_path", "Unknown")
 
         # Generate viewer link only if we have a valid URN
         if tip_urn:
@@ -365,13 +478,91 @@ def search_files(project_id: str, query: str) -> str:
     items = search_project_folder(project_id, query)
     if not items:
         return f"🔍 No files found matching '{query}' in Project {project_id}."
-        
+
     output = f"🔍 **Search Results for '{query}':**\n"
     for i in items:
         name = i["attributes"]["displayName"]
         item_id = i['id']
         item_type = "📁" if i.get("type") == "folders" else "📄"
         output += f"{item_type} **{name}** (ID: `{item_id}`)\n"
+    return output
+
+@mcp.tool()
+def inspect_model(project_id: str, file_id: str, show_tree: bool = False) -> str:
+    """
+    Comprehensive model inspection using Model Derivative API.
+    Shows translation status, available formats, and optionally the object tree.
+
+    Args:
+        project_id: The project ID
+        file_id: The file/item ID or version URN
+        show_tree: If True, includes detailed object tree summary (default: False)
+    """
+    # Step 1: Resolve to version URN
+    version_urn = get_latest_version_urn(project_id, file_id)
+
+    if not version_urn or not version_urn.startswith("urn:"):
+        return f"❌ Error: Could not resolve file ID to a valid version URN. Please check the file ID."
+
+    logger.info(f"Inspecting model with version URN: {version_urn}")
+
+    # Step 2: Get manifest (translation status)
+    manifest = get_model_manifest(version_urn)
+
+    if isinstance(manifest, str):
+        return f"❌ Manifest Error: {manifest}"
+
+    # Parse manifest
+    status = manifest.get("status", "unknown")
+    progress = manifest.get("progress", "unknown")
+
+    output = "🔍 **Model Inspection Report**\n\n"
+    output += f"**Version URN:** `{version_urn}`\n"
+    output += f"**Translation Status:** {status}\n"
+    output += f"**Progress:** {progress}\n\n"
+
+    # Show available derivatives
+    derivatives = manifest.get("derivatives", [])
+    if derivatives:
+        output += "**Available Formats:**\n"
+        for deriv in derivatives:
+            output_type = deriv.get("outputType", "unknown")
+            deriv_status = deriv.get("status", "unknown")
+            output += f"- {output_type}: {deriv_status}\n"
+        output += "\n"
+
+    # Step 3: Get metadata if requested
+    if show_tree and status == "success":
+        metadata = get_model_metadata(version_urn)
+
+        if isinstance(metadata, str):
+            output += f"⚠️ Metadata: {metadata}\n"
+        else:
+            # Parse object tree for summary
+            try:
+                objects = metadata.get("data", {}).get("objects", [])
+                categories = {}
+
+                def traverse(nodes):
+                    for node in nodes:
+                        if "objects" in node:
+                            cat_name = node.get("name", "Unknown")
+                            categories[cat_name] = categories.get(cat_name, 0) + len(node["objects"])
+                        if "objects" in node and isinstance(node["objects"], list):
+                            traverse(node["objects"])
+
+                if objects:
+                    traverse(objects)
+
+                output += "**Object Tree Summary:**\n"
+                for cat, count in sorted(categories.items(), key=lambda x: x[1], reverse=True)[:15]:
+                    output += f"- {cat}: {count} items\n"
+            except Exception as e:
+                output += f"⚠️ Could not parse object tree: {str(e)}\n"
+
+    elif show_tree and status != "success":
+        output += "⚠️ Object tree not available until translation is complete.\n"
+
     return output
 
 @mcp.tool()
@@ -384,19 +575,19 @@ def get_model_tree(project_id: str, file_id: str) -> str:
     headers = {"Authorization": f"Bearer {token}"}
     urn = safe_b64encode(version_id)
     resp = requests.get(f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn}/metadata", headers=headers)
-    
+
     if resp.status_code == 404: return "❌ File found, but it has no metadata. (Has it been fully processed in the viewer?)"
     if resp.status_code != 200: return f"❌ Autodesk API Error ({resp.status_code}): {resp.text}"
-        
+
     data = resp.json().get("data", {}).get("metadata", [])
     if not data: return "❌ No 3D views found."
     guid = data[0]["guid"]
-    
+
     resp_tree = requests.get(f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn}/metadata/{guid}", headers=headers, params={"forceget": "true"})
-    
+
     if resp_tree.status_code == 202: return "⏳ The Model Tree is currently processing. Please try again in 1 minute."
     if resp_tree.status_code != 200: return f"❌ Failed to retrieve object tree (Status: {resp_tree.status_code})."
-    
+
     try:
         objects = resp_tree.json().get("data", {}).get("objects", [])
         categories = {}
@@ -405,12 +596,118 @@ def get_model_tree(project_id: str, file_id: str) -> str:
                 if "objects" in node:
                     categories[node.get("name", "Unknown")] = categories.get(node.get("name", "Unknown"), 0) + len(node["objects"])
         if objects: traverse(objects[0].get("objects", []))
-        
+
         output = f"🏗️ **Model Structure (View GUID: `{guid}`):**\n"
         for cat, count in sorted(categories.items(), key=lambda item: item[1], reverse=True)[:15]:
             output += f"- **{cat}**: {count} items\n"
         return output
     except Exception as e: return f"❌ Parsing Error: {str(e)}"
+
+@mcp.tool()
+def count_elements(project_id: str, file_id: str, category_name: str) -> str:
+    """
+    Counts elements in a model that match a specific category.
+    Uses streaming regex scanner to process metadata without loading full JSON - no memory limits!
+    Accepts file by ID OR Name!
+
+    Args:
+        project_id: The project ID
+        file_id: Filename (e.g., "MyFile.rvt") OR URN (Lineage/Version)
+        category_name: Category to search for (e.g., "Walls", "Doors", "Windows")
+
+    Examples:
+        count_elements(proj_id, "Grasbaan102026.rvt", "Walls")  ← Use filename!
+        count_elements(proj_id, "urn:adsk.wipp...", "Doors")     ← Or URN
+
+    Note: Search is case-insensitive and uses streaming pattern matching.
+    """
+    try:
+        logger.info(f"Initiating streaming scan for category: {category_name}")
+
+        # Step 1: Resolve file_id to lineage URN
+        lineage_urn = resolve_file_to_urn(project_id, file_id)
+
+        if not lineage_urn or not lineage_urn.startswith("urn:"):
+            return f"❌ Error: Could not resolve '{file_id}' to a valid URN."
+
+        # Step 2: Get version URN
+        version_urn = get_latest_version_urn(project_id, lineage_urn)
+
+        if not version_urn or not version_urn.startswith("urn:"):
+            return f"❌ Error: Could not resolve to version URN."
+
+        # Step 3: Stream and count using regex pattern matching
+        count = stream_count_elements(version_urn, category_name)
+
+        # Return success message
+        logger.info(f"✅ Streaming scan complete. Found {count} elements.")
+        return f"✅ Scanned model data stream (SVF). Found {count} items matching '{category_name}'."
+
+    except ValueError as ve:
+        # These are user-friendly errors from the API functions
+        logger.error(f"Stream scan failed: {str(ve)}")
+        return str(ve)
+
+    except Exception as e:
+        logger.error(f"Stream scan failed: {str(e)}")
+        return f"❌ Error: Failed to scan model data: {str(e)}"
+
+@mcp.tool()
+def reprocess_file(project_id: str, file_id: str) -> str:
+    """
+    Triggers a fresh Model Derivative translation job for a file.
+    Use this when a file exists but shows "No Property Database" or other translation errors.
+
+    Args:
+        project_id: The project ID
+        file_id: Filename (e.g., "MyFile.rvt") OR URN (Lineage/Version)
+
+    Examples:
+        reprocess_file(proj_id, "Grasbaan102026.rvt")  ← Use filename!
+        reprocess_file(proj_id, "urn:adsk.wipp...")     ← Or URN
+
+    Note: Translation takes 5-10 minutes. Check status with inspect_file after waiting.
+    """
+    try:
+        # Step 1: Smart Resolve (Handles Name -> URN lookup automatically)
+        # This ensures we have a valid URN (urn:adsk.wipp...) before proceeding
+        logger.info(f"Resolving file '{file_id}' for reprocessing...")
+        lineage_urn = resolve_file_to_urn(project_id, file_id)
+
+        if not lineage_urn or not lineage_urn.startswith("urn:"):
+            return f"❌ Error: Could not resolve '{file_id}' to a valid lineage URN. Please check the file ID."
+
+        logger.info(f"  Resolved to lineage URN: {lineage_urn[:80]}...")
+
+        # Step 2: Get Latest Version (The translation requires the VERSION URN)
+        version_urn = get_latest_version_urn(project_id, lineage_urn)
+
+        if not version_urn or not version_urn.startswith("urn:"):
+            return f"❌ Error: Could not resolve lineage URN to version URN."
+
+        logger.info(f"  Resolved to version URN: {version_urn[:80]}...")
+
+        # Step 3: Trigger Translation
+        logger.info(f"Triggering translation for version: {version_urn}")
+        result = trigger_translation(version_urn)
+
+        # Check if we got an error string
+        if isinstance(result, str):
+            return result
+
+        # Success - result is a dictionary
+        job_status = result.get("result", "unknown")
+
+        if job_status == "success":
+            return f"✅ Translation Job Started for '{file_id}'.\nStatus: {job_status}\n\nPlease wait 5-10 minutes, then try counting elements again."
+        elif job_status == "created":
+            return f"✅ Translation Job Started for '{file_id}'.\nStatus: {job_status}\n\nPlease wait 5-10 minutes, then try counting elements again."
+        else:
+            return f"✅ Translation Job Started for '{file_id}'.\nStatus: {job_status}\n\nPlease wait 5-10 minutes, then try counting elements again."
+
+    except Exception as e:
+        logger.error(f"Reprocess failed: {str(e)}")
+        return f"❌ Reprocess Failed: {str(e)}"
 
 # ==========================================
 # ADMIN TOOLS

@@ -12,6 +12,9 @@ APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL")
 
+# OAuth Scopes - CRITICAL: viewables:read is required for Model Derivative API
+APS_SCOPES = "data:read data:write data:create bucket:read viewables:read"
+
 # API Base URLs
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
 BASE_URL_HQ_US = "https://developer.api.autodesk.com/hq/v1/accounts"
@@ -21,26 +24,38 @@ BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 # Global token cache
 token_cache = {"access_token": None, "expires_at": 0}
 
-def get_token() -> str:
-    """Retrieves or refreshes the 2-legged access token."""
+def get_token(force_refresh: bool = False) -> str:
+    """
+    Retrieves or refreshes the 2-legged access token.
+
+    Args:
+        force_refresh: If True, ignores cached token and fetches a fresh one
+
+    Returns:
+        Access token string
+    """
     global token_cache
     if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
         logger.error("APS credentials missing.")
         raise ValueError("Error: APS credentials missing.")
 
-    if time.time() < token_cache["expires_at"]:
+    # Check cache only if not forcing refresh
+    if not force_refresh and time.time() < token_cache["expires_at"]:
+        logger.debug(f"Using cached token (expires in {int(token_cache['expires_at'] - time.time())}s)")
         return token_cache["access_token"]
 
-    logger.info("Refreshing APS Access Token...")
+    if force_refresh:
+        logger.info("🔄 Force refreshing token (requested by caller)")
+
+    logger.info("🔄 Authenticating with scopes: " + APS_SCOPES)
     url = "https://developer.api.autodesk.com/authentication/v2/token"
-    
-    # Scopes required for the tool's operations
+
     # Using POST Body for credentials to avoid 400 Bad Request
     data = {
         "client_id": APS_CLIENT_ID,
         "client_secret": APS_CLIENT_SECRET,
-        "grant_type": "client_credentials", 
-        "scope": "data:read data:write data:create account:read account:write bucket:read"
+        "grant_type": "client_credentials",
+        "scope": APS_SCOPES  # Use the global constant
     }
 
     try:
@@ -59,3 +74,10 @@ def get_token() -> str:
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to get token: {e}")
         raise
+
+
+def clear_token_cache():
+    """Force clears the token cache to request a fresh token on next call."""
+    global token_cache
+    token_cache = {"access_token": None, "expires_at": 0}
+    logger.info("🗑️ Token cache cleared. Next API call will request fresh token.")

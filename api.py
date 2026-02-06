@@ -3,12 +3,16 @@ import requests
 import logging
 import time
 import base64
+import re
 from functools import lru_cache
 from urllib.parse import quote
 from typing import Optional, Dict, Any, List, Union
 from auth import get_token, BASE_URL_ACC, BASE_URL_HQ_US, BASE_URL_HQ_EU, BASE_URL_GRAPHQL, ACC_ADMIN_EMAIL
 
 logger = logging.getLogger(__name__)
+
+# OAuth Scopes - CRITICAL: viewables:read is required for Model Derivative API
+APS_SCOPES = "data:read data:write data:create bucket:read viewables:read"
 
 # --- UTILS ---
 def clean_id(id_str: Optional[str]) -> str:
@@ -195,32 +199,34 @@ def get_projects_rest(hub_id: str) -> Union[List[Dict[str, Any]], str]:
         logger.error(f"REST Project Exception: {str(e)}")
         return f"Error: {str(e)}"
 
-def resolve_project(project_name_or_id: str) -> Union[Dict[str, Any], str]:
+def find_project_globally(name_query: str) -> Optional[tuple]:
     """
-    Globally searches for a project across all accessible hubs.
-    Matches by project name (case-insensitive) or exact project ID.
+    Universal project finder that searches across ALL accessible hubs.
+    Case-insensitive substring matching.
 
     Args:
-        project_name_or_id: Project name or ID to search for
+        name_query: Project name to search for (case-insensitive)
 
     Returns:
-        Dict with hub_id, project_id, and project_name, or error string
+        Tuple of (hub_id, project_id, project_name) if found, None otherwise
     """
     try:
-        logger.info(f"Searching globally for project: {project_name_or_id}")
+        logger.info(f"[Universal Explorer] Searching globally for project: {name_query}")
 
-        # Step 1: Get all accessible hubs
+        # Step 1: Get all accessible hubs (strict EMEA region)
         hubs = get_hubs_rest()
 
         if isinstance(hubs, str):
-            return f"Failed to get hubs: {hubs}"
+            logger.error(f"Failed to get hubs: {hubs}")
+            return None
 
         if not hubs:
-            return "No hubs found. Check if your app has access to any accounts."
+            logger.error("No hubs found. Check if your app has access to any accounts.")
+            return None
 
-        search_term = project_name_or_id.lower().strip()
+        search_term = name_query.lower().strip()
 
-        # Step 2: Search through each hub
+        # Step 2: Search through every hub
         for hub in hubs:
             hub_id = hub.get("id")
             hub_name = hub.get("name", "Unknown")
@@ -230,40 +236,56 @@ def resolve_project(project_name_or_id: str) -> Union[Dict[str, Any], str]:
                 logger.warning(f"Skipping hub with no ID: {hub_name}")
                 continue
 
-            logger.info(f"Searching in hub: {hub_name} ({hub_id})")
+            logger.info(f"  Searching in hub: {hub_name}")
 
             # Step 3: Get projects for this hub
             projects = get_projects_rest(hub_id)
 
             if isinstance(projects, str):
-                logger.warning(f"Failed to get projects for hub {hub_name}: {projects}")
+                logger.warning(f"  Failed to get projects for hub {hub_name}: {projects}")
                 continue
 
-            # Step 4: Check for matching project
+            # Step 4: Check for matching project (case-insensitive substring match)
             for project in projects:
                 project_id = project.get("id", "")
                 project_name = project.get("name", "")
 
-                # Match by name (case-insensitive) or exact ID
-                if (search_term == project_name.lower() or
-                    search_term in project_name.lower() or
-                    project_name_or_id == project_id):
-
+                # Case-insensitive substring match
+                if search_term in project_name.lower():
                     logger.info(f"✅ Found project '{project_name}' in hub '{hub_name}'")
-                    return {
-                        "hub_id": hub_id,
-                        "project_id": project_id,
-                        "project_name": project_name,
-                        "hub_name": hub_name
-                    }
+                    return (hub_id, project_id, project_name)
 
         # Not found in any hub
-        logger.warning(f"Project '{project_name_or_id}' not found in any accessible hub")
-        return f"Project '{project_name_or_id}' not found in any accessible hub. Please check the name or ID."
+        logger.warning(f"Project '{name_query}' not found in any accessible hub")
+        return None
 
     except Exception as e:
-        logger.error(f"Project Resolution Exception: {str(e)}")
-        return f"Error: {str(e)}"
+        logger.error(f"Project Search Exception: {str(e)}")
+        return None
+
+def resolve_project(project_name_or_id: str) -> Union[Dict[str, Any], str]:
+    """
+    Legacy wrapper for find_project_globally() that returns dict format.
+    Kept for backward compatibility with existing tools.
+
+    Args:
+        project_name_or_id: Project name or ID to search for
+
+    Returns:
+        Dict with hub_id, project_id, and project_name, or error string
+    """
+    result = find_project_globally(project_name_or_id)
+
+    if result is None:
+        return f"Project '{project_name_or_id}' not found in any accessible hub. Please check the name or ID."
+
+    hub_id, project_id, project_name = result
+    return {
+        "hub_id": hub_id,
+        "project_id": project_id,
+        "project_name": project_name,
+        "hub_name": "Unknown"  # Legacy field
+    }
 
 def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]], str]:
     """
@@ -370,7 +392,7 @@ def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str,
 
 def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> Union[List[Dict[str, Any]], str]:
     """
-    Smart recursive search for design files in a project using BFS.
+    Universal recursive file finder using BFS with depth limit.
     Automatically navigates to 'Project Files' folder and searches nested subfolders.
 
     Args:
@@ -379,11 +401,11 @@ def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> 
         extensions: Comma-separated file extensions (e.g., "rvt,dwg,nwc")
 
     Returns:
-        List of matching files with name and URN, or error string
+        List of files with format: {name, item_id, version_id, folder_path}
     """
     try:
         # Step 1: Get top folders
-        logger.info(f"Starting recursive search for design files with extensions: {extensions}")
+        logger.info(f"[Universal Explorer] Searching for files with extensions: {extensions}")
         top_folders = get_top_folders(hub_id, project_id)
 
         if isinstance(top_folders, str):
@@ -394,40 +416,42 @@ def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> 
         for folder in top_folders:
             if folder.get("name") == "Project Files":
                 project_files_folder = folder.get("id")
-                logger.info(f"Found 'Project Files' folder: {project_files_folder}")
+                logger.info(f"  Found 'Project Files' folder: {project_files_folder}")
                 break
 
         # Fallback: if "Project Files" not found, try the first folder
         if not project_files_folder and top_folders:
             project_files_folder = top_folders[0].get("id")
-            logger.warning(f"'Project Files' not found, using first folder: {project_files_folder}")
+            logger.warning(f"  'Project Files' not found, using first folder")
 
         if not project_files_folder:
             return "No folders found in project"
 
-        # Step 3: Initialize BFS queue and results
-        folder_queue = [{"id": project_files_folder, "name": "Project Files"}]
+        # Step 3: Initialize BFS queue with depth tracking
+        folder_queue = [{"id": project_files_folder, "name": "Project Files", "depth": 0}]
         matching_files = []
         ext_list = [ext.strip().lower() for ext in extensions.split(",")]
 
         # Safety limits
         max_folders_to_scan = 50
+        max_depth = 3
         folders_scanned = 0
 
-        # Step 4: BFS Loop
+        # Step 4: BFS Loop with depth limit
         while folder_queue and folders_scanned < max_folders_to_scan:
             current_folder = folder_queue.pop(0)
             folder_id = current_folder["id"]
             folder_name = current_folder["name"]
+            depth = current_folder["depth"]
 
             folders_scanned += 1
-            logger.info(f"Scanning folder {folders_scanned}/{max_folders_to_scan}: '{folder_name}'")
+            logger.info(f"  Scanning folder {folders_scanned}/{max_folders_to_scan} (depth {depth}): '{folder_name}'")
 
             # Get folder contents
             contents = get_folder_contents(project_id, folder_id)
 
             if isinstance(contents, str):
-                logger.warning(f"Failed to get contents of folder '{folder_name}': {contents}")
+                logger.warning(f"  Failed to get contents of folder '{folder_name}': {contents}")
                 continue
 
             # Process items in this folder
@@ -441,27 +465,27 @@ def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> 
                     if any(name.lower().endswith(f".{ext}") for ext in ext_list):
                         matching_files.append({
                             "name": name,
-                            "id": item.get("id"),
-                            "tipVersionUrn": item.get("tipVersionUrn"),
-                            "type": item.get("type"),
-                            "folder": folder_name
+                            "item_id": item.get("id"),
+                            "version_id": item.get("tipVersionUrn"),
+                            "folder_path": folder_name
                         })
-                        logger.info(f"  Found matching file: {name}")
+                        logger.info(f"    Found: {name}")
 
-                # If it's a subfolder, add to queue for scanning
-                elif item_type == "folder":
+                # If it's a subfolder and we haven't reached max depth, add to queue
+                elif item_type == "folder" and depth < max_depth:
                     subfolder_name = item.get("name", "Unknown")
                     folder_queue.append({
                         "id": item.get("id"),
-                        "name": f"{folder_name}/{subfolder_name}"
+                        "name": f"{folder_name}/{subfolder_name}",
+                        "depth": depth + 1
                     })
-                    logger.info(f"  Queued subfolder: {subfolder_name}")
+                    logger.info(f"    Queued subfolder: {subfolder_name} (depth {depth + 1})")
 
         # Log summary
         if folders_scanned >= max_folders_to_scan:
             logger.warning(f"Reached maximum folder scan limit ({max_folders_to_scan})")
 
-        logger.info(f"Search complete: Scanned {folders_scanned} folders, found {len(matching_files)} matching files")
+        logger.info(f"✅ Search complete: Scanned {folders_scanned} folders, found {len(matching_files)} matching files")
         return matching_files
 
     except Exception as e:
@@ -1005,28 +1029,887 @@ def get_account_user_details(email: str) -> dict:
     hub_id = get_cached_hub_id()
     if not hub_id: return {"error": "No Hub ID found."}
     account_id = clean_id(hub_id)
-    
+
     token = get_token()
     headers = {
         "Authorization": f"Bearer {token}",
         "x-ads-region": "EMEA"
     }
-    
+
     # HQ API User Search
     url = f"https://developer.api.autodesk.com/hq/v1/accounts/{account_id}/users"
     params = {"filter[email]": email}
-    
+
     try:
         resp = requests.get(url, headers=headers, params=params)
         if resp.status_code != 200:
              return {"error": f"HQ API returned {resp.status_code}: {resp.text}"}
-             
+
         data = resp.json()
         # HQ API usually returns list
         if isinstance(data, list) and len(data) > 0:
             return data[0]
-        
+
         return {"error": "User not found via HQ Search."}
 
     except Exception as e:
         return {"error": str(e)}
+
+# --- MODEL DERIVATIVE API ---
+
+def get_latest_version_urn(project_id: str, item_id: str) -> Optional[str]:
+    """
+    Resolves a File Item ID (Lineage URN) to its latest Version URN.
+    Uses Data Management API to get the tip version from item relationships.
+
+    Args:
+        project_id: The project ID
+        item_id: The item ID (Lineage URN like urn:adsk.wipp:dm.lineage:...)
+
+    Returns:
+        Version URN (urn:adsk.wipp:fs.file:vf...) or None on error
+    """
+    try:
+        # If already a version URN, return as-is
+        if "fs.file" in item_id or "version=" in item_id:
+            logger.info(f"Already a version URN: {item_id}")
+            return item_id
+
+        # Prepare request with EMEA region
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Ensure proper ID formatting
+        project_id_clean = ensure_b_prefix(project_id)
+        item_id_encoded = encode_urn(item_id)
+
+        # Call Data Management API to get item details
+        url = f"https://developer.api.autodesk.com/data/v1/projects/{project_id_clean}/items/{item_id_encoded}"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(f"Failed to resolve item {item_id}: {resp.status_code} - {resp.text}")
+            return None
+
+        # Extract tip version URN from relationships
+        data = resp.json()
+        tip_urn = data.get("data", {}).get("relationships", {}).get("tip", {}).get("data", {}).get("id")
+
+        if tip_urn:
+            logger.info(f"Resolved lineage URN to version: {tip_urn[:60]}...")
+            return tip_urn
+        else:
+            logger.warning("No tip version found in item relationships")
+            return None
+
+    except Exception as e:
+        logger.error(f"Version Resolution Exception: {str(e)}")
+        return None
+
+def get_model_manifest(version_urn: str) -> Union[Dict[str, Any], str]:
+    """
+    Fetches the Model Derivative manifest for a file version.
+    Shows translation status and available formats.
+
+    Args:
+        version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf.xxx)
+
+    Returns:
+        Manifest data or error string
+    """
+    try:
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Base64 encode the URN (URL-safe, no padding)
+        encoded_urn = safe_b64encode(version_urn)
+
+        url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/manifest"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code == 404:
+            return "Model not found or not yet translated. Please check if the file has been processed in the viewer."
+
+        if resp.status_code != 200:
+            logger.error(f"Manifest API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: {resp.text}"
+
+        return resp.json()
+
+    except Exception as e:
+        logger.error(f"Manifest Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def get_model_metadata(version_urn: str, guid: Optional[str] = None) -> Union[Dict[str, Any], str]:
+    """
+    Fetches the Model Derivative metadata (object tree) for a file version.
+    Shows the hierarchical structure of objects in the model.
+
+    Args:
+        version_urn: The version URN
+        guid: Optional specific view GUID. If not provided, uses first available view.
+
+    Returns:
+        Metadata object tree or error string
+    """
+    try:
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Base64 encode the URN
+        encoded_urn = safe_b64encode(version_urn)
+
+        # If no GUID provided, fetch the manifest to get available views
+        if not guid:
+            manifest_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
+            resp = requests.get(manifest_url, headers=headers)
+
+            if resp.status_code == 404:
+                return "Model metadata not found. File may not be fully processed."
+
+            if resp.status_code != 200:
+                logger.error(f"Metadata API Error {resp.status_code}: {resp.text}")
+                return f"Error {resp.status_code}: {resp.text}"
+
+            data = resp.json().get("data", {}).get("metadata", [])
+            if not data:
+                return "No 3D views found in this model."
+
+            guid = data[0]["guid"]
+            logger.info(f"Using first available view GUID: {guid}")
+
+        # Fetch the object tree for this view
+        tree_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}"
+        resp_tree = requests.get(tree_url, headers=headers, params={"forceget": "true"})
+
+        if resp_tree.status_code == 202:
+            return "Model metadata is still processing. Please try again in a moment."
+
+        if resp_tree.status_code != 200:
+            logger.error(f"Object Tree API Error {resp_tree.status_code}: {resp_tree.text}")
+            return f"Error {resp_tree.status_code}: {resp_tree.text}"
+
+        return resp_tree.json()
+
+    except Exception as e:
+        logger.error(f"Metadata Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def resolve_file_to_urn(project_id: str, identifier: str) -> str:
+    """
+    Smart file resolver that accepts either a URN or a filename.
+    Automatically searches for files by name if a URN is not provided.
+
+    Args:
+        project_id: The project ID
+        identifier: Either a URN (urn:adsk...) or a filename (e.g., "MyFile.rvt")
+
+    Returns:
+        File URN (Lineage or Version)
+
+    Raises:
+        ValueError: If filename doesn't match any files
+    """
+    try:
+        # Check 1: It's already a URN
+        if identifier.startswith("urn:adsk"):
+            logger.info(f"  Identifier is already a URN")
+            return identifier
+
+        # Check 2: It's a filename - search for it
+        logger.info(f"  Identifier appears to be a filename, searching: {identifier}")
+
+        # Get hub_id for the search
+        hub_id = get_cached_hub_id()
+        if not hub_id:
+            raise ValueError("Could not determine hub_id for file search")
+
+        # Search for files with common extensions
+        # Try multiple extensions to increase match likelihood
+        extensions_to_try = ["rvt", "dwg", "nwc", "rcp", "ifc", "nwd"]
+
+        # Extract extension from identifier if present
+        if "." in identifier:
+            file_ext = identifier.split(".")[-1].lower()
+            # Put the matching extension first
+            if file_ext in extensions_to_try:
+                extensions_to_try.remove(file_ext)
+                extensions_to_try.insert(0, file_ext)
+
+        # Try first extension (most likely match)
+        search_extension = extensions_to_try[0]
+        files = find_design_files(hub_id, project_id, search_extension)
+
+        if isinstance(files, str):
+            raise ValueError(f"Error searching for files: {files}")
+
+        # Search for matching filename (case-insensitive)
+        identifier_lower = identifier.lower()
+
+        for file in files:
+            file_name = file.get("name", "").lower()
+
+            # Exact match or contains match
+            if identifier_lower == file_name or identifier_lower in file_name:
+                item_id = file.get("item_id")
+                if item_id:
+                    logger.info(f"  ✅ Found file: {file.get('name')} (ID: {item_id[:60]}...)")
+                    return item_id
+
+        # If not found with first extension, try others
+        for ext in extensions_to_try[1:]:
+            logger.info(f"  Trying extension: {ext}")
+            files = find_design_files(hub_id, project_id, ext)
+
+            if not isinstance(files, str):
+                for file in files:
+                    file_name = file.get("name", "").lower()
+                    if identifier_lower == file_name or identifier_lower in file_name:
+                        item_id = file.get("item_id")
+                        if item_id:
+                            logger.info(f"  ✅ Found file: {file.get('name')} (ID: {item_id[:60]}...)")
+                            return item_id
+
+        # Not found
+        raise ValueError(f"Could not find file matching '{identifier}' in project")
+
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.error(f"File Resolution Exception: {str(e)}")
+        raise ValueError(f"Error resolving file identifier: {str(e)}")
+
+def inspect_generic_file(project_id: str, file_id: str) -> str:
+    """
+    Smart file inspector with automatic name and URN resolution.
+    Accepts either a filename, Lineage URN, or Version URN.
+
+    Args:
+        project_id: The project ID
+        file_id: Either a filename (e.g., "MyFile.rvt"), Lineage URN, or Version URN
+
+    Returns:
+        Status message string
+    """
+    try:
+        logger.info(f"[Smart Inspector] Inspecting file: {file_id[:60] if len(file_id) > 60 else file_id}...")
+
+        # Step 1: Resolve filename to URN if needed
+        try:
+            resolved_id = resolve_file_to_urn(project_id, file_id)
+        except ValueError as e:
+            return f"❌ {str(e)}"
+
+        # Step 2: Auto-Resolve - Check if this is a Lineage URN
+        version_urn = None
+
+        if "lineage" in resolved_id:
+            logger.info("  Detected Lineage URN - resolving to latest version...")
+            version_urn = get_latest_version_urn(project_id, resolved_id)
+
+            if not version_urn:
+                return "❌ Error: Could not resolve Lineage URN to Version URN. File may not exist or has no versions."
+
+        elif "fs.file" in resolved_id or "version=" in resolved_id:
+            logger.info("  Detected Version URN - proceeding directly")
+            version_urn = resolved_id
+        else:
+            # Assume it might be a lineage URN without obvious markers
+            logger.info("  URN type unclear - attempting resolution...")
+            version_urn = get_latest_version_urn(project_id, resolved_id)
+
+            if not version_urn:
+                # If resolution fails, try using it as-is
+                version_urn = resolved_id
+
+        # Step 2: Encode the URN (Base64, strip padding)
+        encoded_urn = safe_b64encode(version_urn)
+
+        # Step 3: Call Model Derivative API to get manifest
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/manifest"
+
+        resp = requests.get(url, headers=headers)
+
+        # Step 4: Handle different status codes
+        if resp.status_code == 404:
+            return "⚠️ Not Translated. Translation required. The file exists but hasn't been processed by Model Derivative API yet."
+
+        if resp.status_code == 202:
+            return "⏳ Processing - Translation in progress. Please check again later."
+
+        if resp.status_code != 200:
+            logger.error(f"Manifest API Error {resp.status_code}: {resp.text}")
+            return f"❌ Error {resp.status_code}: Unable to inspect file."
+
+        # Parse the manifest
+        manifest = resp.json()
+        status = manifest.get("status", "unknown").lower()
+        progress = manifest.get("progress", "unknown")
+
+        if status == "success":
+            return f"✅ Ready for Extraction (Translation complete, progress: {progress})"
+        elif status == "inprogress":
+            return f"⏳ Processing (Translation {progress}% complete)"
+        elif status == "failed":
+            return "❌ Translation Failed - Check file format or try re-uploading"
+        elif status == "timeout":
+            return "⏱️ Translation Timeout - File may be too large or complex"
+        else:
+            return f"Status: {status} (Progress: {progress})"
+
+    except Exception as e:
+        logger.error(f"File Inspection Exception: {str(e)}")
+        return f"❌ Error: {str(e)}"
+
+def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, Any], str]:
+    """
+    Fetches the complete object tree (hierarchy) for a translated model.
+    Accepts filename, Lineage URN, or Version URN.
+
+    Args:
+        project_id: The project ID
+        file_identifier: Filename (e.g., "MyFile.rvt"), Lineage URN, or Version URN
+
+    Returns:
+        Object tree data dict or error string
+    """
+    try:
+        logger.info(f"[Data Extraction] Fetching object tree for: {file_identifier[:60] if len(file_identifier) > 60 else file_identifier}...")
+
+        # Step 1: Resolve filename to URN if needed
+        try:
+            resolved_id = resolve_file_to_urn(project_id, file_identifier)
+        except ValueError as e:
+            return f"❌ {str(e)}"
+
+        # Step 2: Auto-resolve if this is a Lineage URN
+        resolved_urn = resolved_id
+        if "lineage" in resolved_id:
+            logger.info("  Resolving Lineage URN to Version URN...")
+            resolved_urn = get_latest_version_urn(project_id, resolved_id)
+            if not resolved_urn:
+                return "❌ Error: Could not resolve URN to version"
+
+        # Step 2: Encode the URN (Base64, no padding)
+        encoded_urn = safe_b64encode(resolved_urn)
+
+        # Get auth token
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Step 3: Get metadata to find the view GUID
+        metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
+        resp = requests.get(metadata_url, headers=headers)
+
+        if resp.status_code == 404:
+            return "❌ Model not found or not yet translated. Run inspect_file first to check translation status."
+
+        if resp.status_code != 200:
+            logger.error(f"Metadata API Error {resp.status_code}: {resp.text}")
+            return f"❌ Error {resp.status_code}: {resp.text}"
+
+        # Extract the first view GUID
+        metadata = resp.json()
+        views = metadata.get("data", {}).get("metadata", [])
+
+        if not views:
+            return "❌ No 3D views found in this model. It may not contain extractable geometry."
+
+        guid = views[0].get("guid")
+        view_name = views[0].get("name", "Unknown")
+        logger.info(f"  Using view: {view_name} (GUID: {guid})")
+
+        # Step 4: Get the object tree for this view (with safe GZIP handling)
+        tree_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}"
+
+        # Prepare headers with explicit GZIP support and EMEA region
+        tree_headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept-Encoding": "gzip, deflate",  # Explicitly request compression
+            "x-ads-region": "EMEA"  # EMEA region support
+        }
+
+        logger.info(f"  Requesting object tree from Model Derivative API...")
+
+        # Use stream=True for large payloads and proper GZIP handling
+        resp_tree = requests.get(
+            tree_url,
+            headers=tree_headers,
+            params={"forceget": "true"},
+            stream=True,
+            timeout=120  # 2 minute timeout for large models
+        )
+
+        if resp_tree.status_code == 202:
+            return "⏳ Object tree is still being processed. Please wait a moment and try again."
+
+        if resp_tree.status_code != 200:
+            logger.error(f"Object Tree API Error {resp_tree.status_code}: {resp_tree.text}")
+            return f"❌ Error {resp_tree.status_code}: Failed to fetch object tree"
+
+        # Debug: Log response details
+        content_encoding = resp_tree.headers.get('Content-Encoding', 'none')
+        content_length = resp_tree.headers.get('Content-Length', 'unknown')
+        logger.info(f"  Response encoding: {content_encoding}, Content-Length: {content_length}")
+
+        # Step 5: Safely parse the JSON response
+        try:
+            # requests automatically handles GZIP decompression when using .json()
+            tree_data = resp_tree.json()
+
+            if not tree_data:
+                logger.error("Received empty JSON response")
+                return "❌ Error: Received empty response from API"
+
+            # Extract and log statistics
+            data_section = tree_data.get("data", {})
+            objects = data_section.get("objects", [])
+            object_count = len(objects)
+
+            # Calculate approximate data size for logging
+            if objects:
+                total_nodes = 0
+
+                def count_nodes(nodes):
+                    nonlocal total_nodes
+                    for node in nodes:
+                        total_nodes += 1
+                        if "objects" in node and isinstance(node["objects"], list):
+                            count_nodes(node["objects"])
+
+                count_nodes(objects)
+                logger.info(f"✅ Successfully fetched object tree:")
+                logger.info(f"   - Root objects: {object_count}")
+                logger.info(f"   - Total nodes: {total_nodes}")
+            else:
+                logger.warning("Object tree has no objects - model may be empty")
+
+            return tree_data
+
+        except ValueError as json_err:
+            logger.error(f"JSON parsing failed: {str(json_err)}")
+            # DO NOT log response content - it may be huge
+            return f"❌ Error: Failed to parse model data. The response may be corrupted or invalid JSON."
+
+        except Exception as parse_err:
+            logger.error(f"Unexpected parsing error: {str(parse_err)}")
+            return f"❌ Error: Unexpected error while processing model data: {str(parse_err)}"
+
+    except requests.exceptions.Timeout:
+        logger.error("Request timed out while fetching object tree")
+        return "❌ Error: Request timed out. The model may be too large or the server is slow to respond."
+
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"Request Exception: {str(req_err)}")
+        return f"❌ Error: Network error while fetching object tree: {str(req_err)}"
+
+    except Exception as e:
+        logger.error(f"Object Tree Exception: {str(e)}")
+        return f"❌ Error: {str(e)}"
+
+
+def get_view_guid_only(version_urn: str) -> str:
+    """
+    Fetches view GUID with automatic token healing.
+    Retries ONCE on 401 errors by forcing a token refresh.
+
+    Args:
+        version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf...)
+
+    Returns:
+        View GUID (str)
+
+    Raises:
+        ValueError: If model not found, no 3D views available, or auth fails after retry
+    """
+    logger.info(f"[Lightweight GUID Fetch - EMEA Region] Getting view GUID for model...")
+
+    # Step 1: Encode the RAW version URN (Do not strip query params)
+    # For ACC/BIM360, the URN must include the version suffix (e.g., ?version=X)
+    logger.info(f"  Using Full URN: {version_urn[:80]}...")
+    urn_b64 = safe_b64encode(version_urn)
+    metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata"
+
+    # RETRY LOOP (The Fix) - Up to 2 attempts
+    for attempt in range(2):
+        try:
+            # Attempt 0: Normal token (cached if available)
+            # Attempt 1: Force refresh token
+            is_retry = (attempt == 1)
+            if is_retry:
+                logger.info("⚠️ 401 received on first attempt. Force-refreshing token and retrying...")
+
+            # Get token (force refresh on second attempt)
+            token = get_token(force_refresh=is_retry)
+
+            # Prepare headers with EMEA region
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "x-ads-region": "EMEA"  # CRITICAL: Must route to European data center
+            }
+
+            logger.info(f"  Attempt {attempt + 1}/2: Fetching Metadata from EMEA...")
+            logger.info(f"  Request URL: {metadata_url}")
+            logger.info(f"  Request Headers: Authorization=Bearer *****, x-ads-region={headers.get('x-ads-region')}")
+
+            # Make the request
+            resp = requests.get(metadata_url, headers=headers, timeout=30)
+
+            # If 401 and it's the first attempt, CONTINUE to next loop iteration (retry)
+            if resp.status_code == 401 and attempt == 0:
+                logger.warning("  Received 401 on first attempt. Will retry with fresh token...")
+                continue
+
+            # If 401 on second attempt after token refresh, raise error
+            if resp.status_code == 401:
+                error_msg = "❌ Critical Auth Failure: 401 Unauthorized even after token refresh. Verify 'viewables:read' scope is configured."
+                logger.error(error_msg)
+                logger.error(f"  Response: {resp.text}")
+                logger.error(f"  Required scopes: data:read data:write data:create bucket:read viewables:read")
+                raise ValueError(error_msg)
+
+            # Handle 404 - model not found or not translated
+            if resp.status_code == 404:
+                error_msg = "❌ Model not found (404). Translation might be missing or file doesn't exist in Model Derivative."
+                logger.error(error_msg)
+                logger.error(f"  Response: {resp.text}")
+                raise ValueError(error_msg)
+
+            # Raise for any other non-200 status
+            if resp.status_code != 200:
+                error_msg = f"Metadata API Error {resp.status_code}: {resp.text}"
+                logger.error(error_msg)
+                raise ValueError(f"❌ {error_msg}")
+
+            # Success - parse the response
+            data = resp.json()
+            views = data.get("data", {}).get("metadata", [])
+
+            if not views:
+                error_msg = "❌ No 3D views found in model metadata. Model may not contain extractable geometry."
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            # Extract GUID and view name
+            guid = views[0].get("guid")
+            view_name = views[0].get("name", "Unknown")
+
+            logger.info(f"✅ Found view: {view_name} (GUID: {guid})")
+            return guid
+
+        except ValueError:
+            # Re-raise ValueError (already has user-friendly message)
+            if attempt == 1:
+                raise
+            # On first attempt, continue to retry
+            continue
+
+        except Exception as e:
+            # Only raise on final attempt
+            if attempt == 1:
+                error_msg = f"❌ Error fetching view GUID: {str(e)}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+    # Should never reach here, but just in case
+    raise ValueError("❌ Unexpected error in retry loop.")
+
+
+def stream_count_elements(version_urn: str, category_name: str) -> int:
+    """
+    Streams metadata and counts elements matching a category using regex pattern matching.
+    Avoids loading the full JSON into memory by processing the HTTP stream in chunks.
+
+    Args:
+        version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf...)
+        category_name: Category to search for (e.g., "Walls", "Doors", "Windows")
+
+    Returns:
+        Count of matching elements (int)
+
+    Raises:
+        ValueError: If model not found or metadata fetch fails
+    """
+    logger.info(f"[Streaming Element Counter] Counting elements matching: {category_name}")
+
+    # Step 1: Get View GUID (lightweight - no object tree download)
+    guid = get_view_guid_only(version_urn)
+    logger.info(f"  Using View GUID: {guid}")
+
+    # Step 2: Encode URN for metadata endpoint
+    urn_b64 = safe_b64encode(version_urn)
+    metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata/{guid}"
+
+    # Step 3: Get auth token
+    token = get_token()
+
+    # Step 4: Prepare headers
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "x-ads-region": "EMEA"
+    }
+
+    logger.info(f"  Streaming metadata to scan for: {category_name}")
+    logger.info(f"  URL: {metadata_url}")
+
+    # Step 5: Regex pattern to find "name" fields containing the category
+    # Pattern: "name"\s*:\s*"[^"]*CategoryName[^"]*"
+    # Case insensitive flag (?i)
+    # Use re.escape to properly handle special regex characters in category_name
+    pattern = re.compile(rb'"name"\s*:\s*"[^"]*' + re.escape(category_name).encode() + rb'[^"]*"', re.IGNORECASE)
+
+    count = 0
+    buffer = b""
+
+    try:
+        # Step 6: Stream the response
+        with requests.get(metadata_url, headers=headers, stream=True, timeout=60) as r:
+            r.raise_for_status()
+
+            # Process in 64KB chunks
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:  # Filter out keep-alive chunks
+                    buffer += chunk
+
+                    # Find all matches in current buffer
+                    matches = pattern.findall(buffer)
+                    count += len(matches)
+
+                    # Keep the last 512 bytes of buffer to handle matches split across chunks
+                    # This prevents cutting patterns like "Wa|ll" in half
+                    buffer = buffer[-512:]
+
+        logger.info(f"✅ Streaming scan complete. Found {count} elements matching '{category_name}'.")
+        return count
+
+    except requests.exceptions.HTTPError as http_err:
+        error_msg = f"❌ HTTP Error while streaming metadata: {http_err}"
+        logger.error(error_msg)
+        logger.error(f"  Response: {http_err.response.text if http_err.response else 'No response'}")
+        raise ValueError(error_msg)
+
+    except requests.exceptions.Timeout:
+        error_msg = "❌ Timeout while streaming metadata (60s limit exceeded)."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    except Exception as e:
+        error_msg = f"❌ Error during streaming scan: {str(e)}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+
+def query_model_elements(project_id: str, file_identifier: str, category_name: str) -> Union[int, str]:
+    """
+    Queries a model for elements matching a category using server-side filtering.
+    Uses the Model Derivative Query API to avoid downloading the full object tree.
+
+    Args:
+        project_id: The project ID
+        file_identifier: Filename (e.g., "MyFile.rvt"), Lineage URN, or Version URN
+        category_name: Category to search for (e.g., "Walls", "Doors", "Windows")
+
+    Returns:
+        Count of matching elements (int) or error message (str)
+    """
+    try:
+        logger.info(f"[Server-Side Query] Querying model for category: {category_name}")
+
+        # Step 1: Resolve filename to URN if needed
+        try:
+            resolved_id = resolve_file_to_urn(project_id, file_identifier)
+        except ValueError as e:
+            return f"❌ {str(e)}"
+
+        # Step 2: Auto-resolve if this is a Lineage URN
+        resolved_urn = resolved_id
+        if "lineage" in resolved_id:
+            logger.info("  Resolving Lineage URN to Version URN...")
+            resolved_urn = get_latest_version_urn(project_id, resolved_id)
+            if not resolved_urn:
+                return "❌ Error: Could not resolve URN to version"
+
+        # Step 3: Get view GUID (lightweight - no object tree download)
+        try:
+            guid = get_view_guid_only(resolved_urn)
+        except ValueError as e:
+            # get_view_guid_only raises ValueError with user-friendly message
+            return str(e)
+
+        # Step 4: Encode the URN for the query endpoint (use raw URN)
+        # For ACC/BIM360, the URN must include the version suffix
+        encoded_urn = safe_b64encode(resolved_urn)
+
+        # Get auth token
+        token = get_token()
+
+        # Step 5: Execute server-side query
+        query_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}/properties:query"
+
+        query_headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA",
+            "Content-Type": "application/json"
+        }
+
+        # Build query payload - filter by name containing category
+        query_payload = {
+            "query": {
+                "$contains": ["name", category_name]
+            }
+        }
+
+        logger.info(f"  Executing server-side query: {query_payload}")
+
+        resp_query = requests.post(
+            query_url,
+            headers=query_headers,
+            json=query_payload,
+            timeout=60
+        )
+
+        # Handle specific error cases
+        if resp_query.status_code == 400:
+            logger.warning(f"Query API returned 400: {resp_query.text}")
+            return "⚠️ Query Failed. The model might not support advanced querying yet."
+
+        if resp_query.status_code == 404:
+            return "❌ Model metadata not found. The model may not be fully translated yet."
+
+        if resp_query.status_code != 200:
+            logger.error(f"Query API Error {resp_query.status_code}: {resp_query.text}")
+            return f"❌ Query Error {resp_query.status_code}: {resp_query.text}"
+
+        # Step 6: Extract count from results
+        query_data = resp_query.json()
+        collection = query_data.get("data", {}).get("collection", [])
+
+        count = len(collection)
+        logger.info(f"✅ Server-side query complete. Found {count} matching elements.")
+
+        return count
+
+    except requests.exceptions.Timeout:
+        logger.error("Query request timed out")
+        return "❌ Error: Query request timed out. The model may be too large or the server is slow to respond."
+
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"Request Exception during query: {str(req_err)}")
+        return f"❌ Error: Network error during query: {str(req_err)}"
+
+    except Exception as e:
+        logger.error(f"Query Exception: {str(e)}")
+        return f"❌ Error: {str(e)}"
+
+
+def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
+    """
+    Triggers a fresh Model Derivative translation job for a file.
+    Forces re-processing even if partial data exists.
+
+    Args:
+        version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf...)
+
+    Returns:
+        Job result dictionary or error message string
+    """
+    try:
+        logger.info(f"[Translation Trigger] Starting fresh translation job for model...")
+        logger.info(f"  Version URN: {version_urn[:80]}...")
+
+        # Step 1: Encode the full URN (Base64, no padding)
+        # Do NOT strip query parameters - use the raw version URN
+        encoded_urn = safe_b64encode(version_urn)
+
+        # Step 2: Get auth token
+        token = get_token()
+
+        # Step 3: Prepare headers with EMEA region and force flag
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA",  # EMEA region support
+            "x-ads-force": "true",   # CRITICAL: Forces overwrite of existing partial data
+            "Content-Type": "application/json"
+        }
+
+        # Step 4: Prepare translation job payload
+        # Request SVF (Classic) format with 2D and 3D views
+        payload = {
+            "input": {
+                "urn": encoded_urn
+            },
+            "output": {
+                "formats": [
+                    {
+                        "type": "svf",  # CHANGED FROM 'svf2' TO 'svf' (406: SVF2 not supported)
+                        "views": ["2d", "3d"]
+                    }
+                ]
+            }
+        }
+
+        # Step 5: Submit translation job
+        job_url = "https://developer.api.autodesk.com/modelderivative/v2/designdata/job"
+
+        logger.info(f"  Submitting translation job to Model Derivative API...")
+        logger.info(f"  Requesting 'svf' (Classic) translation format...")
+        logger.info(f"  Endpoint: POST {job_url}")
+        logger.info(f"  Headers: x-ads-region=EMEA, x-ads-force=true")
+
+        resp = requests.post(
+            job_url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        # Handle response
+        if resp.status_code == 400:
+            error_msg = f"❌ Translation job rejected (400): {resp.text}"
+            logger.error(error_msg)
+            return error_msg
+
+        if resp.status_code == 404:
+            error_msg = "❌ File not found (404). The URN may be invalid or the file doesn't exist."
+            logger.error(error_msg)
+            logger.error(f"  Response: {resp.text}")
+            return error_msg
+
+        if resp.status_code not in [200, 201]:
+            error_msg = f"❌ Translation API Error {resp.status_code}: {resp.text}"
+            logger.error(error_msg)
+            return error_msg
+
+        # Success - parse job result
+        job_result = resp.json()
+        result_status = job_result.get("result", "unknown")
+        urn_output = job_result.get("urn", "unknown")
+
+        logger.info(f"✅ Translation job submitted successfully!")
+        logger.info(f"  Result: {result_status}")
+        logger.info(f"  URN: {urn_output}")
+
+        return job_result
+
+    except requests.exceptions.Timeout:
+        error_msg = "❌ Error: Translation job request timed out."
+        logger.error(error_msg)
+        return error_msg
+
+    except requests.exceptions.RequestException as req_err:
+        error_msg = f"❌ Error: Network error during translation job: {str(req_err)}"
+        logger.error(error_msg)
+        return error_msg
+
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        logger.error(f"Translation Trigger Exception: {str(e)}")
+        return error_msg
