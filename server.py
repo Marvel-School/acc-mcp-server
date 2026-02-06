@@ -325,18 +325,21 @@ def find_files(project_name: Optional[str] = None, project_id: Optional[str] = N
     return output
 
 @mcp.tool()
-def inspect_file(project_id: str, version_id: str) -> str:
+def inspect_file(project_id: str, file_id: str) -> str:
     """
-    Universal file inspector that checks translation status.
-    Works for any file type that can be processed by Model Derivative API.
+    Smart file inspector with automatic URN resolution.
+    Automatically detects and handles both Lineage URNs and Version URNs.
 
     Args:
         project_id: The project ID
-        version_id: The version URN (from find_files output)
+        file_id: Either Item ID (Lineage URN) or Version URN
+                 - Lineage: urn:adsk.wipp:dm.lineage:...
+                 - Version: urn:adsk.wipp:fs.file:vf...
 
-    Returns translation status (Ready, Processing, Failed, etc.)
+    The tool will automatically convert Lineage URNs to Version URNs before inspection.
+    Returns translation status (Ready, Processing, Failed, Not Translated, etc.)
     """
-    return inspect_generic_file(project_id, version_id)
+    return inspect_generic_file(project_id, file_id)
 
 # ==========================================
 # 3D MODEL TOOLS

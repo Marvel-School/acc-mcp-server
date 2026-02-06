@@ -1056,16 +1056,54 @@ def get_account_user_details(email: str) -> dict:
 def get_latest_version_urn(project_id: str, item_id: str) -> Optional[str]:
     """
     Resolves a File Item ID (Lineage URN) to its latest Version URN.
-    This is an alias for resolve_to_version_id() for clarity in Model Derivative context.
+    Uses Data Management API to get the tip version from item relationships.
 
     Args:
         project_id: The project ID
         item_id: The item ID (Lineage URN like urn:adsk.wipp:dm.lineage:...)
 
     Returns:
-        Version URN or None on error
+        Version URN (urn:adsk.wipp:fs.file:vf...) or None on error
     """
-    return resolve_to_version_id(project_id, item_id)
+    try:
+        # If already a version URN, return as-is
+        if "fs.file" in item_id or "version=" in item_id:
+            logger.info(f"Already a version URN: {item_id}")
+            return item_id
+
+        # Prepare request with EMEA region
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Ensure proper ID formatting
+        project_id_clean = ensure_b_prefix(project_id)
+        item_id_encoded = encode_urn(item_id)
+
+        # Call Data Management API to get item details
+        url = f"https://developer.api.autodesk.com/data/v1/projects/{project_id_clean}/items/{item_id_encoded}"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(f"Failed to resolve item {item_id}: {resp.status_code} - {resp.text}")
+            return None
+
+        # Extract tip version URN from relationships
+        data = resp.json()
+        tip_urn = data.get("data", {}).get("relationships", {}).get("tip", {}).get("data", {}).get("id")
+
+        if tip_urn:
+            logger.info(f"Resolved lineage URN to version: {tip_urn[:60]}...")
+            return tip_urn
+        else:
+            logger.warning("No tip version found in item relationships")
+            return None
+
+    except Exception as e:
+        logger.error(f"Version Resolution Exception: {str(e)}")
+        return None
 
 def get_model_manifest(version_urn: str) -> Union[Dict[str, Any], str]:
     """
@@ -1156,41 +1194,63 @@ def get_model_metadata(version_urn: str, guid: Optional[str] = None) -> Union[Di
         logger.error(f"Metadata Exception: {str(e)}")
         return f"Error: {str(e)}"
 
-def inspect_generic_file(project_id: str, version_id: str) -> str:
+def inspect_generic_file(project_id: str, file_id: str) -> str:
     """
-    Universal file inspector that checks Model Derivative translation status.
-    Works for any file type that can be translated.
+    Smart file inspector with automatic URN resolution.
+    Automatically detects and converts Lineage URNs to Version URNs before inspection.
 
     Args:
-        project_id: The project ID (unused, kept for API consistency)
-        version_id: The version URN to inspect
+        project_id: The project ID
+        file_id: Either a Lineage URN (urn:adsk.wipp:dm.lineage:...) or Version URN (urn:adsk.wipp:fs.file:vf...)
 
     Returns:
         Status message string
     """
     try:
-        logger.info(f"[Universal Explorer] Inspecting file with version: {version_id}")
+        logger.info(f"[Smart Inspector] Inspecting file: {file_id[:60]}...")
 
-        # Encode the URN (Base64, no padding)
-        encoded_urn = safe_b64encode(version_id)
+        # Step 1: Auto-Resolve - Check if this is a Lineage URN
+        version_urn = None
 
-        # Call Model Derivative API to get manifest
+        if "lineage" in file_id:
+            logger.info("  Detected Lineage URN - resolving to latest version...")
+            version_urn = get_latest_version_urn(project_id, file_id)
+
+            if not version_urn:
+                return "❌ Error: Could not resolve Lineage URN to Version URN. File may not exist or has no versions."
+
+        elif "fs.file" in file_id or "version=" in file_id:
+            logger.info("  Detected Version URN - proceeding directly")
+            version_urn = file_id
+        else:
+            # Assume it might be a lineage URN without obvious markers
+            logger.info("  URN type unclear - attempting resolution...")
+            version_urn = get_latest_version_urn(project_id, file_id)
+
+            if not version_urn:
+                # If resolution fails, try using it as-is
+                version_urn = file_id
+
+        # Step 2: Encode the URN (Base64, strip padding)
+        encoded_urn = safe_b64encode(version_urn)
+
+        # Step 3: Call Model Derivative API to get manifest
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
         url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/manifest"
 
         resp = requests.get(url, headers=headers)
 
-        # Handle different status codes
+        # Step 4: Handle different status codes
         if resp.status_code == 404:
-            return "File not found or not yet translated. Please check if the file has been processed."
+            return "⚠️ Not Translated. Translation required. The file exists but hasn't been processed by Model Derivative API yet."
 
         if resp.status_code == 202:
-            return "Processing - Translation in progress. Please check again later."
+            return "⏳ Processing - Translation in progress. Please check again later."
 
         if resp.status_code != 200:
             logger.error(f"Manifest API Error {resp.status_code}: {resp.text}")
-            return f"Error {resp.status_code}: Unable to inspect file."
+            return f"❌ Error {resp.status_code}: Unable to inspect file."
 
         # Parse the manifest
         manifest = resp.json()
@@ -1202,7 +1262,7 @@ def inspect_generic_file(project_id: str, version_id: str) -> str:
         elif status == "inprogress":
             return f"⏳ Processing (Translation {progress}% complete)"
         elif status == "failed":
-            return "❌ Translation Failed"
+            return "❌ Translation Failed - Check file format or try re-uploading"
         elif status == "timeout":
             return "⏱️ Translation Timeout - File may be too large or complex"
         else:
@@ -1210,4 +1270,4 @@ def inspect_generic_file(project_id: str, version_id: str) -> str:
 
     except Exception as e:
         logger.error(f"File Inspection Exception: {str(e)}")
-        return f"Error: {str(e)}"
+        return f"❌ Error: {str(e)}"
