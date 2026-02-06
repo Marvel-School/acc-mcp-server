@@ -195,6 +195,76 @@ def get_projects_rest(hub_id: str) -> Union[List[Dict[str, Any]], str]:
         logger.error(f"REST Project Exception: {str(e)}")
         return f"Error: {str(e)}"
 
+def resolve_project(project_name_or_id: str) -> Union[Dict[str, Any], str]:
+    """
+    Globally searches for a project across all accessible hubs.
+    Matches by project name (case-insensitive) or exact project ID.
+
+    Args:
+        project_name_or_id: Project name or ID to search for
+
+    Returns:
+        Dict with hub_id, project_id, and project_name, or error string
+    """
+    try:
+        logger.info(f"Searching globally for project: {project_name_or_id}")
+
+        # Step 1: Get all accessible hubs
+        hubs = get_hubs_rest()
+
+        if isinstance(hubs, str):
+            return f"Failed to get hubs: {hubs}"
+
+        if not hubs:
+            return "No hubs found. Check if your app has access to any accounts."
+
+        search_term = project_name_or_id.lower().strip()
+
+        # Step 2: Search through each hub
+        for hub in hubs:
+            hub_id = hub.get("id")
+            hub_name = hub.get("name", "Unknown")
+
+            # Skip if hub_id is None
+            if not hub_id:
+                logger.warning(f"Skipping hub with no ID: {hub_name}")
+                continue
+
+            logger.info(f"Searching in hub: {hub_name} ({hub_id})")
+
+            # Step 3: Get projects for this hub
+            projects = get_projects_rest(hub_id)
+
+            if isinstance(projects, str):
+                logger.warning(f"Failed to get projects for hub {hub_name}: {projects}")
+                continue
+
+            # Step 4: Check for matching project
+            for project in projects:
+                project_id = project.get("id", "")
+                project_name = project.get("name", "")
+
+                # Match by name (case-insensitive) or exact ID
+                if (search_term == project_name.lower() or
+                    search_term in project_name.lower() or
+                    project_name_or_id == project_id):
+
+                    logger.info(f"✅ Found project '{project_name}' in hub '{hub_name}'")
+                    return {
+                        "hub_id": hub_id,
+                        "project_id": project_id,
+                        "project_name": project_name,
+                        "hub_name": hub_name
+                    }
+
+        # Not found in any hub
+        logger.warning(f"Project '{project_name_or_id}' not found in any accessible hub")
+        return f"Project '{project_name_or_id}' not found in any accessible hub. Please check the name or ID."
+
+    except Exception as e:
+        logger.error(f"Project Resolution Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
 def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]], str]:
     """
     Fetches top-level folders for a project using Data Management REST API.
@@ -300,8 +370,8 @@ def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str,
 
 def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> Union[List[Dict[str, Any]], str]:
     """
-    Smart search for design files in a project.
-    Automatically navigates to 'Project Files' folder and searches for files by extension.
+    Smart recursive search for design files in a project using BFS.
+    Automatically navigates to 'Project Files' folder and searches nested subfolders.
 
     Args:
         hub_id: The hub/account ID
@@ -313,7 +383,7 @@ def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> 
     """
     try:
         # Step 1: Get top folders
-        logger.info(f"Searching for design files with extensions: {extensions}")
+        logger.info(f"Starting recursive search for design files with extensions: {extensions}")
         top_folders = get_top_folders(hub_id, project_id)
 
         if isinstance(top_folders, str):
@@ -335,29 +405,63 @@ def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> 
         if not project_files_folder:
             return "No folders found in project"
 
-        # Step 3: Get folder contents
-        contents = get_folder_contents(project_id, project_files_folder)
-
-        if isinstance(contents, str):
-            return f"Failed to get folder contents: {contents}"
-
-        # Step 4: Filter by file extensions
-        ext_list = [ext.strip().lower() for ext in extensions.split(",")]
+        # Step 3: Initialize BFS queue and results
+        folder_queue = [{"id": project_files_folder, "name": "Project Files"}]
         matching_files = []
+        ext_list = [ext.strip().lower() for ext in extensions.split(",")]
 
-        for item in contents:
-            if item.get("itemType") == "file":
-                name = item.get("name", "")
-                # Check if file ends with any of the specified extensions
-                if any(name.lower().endswith(f".{ext}") for ext in ext_list):
-                    matching_files.append({
-                        "name": name,
+        # Safety limits
+        max_folders_to_scan = 50
+        folders_scanned = 0
+
+        # Step 4: BFS Loop
+        while folder_queue and folders_scanned < max_folders_to_scan:
+            current_folder = folder_queue.pop(0)
+            folder_id = current_folder["id"]
+            folder_name = current_folder["name"]
+
+            folders_scanned += 1
+            logger.info(f"Scanning folder {folders_scanned}/{max_folders_to_scan}: '{folder_name}'")
+
+            # Get folder contents
+            contents = get_folder_contents(project_id, folder_id)
+
+            if isinstance(contents, str):
+                logger.warning(f"Failed to get contents of folder '{folder_name}': {contents}")
+                continue
+
+            # Process items in this folder
+            for item in contents:
+                item_type = item.get("itemType")
+
+                # If it's a file, check if it matches our extensions
+                if item_type == "file":
+                    name = item.get("name", "")
+                    # Check if file ends with any of the specified extensions
+                    if any(name.lower().endswith(f".{ext}") for ext in ext_list):
+                        matching_files.append({
+                            "name": name,
+                            "id": item.get("id"),
+                            "tipVersionUrn": item.get("tipVersionUrn"),
+                            "type": item.get("type"),
+                            "folder": folder_name
+                        })
+                        logger.info(f"  Found matching file: {name}")
+
+                # If it's a subfolder, add to queue for scanning
+                elif item_type == "folder":
+                    subfolder_name = item.get("name", "Unknown")
+                    folder_queue.append({
                         "id": item.get("id"),
-                        "tipVersionUrn": item.get("tipVersionUrn"),
-                        "type": item.get("type")
+                        "name": f"{folder_name}/{subfolder_name}"
                     })
+                    logger.info(f"  Queued subfolder: {subfolder_name}")
 
-        logger.info(f"Found {len(matching_files)} matching files")
+        # Log summary
+        if folders_scanned >= max_folders_to_scan:
+            logger.warning(f"Reached maximum folder scan limit ({max_folders_to_scan})")
+
+        logger.info(f"Search complete: Scanned {folders_scanned} folders, found {len(matching_files)} matching files")
         return matching_files
 
     except Exception as e:

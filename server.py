@@ -38,7 +38,8 @@ from api import (
     get_projects_rest,
     get_top_folders as fetch_top_folders,
     get_folder_contents as fetch_folder_contents,
-    find_design_files
+    find_design_files,
+    resolve_project
 )
 
 # Initialize Logging
@@ -278,18 +279,49 @@ def get_model_viewer_link(project_id: str, item_id: str) -> str:
     return f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(version_id, safe='')}"
 
 @mcp.tool()
-def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
+def find_models(project_name_or_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
     """
-    Automatically searches the 'Project Files' folder for design files (RVT, DWG, etc.).
-    Smart search that navigates to Project Files folder autonomously.
+    Automatically searches for design files (RVT, DWG, etc.) in a project.
+    Smart search that finds the project globally and navigates folders autonomously.
 
     Args:
-        project_id: The project ID
+        project_name_or_id: Project name or ID (will search all hubs automatically)
         file_types: Comma-separated list of file extensions (e.g. "rvt,dwg,nwc")
     """
-    hub_id = get_cached_hub_id()
-    if not hub_id:
-        return "❌ Error: No Hubs found."
+    # Try to resolve the project globally
+    logger.info(f"Attempting to resolve project: {project_name_or_id}")
+
+    # First, try to use cached hub_id if the input looks like a project ID
+    if project_name_or_id.startswith("b."):
+        hub_id = get_cached_hub_id()
+        if hub_id:
+            logger.info(f"Using cached hub_id for project ID: {project_name_or_id}")
+            project_id = project_name_or_id
+        else:
+            # Fallback to global search
+            resolution = resolve_project(project_name_or_id)
+            if isinstance(resolution, str):
+                return f"❌ {resolution}"
+
+            hub_id = resolution.get("hub_id")
+            project_id = resolution.get("project_id")
+            project_name = resolution.get("project_name")
+            hub_name = resolution.get("hub_name")
+            logger.info(f"Resolved to: Project '{project_name}' in Hub '{hub_name}'")
+    else:
+        # Input is likely a project name, do global search
+        resolution = resolve_project(project_name_or_id)
+        if isinstance(resolution, str):
+            return f"❌ {resolution}"
+
+        hub_id = resolution.get("hub_id")
+        project_id = resolution.get("project_id")
+        project_name = resolution.get("project_name")
+        hub_name = resolution.get("hub_name")
+        logger.info(f"Resolved to: Project '{project_name}' in Hub '{hub_name}'")
+
+    if not hub_id or not project_id:
+        return "❌ Error: Could not determine hub_id or project_id."
 
     # Use smart search function
     result = find_design_files(hub_id, project_id, file_types)
@@ -305,6 +337,7 @@ def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
         name = file.get("name", "Unknown")
         file_id = file.get("id", "")
         tip_urn = file.get("tipVersionUrn") or file_id
+        folder_path = file.get("folder", "Unknown")
 
         # Generate viewer link only if we have a valid URN
         if tip_urn:
@@ -312,12 +345,15 @@ def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
             viewer_link = f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(tip_urn, safe='')}"
 
             output += f"- **{name}**\n"
+            output += f"  📁 Location: `{folder_path}`\n"
             output += f"  [Open in Viewer]({viewer_link})\n"
             output += f"  ID: `{file_id}`\n"
             if tip_urn != file_id:
                 output += f"  Version URN: `{tip_urn}`\n"
         else:
-            output += f"- **{name}** (ID: `{file_id}`)\n"
+            output += f"- **{name}**\n"
+            output += f"  📁 Location: `{folder_path}`\n"
+            output += f"  ID: `{file_id}`\n"
 
     return output
 
