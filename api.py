@@ -5,7 +5,7 @@ import time
 import base64
 from functools import lru_cache
 from urllib.parse import quote
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from auth import get_token, BASE_URL_ACC, BASE_URL_HQ_US, BASE_URL_HQ_EU, BASE_URL_GRAPHQL, ACC_ADMIN_EMAIL
 
 logger = logging.getLogger(__name__)
@@ -47,18 +47,426 @@ def make_api_request(url: str):
         return f"Error: {str(e)}"
 
 def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None):
-    """Wrapper for GraphQL requests."""
+    """
+    Wrapper for AEC GraphQL requests.
+    Critical: GraphQL returns 200 OK even with errors - must check response.data.errors.
+    """
     try:
         token = get_token()
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        resp = requests.post(BASE_URL_GRAPHQL, headers=headers, json={"query": query, "variables": variables or {}})
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "x-ads-region": "EMEA"
+        }
+        payload = {"query": query, "variables": variables or {}}
+        resp = requests.post(BASE_URL_GRAPHQL, headers=headers, json=payload)
+
         if resp.status_code != 200:
-            logger.warning(f"GraphQL Error {resp.status_code}: {resp.text}")
+            logger.warning(f"GraphQL HTTP Error {resp.status_code}: {resp.text}")
             return f"GraphQL Error {resp.status_code}: {resp.text}"
-        return resp.json().get("data", {})
+
+        json_data = resp.json()
+
+        # Critical: GraphQL returns 200 even on errors - check errors field
+        if "errors" in json_data:
+            error_messages = [err.get("message", str(err)) for err in json_data["errors"]]
+            error_str = "; ".join(error_messages)
+            logger.error(f"GraphQL Query Errors: {error_str}")
+            return f"GraphQL Query Error: {error_str}"
+
+        return json_data.get("data", {})
     except Exception as e:
         logger.error(f"GraphQL Exception: {str(e)}")
         return f"GraphQL Exception: {str(e)}"
+
+def get_hubs_aec() -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches all hubs using AEC Data Model GraphQL API.
+    Returns list of hubs or error string.
+    """
+    query = """
+    query {
+        hubs {
+            results {
+                id
+                name
+            }
+        }
+    }
+    """
+    result = make_graphql_request(query)
+
+    if isinstance(result, str):
+        return result
+
+    if not result or "hubs" not in result:
+        return "No hubs data returned from GraphQL API"
+
+    return result["hubs"].get("results", [])
+
+def get_projects_aec(hub_id: str) -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches all projects for a given hub using AEC Data Model GraphQL API.
+    Returns list of projects or error string.
+    """
+    query = """
+    query($hubId: ID!) {
+        projects(hubId: $hubId) {
+            results {
+                id
+                name
+                hubId
+            }
+        }
+    }
+    """
+    variables = {"hubId": hub_id}
+    result = make_graphql_request(query, variables)
+
+    if isinstance(result, str):
+        return result
+
+    if not result or "projects" not in result:
+        return f"No projects data returned for hub {hub_id}"
+
+    return result["projects"].get("results", [])
+
+def get_hubs_rest() -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches all hubs using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+        url = "https://developer.api.autodesk.com/project/v1/hubs"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(f"REST API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: {resp.text}"
+
+        data = resp.json()
+        hubs = data.get("data", [])
+
+        # Extract relevant fields
+        result = []
+        for hub in hubs:
+            result.append({
+                "id": hub.get("id"),
+                "name": hub.get("attributes", {}).get("name")
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"REST Hub Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def get_projects_rest(hub_id: str) -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches all projects for a given hub using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    try:
+        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
+
+        # Use pagination to get all projects
+        all_projects = fetch_paginated_data(url, style='url', impersonate=False)
+
+        if isinstance(all_projects, str):
+            return all_projects
+
+        # Extract relevant fields
+        result = []
+        for project in all_projects:
+            result.append({
+                "id": project.get("id"),
+                "name": project.get("attributes", {}).get("name"),
+                "hubId": hub_id
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"REST Project Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def resolve_project(project_name_or_id: str) -> Union[Dict[str, Any], str]:
+    """
+    Globally searches for a project across all accessible hubs.
+    Matches by project name (case-insensitive) or exact project ID.
+
+    Args:
+        project_name_or_id: Project name or ID to search for
+
+    Returns:
+        Dict with hub_id, project_id, and project_name, or error string
+    """
+    try:
+        logger.info(f"Searching globally for project: {project_name_or_id}")
+
+        # Step 1: Get all accessible hubs
+        hubs = get_hubs_rest()
+
+        if isinstance(hubs, str):
+            return f"Failed to get hubs: {hubs}"
+
+        if not hubs:
+            return "No hubs found. Check if your app has access to any accounts."
+
+        search_term = project_name_or_id.lower().strip()
+
+        # Step 2: Search through each hub
+        for hub in hubs:
+            hub_id = hub.get("id")
+            hub_name = hub.get("name", "Unknown")
+
+            # Skip if hub_id is None
+            if not hub_id:
+                logger.warning(f"Skipping hub with no ID: {hub_name}")
+                continue
+
+            logger.info(f"Searching in hub: {hub_name} ({hub_id})")
+
+            # Step 3: Get projects for this hub
+            projects = get_projects_rest(hub_id)
+
+            if isinstance(projects, str):
+                logger.warning(f"Failed to get projects for hub {hub_name}: {projects}")
+                continue
+
+            # Step 4: Check for matching project
+            for project in projects:
+                project_id = project.get("id", "")
+                project_name = project.get("name", "")
+
+                # Match by name (case-insensitive) or exact ID
+                if (search_term == project_name.lower() or
+                    search_term in project_name.lower() or
+                    project_name_or_id == project_id):
+
+                    logger.info(f"✅ Found project '{project_name}' in hub '{hub_name}'")
+                    return {
+                        "hub_id": hub_id,
+                        "project_id": project_id,
+                        "project_name": project_name,
+                        "hub_name": hub_name
+                    }
+
+        # Not found in any hub
+        logger.warning(f"Project '{project_name_or_id}' not found in any accessible hub")
+        return f"Project '{project_name_or_id}' not found in any accessible hub. Please check the name or ID."
+
+    except Exception as e:
+        logger.error(f"Project Resolution Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches top-level folders for a project using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Ensure proper ID formatting
+        hub_id_clean = ensure_b_prefix(hub_id)
+        project_id_clean = ensure_b_prefix(project_id)
+
+        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id_clean}/projects/{project_id_clean}/topFolders"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(f"Top Folders API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: {resp.text}"
+
+        data = resp.json()
+        folders = data.get("data", [])
+
+        # Extract relevant fields
+        result = []
+        for folder in folders:
+            result.append({
+                "id": folder.get("id"),
+                "name": folder.get("attributes", {}).get("displayName"),
+                "type": folder.get("type")
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Top Folders Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches contents of a folder using Data Management REST API.
+    Returns files and subfolders with proper URN extraction for files.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    try:
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Ensure proper ID formatting
+        project_id_clean = ensure_b_prefix(project_id)
+        folder_id_encoded = encode_urn(folder_id)
+
+        url = f"https://developer.api.autodesk.com/data/v1/projects/{project_id_clean}/folders/{folder_id_encoded}/contents"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(f"Folder Contents API Error {resp.status_code}: {resp.text}")
+            return f"Error {resp.status_code}: {resp.text}"
+
+        data = resp.json()
+        items = data.get("data", [])
+
+        # Parse items with detailed information
+        result = []
+        for item in items:
+            item_type = item.get("type")
+            attributes = item.get("attributes", {})
+
+            parsed_item = {
+                "id": item.get("id"),
+                "name": attributes.get("displayName"),
+                "type": item_type
+            }
+
+            # For files, extract the tip version URN (needed for Model Derivative API)
+            if item_type == "items":
+                relationships = item.get("relationships", {})
+                tip = relationships.get("tip", {})
+                tip_data = tip.get("data", {})
+                tip_id = tip_data.get("id")
+
+                if tip_id:
+                    parsed_item["tipVersionUrn"] = tip_id
+                    parsed_item["itemType"] = "file"
+                else:
+                    parsed_item["itemType"] = "file"
+            elif item_type == "folders":
+                parsed_item["itemType"] = "folder"
+
+            result.append(parsed_item)
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Folder Contents Exception: {str(e)}")
+        return f"Error: {str(e)}"
+
+def find_design_files(hub_id: str, project_id: str, extensions: str = "rvt") -> Union[List[Dict[str, Any]], str]:
+    """
+    Smart recursive search for design files in a project using BFS.
+    Automatically navigates to 'Project Files' folder and searches nested subfolders.
+
+    Args:
+        hub_id: The hub/account ID
+        project_id: The project ID
+        extensions: Comma-separated file extensions (e.g., "rvt,dwg,nwc")
+
+    Returns:
+        List of matching files with name and URN, or error string
+    """
+    try:
+        # Step 1: Get top folders
+        logger.info(f"Starting recursive search for design files with extensions: {extensions}")
+        top_folders = get_top_folders(hub_id, project_id)
+
+        if isinstance(top_folders, str):
+            return f"Failed to get top folders: {top_folders}"
+
+        # Step 2: Find "Project Files" folder
+        project_files_folder = None
+        for folder in top_folders:
+            if folder.get("name") == "Project Files":
+                project_files_folder = folder.get("id")
+                logger.info(f"Found 'Project Files' folder: {project_files_folder}")
+                break
+
+        # Fallback: if "Project Files" not found, try the first folder
+        if not project_files_folder and top_folders:
+            project_files_folder = top_folders[0].get("id")
+            logger.warning(f"'Project Files' not found, using first folder: {project_files_folder}")
+
+        if not project_files_folder:
+            return "No folders found in project"
+
+        # Step 3: Initialize BFS queue and results
+        folder_queue = [{"id": project_files_folder, "name": "Project Files"}]
+        matching_files = []
+        ext_list = [ext.strip().lower() for ext in extensions.split(",")]
+
+        # Safety limits
+        max_folders_to_scan = 50
+        folders_scanned = 0
+
+        # Step 4: BFS Loop
+        while folder_queue and folders_scanned < max_folders_to_scan:
+            current_folder = folder_queue.pop(0)
+            folder_id = current_folder["id"]
+            folder_name = current_folder["name"]
+
+            folders_scanned += 1
+            logger.info(f"Scanning folder {folders_scanned}/{max_folders_to_scan}: '{folder_name}'")
+
+            # Get folder contents
+            contents = get_folder_contents(project_id, folder_id)
+
+            if isinstance(contents, str):
+                logger.warning(f"Failed to get contents of folder '{folder_name}': {contents}")
+                continue
+
+            # Process items in this folder
+            for item in contents:
+                item_type = item.get("itemType")
+
+                # If it's a file, check if it matches our extensions
+                if item_type == "file":
+                    name = item.get("name", "")
+                    # Check if file ends with any of the specified extensions
+                    if any(name.lower().endswith(f".{ext}") for ext in ext_list):
+                        matching_files.append({
+                            "name": name,
+                            "id": item.get("id"),
+                            "tipVersionUrn": item.get("tipVersionUrn"),
+                            "type": item.get("type"),
+                            "folder": folder_name
+                        })
+                        logger.info(f"  Found matching file: {name}")
+
+                # If it's a subfolder, add to queue for scanning
+                elif item_type == "folder":
+                    subfolder_name = item.get("name", "Unknown")
+                    folder_queue.append({
+                        "id": item.get("id"),
+                        "name": f"{folder_name}/{subfolder_name}"
+                    })
+                    logger.info(f"  Queued subfolder: {subfolder_name}")
+
+        # Log summary
+        if folders_scanned >= max_folders_to_scan:
+            logger.warning(f"Reached maximum folder scan limit ({max_folders_to_scan})")
+
+        logger.info(f"Search complete: Scanned {folders_scanned} folders, found {len(matching_files)} matching files")
+        return matching_files
+
+    except Exception as e:
+        logger.error(f"Design File Search Exception: {str(e)}")
+        return f"Error: {str(e)}"
 
 # --- CACHE ---
 # Cache for hub_id to avoid repeated calls
@@ -124,8 +532,6 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
                         results = data
                     elif isinstance(data, dict):
                         results = data.get("results", [])
-                        if not results and "id" in data: 
-                             pass
                 
                 if not results:
                     if offset == 0:
@@ -155,11 +561,19 @@ def get_user_id_by_email(account_id: str, email: str) -> Optional[str]:
     return None
 
 @lru_cache(maxsize=16)
-def get_acting_user_id(account_id: str, requester_email: Optional[str] = None) -> Optional[str]:
+def get_acting_user_id(account_id: Optional[str] = None, requester_email: Optional[str] = None) -> Optional[str]:
     """
     Robustly resolves a User ID for 2-legged auth impersonation.
     Cached to prevent repeated API hits for the same account/email.
     """
+    # Resolve account_id if missing
+    if not account_id:
+        account_id = get_cached_hub_id()
+        
+    if not account_id:
+         logger.warning("No Account ID available for resolving Acting User.")
+         return None
+
     try:
         # 0. Check for explicit Admin ID in env (Fastest path)
         env_admin_id = os.environ.get("ACC_ADMIN_ID")
@@ -259,7 +673,7 @@ def search_project_folder(project_id: str, query: str, limit: int = 20) -> List[
 
 # --- NEW: FEATURES API (Issues/Assets) ---
 
-def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", impersonate: bool = False) -> List[Dict[str, Any]]:
+def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", impersonate: bool = False) -> Union[List[Dict[str, Any]], str]:
     """
     Generic pagination helper for ACC APIs.
     styles: 
@@ -276,7 +690,7 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
     while current_url and page_count < MAX_PAGES:
         try:
             token = get_token()
-            headers = {"Authorization": f"Bearer {token}"}
+            headers = {"Authorization": f"Bearer {token}", "x-ads-region": "EMEA"}
             
             # Auto-inject x-user-id for 2-legged flows (Required for Admin/Issues/Assets)
             if impersonate:
@@ -296,11 +710,32 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
 
             resp = requests.get(current_url, headers=headers, params=params if style == 'offset' else None)
             
-            # RETRY LOGIC: If Impersonation blocked us, try as Raw Service Account
-            if resp.status_code == 401 and impersonate and "x-user-id" in headers:
-                logger.warning(f"⚠️ Impersonation denied (401) for {current_url}. Retrying as Service Account (No x-user-id)...")
-                headers.pop("x-user-id", None)
-                resp = requests.get(current_url, headers=headers, params=params if style == 'offset' else None)
+            # ESCALATION LOGIC: If 401, we might be missing x-user-id or using a non-admin.
+            # Issues API strictly forbids Service-to-Service (missing header).
+            if resp.status_code == 401 and impersonate:
+                logger.warning(f"⚠️ 401 Unauthorized at {current_url}. Escalating: Verifying Admin Context.")
+                
+                try:
+                    # 1. Resolve the definitive Admin ID
+                    hub_id = get_cached_hub_id()
+                    admin_id = get_acting_user_id(clean_id(hub_id)) if hub_id else None
+                    
+                    current_header_id = headers.get("x-user-id")
+                    
+                    # 2. Check if we are already using it
+                    if admin_id and current_header_id == admin_id:
+                         logger.error("❌ Already failed as Admin. Cannot escalate further.")
+                         # Allow it to fall through to the error handler
+                    elif admin_id:
+                         # 3. Apply Escalation
+                         logger.info(f"🔄 Retrying with Admin ID: {admin_id}")
+                         headers["x-user-id"] = admin_id
+                         resp = requests.get(current_url, headers=headers, params=params if style == 'offset' else None)
+                    else:
+                         logger.warning("❌ Could not resolve Admin ID for escalation.")
+                         
+                except Exception as e:
+                    logger.error(f"Escalation failed: {e}")
             
             if resp.status_code in [403, 404]:
                 logger.warning(f"Endpoint returned {resp.status_code} (Module inactive?).")
@@ -330,10 +765,10 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
                     batch = data["results"]
             
             all_items.extend(batch)
-            
+
             # Navigate
             if style == 'url':
-                links = data.get("links", {})
+                links = data.get("links", {}) if isinstance(data, dict) else {}
                 next_obj = links.get("next")
                 if isinstance(next_obj, dict):
                     current_url = next_obj.get("href")
@@ -354,7 +789,7 @@ def fetch_paginated_data(url: str, limit: int = 100, style: str = "url", imperso
             
     return all_items
 
-def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_project_issues(project_id: str, status: Optional[str] = None) -> Union[List[Dict[str, Any]], str]:
     p_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/issues/v1/projects/{p_id}/issues"
     # Issues API uses offset/limit
@@ -367,7 +802,7 @@ def get_project_issues(project_id: str, status: Optional[str] = None) -> List[Di
         
     return items
 
-def get_project_assets(project_id: str, category: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_project_assets(project_id: str, category: Optional[str] = None) -> Union[List[Dict[str, Any]], str]:
     p_id = clean_id(project_id)
     url = f"{BASE_URL_ACC}/assets/v2/projects/{p_id}/assets" # Assets V2
     items = fetch_paginated_data(url, limit=50, style='offset', impersonate=True)
@@ -412,7 +847,7 @@ def get_account_users(search_term: str = "") -> List[Dict[str, Any]]:
         
     return all_users
 
-def invite_user_to_project(project_id: str, email: str, products: list = None) -> str:
+def invite_user_to_project(project_id: str, email: str, products: Optional[List[Dict[str, str]]] = None) -> str:
     """
     Invites a user to a project.
     Always ensures 'products' list exists (defaults to 'docs' -> 'member').
@@ -422,7 +857,8 @@ def invite_user_to_project(project_id: str, email: str, products: list = None) -
         token = get_token()
         headers = {
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "x-ads-region": "EMEA"
         }
         
         # 1b. Resolve Account context for impersonation
@@ -472,7 +908,7 @@ def invite_user_to_project(project_id: str, email: str, products: list = None) -
     except Exception as e:
         return f"❌ Exception in invite_user_to_project: {str(e)}"
 
-def fetch_project_users(project_id: str) -> list:
+def fetch_project_users(project_id: str) -> Union[List[Dict[str, Any]], str]:
     """Fetches users specific to a project using ACC Admin API."""
     p_id = clean_id(project_id)
     url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{p_id}/users"
@@ -484,13 +920,17 @@ def fetch_project_users(project_id: str) -> list:
 def _get_admin_headers(account_id: str):
     """Helper to get headers with Admin Impersonation."""
     token = get_token()
-    headers = { "Authorization": f"Bearer {token}", "Content-Type": "application/json" }
+    headers = { 
+        "Authorization": f"Bearer {token}", 
+        "Content-Type": "application/json",
+        "x-ads-region": "EMEA"
+    }
     admin_id = get_acting_user_id(account_id)
     if admin_id:
         headers["x-user-id"] = admin_id
     return headers
 
-def trigger_data_extraction(services: list = None) -> dict:
+def trigger_data_extraction(services: Optional[List[str]] = None) -> dict:
     """Triggers Data Export (Admin Context)."""
     hub_id = get_cached_hub_id()
     if not hub_id: return {"error": "No Hub ID found."}
@@ -498,12 +938,12 @@ def trigger_data_extraction(services: list = None) -> dict:
     
     headers = _get_admin_headers(account_id)
     if "x-user-id" not in headers:
-        return {"error": "Could not resolve Account Admin ID."}
-
+        return {"error": "Could not resolve Account Admin ID. Data Connector requires Admin Impersonation."}
+    
     url = f"https://developer.api.autodesk.com/data-connector/v1/accounts/{account_id}/requests"
     
     payload = {
-        "description": "Copilot Export",
+        "description": f"MCP Agent Export - {time.strftime('%Y-%m-%d')}",
         "schedule": { "interval": "OneTime" }
     }
     if services:
@@ -542,7 +982,7 @@ def check_request_job_status(request_id: str) -> dict:
         "progress": latest_job.get("progress", 0)
     }
 
-def get_data_download_url(job_id: str) -> str:
+def get_data_download_url(job_id: str) -> Optional[str]:
     """Gets signed URL for the ZIP file."""
     hub_id = get_cached_hub_id()
     account_id = clean_id(hub_id)
@@ -556,3 +996,37 @@ def get_data_download_url(job_id: str) -> str:
     if response.status_code == 200:
         return response.json().get("signedUrl")
     return None
+
+def get_account_user_details(email: str) -> dict:
+    """
+    Fetches full details for a specific user from HQ API (EMEA).
+    Does NOT use impersonation.
+    """
+    hub_id = get_cached_hub_id()
+    if not hub_id: return {"error": "No Hub ID found."}
+    account_id = clean_id(hub_id)
+    
+    token = get_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "x-ads-region": "EMEA"
+    }
+    
+    # HQ API User Search
+    url = f"https://developer.api.autodesk.com/hq/v1/accounts/{account_id}/users"
+    params = {"filter[email]": email}
+    
+    try:
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code != 200:
+             return {"error": f"HQ API returned {resp.status_code}: {resp.text}"}
+             
+        data = resp.json()
+        # HQ API usually returns list
+        if isinstance(data, list) and len(data) > 0:
+            return data[0]
+        
+        return {"error": "User not found via HQ Search."}
+
+    except Exception as e:
+        return {"error": str(e)}

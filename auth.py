@@ -2,7 +2,6 @@ import os
 import requests
 import time
 import logging
-from requests.auth import HTTPBasicAuth
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,7 +16,6 @@ ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL")
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
 BASE_URL_HQ_US = "https://developer.api.autodesk.com/hq/v1/accounts"
 BASE_URL_HQ_EU = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts"
-BASE_URL_HQ = BASE_URL_HQ_US # Default to US, fallback logic will handle EU
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # Global token cache
@@ -35,18 +33,24 @@ def get_token() -> str:
 
     logger.info("Refreshing APS Access Token...")
     url = "https://developer.api.autodesk.com/authentication/v2/token"
-    auth = HTTPBasicAuth(APS_CLIENT_ID, APS_CLIENT_SECRET)
     
     # Scopes required for the tool's operations
-    # Reverting to known working scopes (account:write is key for Admin API)
-    # project:read/write are often not supported in 2-legged auth for this endpoint or app config
+    # Using POST Body for credentials to avoid 400 Bad Request
     data = {
+        "client_id": APS_CLIENT_ID,
+        "client_secret": APS_CLIENT_SECRET,
         "grant_type": "client_credentials", 
-        "scope": "data:read data:write account:read account:write bucket:read"
+        "scope": "data:read data:write data:create account:read account:write bucket:read"
     }
 
     try:
-        resp = requests.post(url, auth=auth, data=data)
+        resp = requests.post(url, data=data)
+        
+        # Loud Fail: Log the exact error from Autodesk if 400
+        if resp.status_code == 400:
+            logger.error(f"❌ Token Refresh Failed (400): {resp.text}")
+            resp.raise_for_status()
+
         resp.raise_for_status()
         token_data = resp.json()
         token_cache["access_token"] = token_data["access_token"]

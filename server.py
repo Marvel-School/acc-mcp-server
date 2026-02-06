@@ -10,12 +10,12 @@ from urllib.parse import quote
 from fastmcp import FastMCP
 from auth import get_token, BASE_URL_ACC
 from api import (
-    make_api_request, 
-    make_graphql_request, 
-    get_user_id_by_email, 
+    make_api_request,
+    make_graphql_request,
+    get_user_id_by_email,
     get_acting_user_id,
-    clean_id, 
-    ensure_b_prefix, 
+    clean_id,
+    ensure_b_prefix,
     encode_urn,
     get_cached_hub_id,
     resolve_to_version_id,
@@ -30,7 +30,16 @@ from api import (
     get_project_issues,
     get_project_assets,
     get_account_users,
-    invite_user_to_project
+    invite_user_to_project,
+    get_account_user_details,
+    get_hubs_aec,
+    get_projects_aec,
+    get_hubs_rest,
+    get_projects_rest,
+    get_top_folders as fetch_top_folders,
+    get_folder_contents as fetch_folder_contents,
+    find_design_files,
+    resolve_project
 )
 
 # Initialize Logging
@@ -103,7 +112,47 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
         
     if len(all_projs) > limit:
         output += f"\n*(Displaying {limit} of {len(all_projs)} results. Use 'name_filter' to refine.)*"
-        
+
+    return output
+
+@mcp.tool()
+def list_aec_hubs() -> str:
+    """
+    Lists all hubs using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    result = get_hubs_rest()
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return "No hubs found."
+
+    output = "🏢 **Hubs (via REST API):**\n"
+    for hub in result:
+        output += f"- {hub.get('name', 'Unknown')} (ID: `{hub.get('id')}`)\n"
+
+    return output
+
+@mcp.tool()
+def list_aec_projects(hub_id: str) -> str:
+    """
+    Lists all projects for a hub using Data Management REST API.
+    Supports 2-legged OAuth (Service Accounts).
+    """
+    result = get_projects_rest(hub_id)
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return f"No projects found for hub {hub_id}."
+
+    output = f"📂 **Projects for Hub {hub_id} (via REST API):**\n"
+    for project in result:
+        output += f"- **{project.get('name', 'Unknown')}**\n  ID: `{project.get('id')}`\n"
+
     return output
 
 # ==========================================
@@ -112,29 +161,62 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
 
 @mcp.tool()
 def get_top_folders(project_id: str) -> str:
+    """
+    Lists top-level folders in a project.
+    Uses Data Management REST API with EMEA region support.
+    """
     hub_id = get_cached_hub_id()
-    if not hub_id: return "Error: No Hubs."
-    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{ensure_b_prefix(project_id)}/topFolders"
-    data = make_api_request(url)
-    if isinstance(data, str): return data
-    output = "root_folders:\n"
-    for i in data.get("data", []): output += f"- {i['attributes']['displayName']} (ID: {i['id']})\n"
+    if not hub_id:
+        return "❌ Error: No Hubs found."
+
+    result = fetch_top_folders(hub_id, project_id)
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return "No top folders found."
+
+    output = "📁 **Top Folders:**\n"
+    for folder in result:
+        output += f"- {folder.get('name', 'Unknown')} (ID: `{folder.get('id')}`)\n"
+
     return output
 
 @mcp.tool()
 def list_folder_contents(project_id: str, folder_id: str, limit: int = 20) -> str:
-    safe_folder = encode_urn(folder_id)
-    safe_proj = ensure_b_prefix(project_id)
-    url = f"https://developer.api.autodesk.com/data/v1/projects/{safe_proj}/folders/{safe_folder}/contents"
-    data = make_api_request(url)
-    if isinstance(data, str): return data
-    items = data.get("data", [])
-    if not items: return "📂 Folder is empty."
-    output = f"**Contents ({len(items)} items):**\n"
-    for i in items[:limit]:
-        name = i.get("attributes", {}).get("displayName", "Unnamed")
-        icon = "📁" if i["type"] == "folders" else "📄"
-        output += f"{icon} {name} (ID: `{i['id']}`)\n"
+    """
+    Lists contents of a folder (files and subfolders).
+    Uses Data Management REST API with EMEA region support.
+    Extracts tip version URNs for files (needed for Model Derivative API).
+    """
+    result = fetch_folder_contents(project_id, folder_id)
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return "📂 Folder is empty."
+
+    output = f"📂 **Folder Contents ({len(result)} items):**\n"
+    for item in result[:limit]:
+        name = item.get("name", "Unnamed")
+        item_type = item.get("itemType", "unknown")
+        item_id = item.get("id")
+
+        # Use appropriate icon
+        icon = "📁" if item_type == "folder" else "📄"
+
+        output += f"{icon} **{name}**\n"
+        output += f"   ID: `{item_id}`\n"
+
+        # Include tip version URN for files (needed for Model Derivative API)
+        if item_type == "file" and item.get("tipVersionUrn"):
+            output += f"   Version URN: `{item.get('tipVersionUrn')}`\n"
+
+    if len(result) > limit:
+        output += f"\n*(Showing {limit} of {len(result)} items)*"
+
     return output
 
 @mcp.tool()
@@ -197,31 +279,82 @@ def get_model_viewer_link(project_id: str, item_id: str) -> str:
     return f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(version_id, safe='')}"
 
 @mcp.tool()
-def find_models(project_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
+def find_models(project_name_or_id: str, file_types: str = "rvt,rcp,dwg,nwc") -> str:
     """
-    Finds models in the Project Files folder.
-    file_types: Comma-separated list of file extensions (e.g. "rvt,dwg")
+    Automatically searches for design files (RVT, DWG, etc.) in a project.
+    Smart search that finds the project globally and navigates folders autonomously.
+
+    Args:
+        project_name_or_id: Project name or ID (will search all hubs automatically)
+        file_types: Comma-separated list of file extensions (e.g. "rvt,dwg,nwc")
     """
-    hub_id = get_cached_hub_id()
-    if not hub_id: return "Error: No Hubs."
-    p_id = ensure_b_prefix(project_id)
-    top_data = make_api_request(f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects/{p_id}/topFolders")
-    if isinstance(top_data, str): return top_data
-    proj_files_folder = next((f["id"] for f in top_data.get("data", []) if f["attributes"]["name"] == "Project Files"), None)
-    if not proj_files_folder: return "Error: Could not find 'Project Files' folder."
-    extensions = [ext.strip().lower() for ext in file_types.split(",")]
-    search_url = f"https://developer.api.autodesk.com/data/v1/projects/{p_id}/folders/{proj_files_folder}/search?filter[extension.type]={','.join(extensions)}"
-    search_results = make_api_request(search_url)
-    if isinstance(search_results, str): return search_results
-    items = search_results.get("data", [])
-    if not items: return "❌ No models found matching those extensions."
-    output = f"🔍 **Found {len(items)} Models:**\n"
-    for i in items:
-        name = i["attributes"]["displayName"]
-        item_id = i['id']
-        domain = get_viewer_domain(item_id)
-        viewer_link = f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(item_id, safe='')}"
-        output += f"- **{name}**\n  [Open in Viewer]({viewer_link}) (ID: `{item_id}`)\n"
+    # Try to resolve the project globally
+    logger.info(f"Attempting to resolve project: {project_name_or_id}")
+
+    # First, try to use cached hub_id if the input looks like a project ID
+    if project_name_or_id.startswith("b."):
+        hub_id = get_cached_hub_id()
+        if hub_id:
+            logger.info(f"Using cached hub_id for project ID: {project_name_or_id}")
+            project_id = project_name_or_id
+        else:
+            # Fallback to global search
+            resolution = resolve_project(project_name_or_id)
+            if isinstance(resolution, str):
+                return f"❌ {resolution}"
+
+            hub_id = resolution.get("hub_id")
+            project_id = resolution.get("project_id")
+            project_name = resolution.get("project_name")
+            hub_name = resolution.get("hub_name")
+            logger.info(f"Resolved to: Project '{project_name}' in Hub '{hub_name}'")
+    else:
+        # Input is likely a project name, do global search
+        resolution = resolve_project(project_name_or_id)
+        if isinstance(resolution, str):
+            return f"❌ {resolution}"
+
+        hub_id = resolution.get("hub_id")
+        project_id = resolution.get("project_id")
+        project_name = resolution.get("project_name")
+        hub_name = resolution.get("hub_name")
+        logger.info(f"Resolved to: Project '{project_name}' in Hub '{hub_name}'")
+
+    if not hub_id or not project_id:
+        return "❌ Error: Could not determine hub_id or project_id."
+
+    # Use smart search function
+    result = find_design_files(hub_id, project_id, file_types)
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return "❌ No models found matching those extensions."
+
+    output = f"🔍 **Found {len(result)} Models:**\n"
+    for file in result:
+        name = file.get("name", "Unknown")
+        file_id = file.get("id", "")
+        tip_urn = file.get("tipVersionUrn") or file_id
+        folder_path = file.get("folder", "Unknown")
+
+        # Generate viewer link only if we have a valid URN
+        if tip_urn:
+            domain = get_viewer_domain(tip_urn)
+            viewer_link = f"https://{domain}/docs/files/projects/{clean_id(project_id)}?entityId={quote(tip_urn, safe='')}"
+
+            output += f"- **{name}**\n"
+            output += f"  📁 Location: `{folder_path}`\n"
+            output += f"  [Open in Viewer]({viewer_link})\n"
+            output += f"  ID: `{file_id}`\n"
+            if tip_urn != file_id:
+                output += f"  Version URN: `{tip_urn}`\n"
+        else:
+            output += f"- **{name}**\n"
+            output += f"  📁 Location: `{folder_path}`\n"
+            output += f"  ID: `{file_id}`\n"
+
     return output
 
 @mcp.tool()
@@ -406,7 +539,7 @@ def list_assets(project_id: str, category_filter: str = "all") -> str:
     return str(get_project_assets(project_id, cat))
 
 # ==========================================
-# ADMIN TOOLS
+# USER MANAGEMENT TOOLS
 # ==========================================
 
 @mcp.tool()
@@ -501,25 +634,36 @@ def check_export_status(request_id: str) -> str:
     If complete, returns a DOWNLOAD LINK.
     """
     result = check_request_job_status(request_id)
-    
+
     if "error" in result:
         return f"❌ Error: {result['error']}"
-        
-    status = result.get("status")
+
+    status = result.get("status", "").upper()
     job_id = result.get("job_id")
-    
+
     if status == "SUCCESS" and job_id:
-        # Fetch Link
         link = get_data_download_url(job_id)
         if link:
             return f"✅ **Export Complete!**\n\n⬇️ [Click here to Download ZIP]({link})\n*(Link expires in 60 seconds)*"
         else:
             return "✅ Export complete, but failed to generate download link."
-            
+
     elif status == "FAILED":
         return "❌ Export Job Failed."
-        
+
     return f"⏳ Export Processing... (Job ID: {job_id})"
+
+@mcp.tool()
+def check_admin_status() -> str:
+    """
+    Diagnostic: Use HQ API to find the Admin's configured permissions.
+    """
+    email = os.environ.get("ACC_ADMIN_EMAIL")
+    if not email:
+        return "❌ `ACC_ADMIN_EMAIL` is not set in environment."
+        
+    result = get_account_user_details(email)
+    return f"🔍 **Admin User Details ({email}):**\n```json\n{json.dumps(result, indent=2)}\n```"
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
