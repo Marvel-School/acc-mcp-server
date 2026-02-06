@@ -12,6 +12,9 @@ APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL")
 
+# OAuth Scopes - CRITICAL: viewables:read is required for Model Derivative API
+APS_SCOPES = "data:read data:write data:create bucket:read viewables:read"
+
 # API Base URLs
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
 BASE_URL_HQ_US = "https://developer.api.autodesk.com/hq/v1/accounts"
@@ -29,19 +32,18 @@ def get_token() -> str:
         raise ValueError("Error: APS credentials missing.")
 
     if time.time() < token_cache["expires_at"]:
+        logger.debug(f"Using cached token (expires in {int(token_cache['expires_at'] - time.time())}s)")
         return token_cache["access_token"]
 
-    logger.info("Refreshing APS Access Token...")
+    logger.info("🔄 Authenticating with scopes: " + APS_SCOPES)
     url = "https://developer.api.autodesk.com/authentication/v2/token"
-    
-    # Scopes required for the tool's operations
-    # CRITICAL: viewables:read is required for Model Derivative API (metadata endpoint)
+
     # Using POST Body for credentials to avoid 400 Bad Request
     data = {
         "client_id": APS_CLIENT_ID,
         "client_secret": APS_CLIENT_SECRET,
         "grant_type": "client_credentials",
-        "scope": "data:read data:write data:create bucket:read viewables:read"
+        "scope": APS_SCOPES  # Use the global constant
     }
 
     try:
@@ -60,3 +62,10 @@ def get_token() -> str:
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to get token: {e}")
         raise
+
+
+def clear_token_cache():
+    """Force clears the token cache to request a fresh token on next call."""
+    global token_cache
+    token_cache = {"access_token": None, "expires_at": 0}
+    logger.info("🗑️ Token cache cleared. Next API call will request fresh token.")

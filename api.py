@@ -10,6 +10,9 @@ from auth import get_token, BASE_URL_ACC, BASE_URL_HQ_US, BASE_URL_HQ_EU, BASE_U
 
 logger = logging.getLogger(__name__)
 
+# OAuth Scopes - CRITICAL: viewables:read is required for Model Derivative API
+APS_SCOPES = "data:read data:write data:create bucket:read viewables:read"
+
 # --- UTILS ---
 def clean_id(id_str: Optional[str]) -> str:
     return id_str.replace("b.", "") if id_str else ""
