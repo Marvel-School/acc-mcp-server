@@ -1194,42 +1194,132 @@ def get_model_metadata(version_urn: str, guid: Optional[str] = None) -> Union[Di
         logger.error(f"Metadata Exception: {str(e)}")
         return f"Error: {str(e)}"
 
-def inspect_generic_file(project_id: str, file_id: str) -> str:
+def resolve_file_to_urn(project_id: str, identifier: str) -> str:
     """
-    Smart file inspector with automatic URN resolution.
-    Automatically detects and converts Lineage URNs to Version URNs before inspection.
+    Smart file resolver that accepts either a URN or a filename.
+    Automatically searches for files by name if a URN is not provided.
 
     Args:
         project_id: The project ID
-        file_id: Either a Lineage URN (urn:adsk.wipp:dm.lineage:...) or Version URN (urn:adsk.wipp:fs.file:vf...)
+        identifier: Either a URN (urn:adsk...) or a filename (e.g., "MyFile.rvt")
+
+    Returns:
+        File URN (Lineage or Version)
+
+    Raises:
+        ValueError: If filename doesn't match any files
+    """
+    try:
+        # Check 1: It's already a URN
+        if identifier.startswith("urn:adsk"):
+            logger.info(f"  Identifier is already a URN")
+            return identifier
+
+        # Check 2: It's a filename - search for it
+        logger.info(f"  Identifier appears to be a filename, searching: {identifier}")
+
+        # Get hub_id for the search
+        hub_id = get_cached_hub_id()
+        if not hub_id:
+            raise ValueError("Could not determine hub_id for file search")
+
+        # Search for files with common extensions
+        # Try multiple extensions to increase match likelihood
+        extensions_to_try = ["rvt", "dwg", "nwc", "rcp", "ifc", "nwd"]
+
+        # Extract extension from identifier if present
+        if "." in identifier:
+            file_ext = identifier.split(".")[-1].lower()
+            # Put the matching extension first
+            if file_ext in extensions_to_try:
+                extensions_to_try.remove(file_ext)
+                extensions_to_try.insert(0, file_ext)
+
+        # Try first extension (most likely match)
+        search_extension = extensions_to_try[0]
+        files = find_design_files(hub_id, project_id, search_extension)
+
+        if isinstance(files, str):
+            raise ValueError(f"Error searching for files: {files}")
+
+        # Search for matching filename (case-insensitive)
+        identifier_lower = identifier.lower()
+
+        for file in files:
+            file_name = file.get("name", "").lower()
+
+            # Exact match or contains match
+            if identifier_lower == file_name or identifier_lower in file_name:
+                item_id = file.get("item_id")
+                if item_id:
+                    logger.info(f"  ✅ Found file: {file.get('name')} (ID: {item_id[:60]}...)")
+                    return item_id
+
+        # If not found with first extension, try others
+        for ext in extensions_to_try[1:]:
+            logger.info(f"  Trying extension: {ext}")
+            files = find_design_files(hub_id, project_id, ext)
+
+            if not isinstance(files, str):
+                for file in files:
+                    file_name = file.get("name", "").lower()
+                    if identifier_lower == file_name or identifier_lower in file_name:
+                        item_id = file.get("item_id")
+                        if item_id:
+                            logger.info(f"  ✅ Found file: {file.get('name')} (ID: {item_id[:60]}...)")
+                            return item_id
+
+        # Not found
+        raise ValueError(f"Could not find file matching '{identifier}' in project")
+
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.error(f"File Resolution Exception: {str(e)}")
+        raise ValueError(f"Error resolving file identifier: {str(e)}")
+
+def inspect_generic_file(project_id: str, file_id: str) -> str:
+    """
+    Smart file inspector with automatic name and URN resolution.
+    Accepts either a filename, Lineage URN, or Version URN.
+
+    Args:
+        project_id: The project ID
+        file_id: Either a filename (e.g., "MyFile.rvt"), Lineage URN, or Version URN
 
     Returns:
         Status message string
     """
     try:
-        logger.info(f"[Smart Inspector] Inspecting file: {file_id[:60]}...")
+        logger.info(f"[Smart Inspector] Inspecting file: {file_id[:60] if len(file_id) > 60 else file_id}...")
 
-        # Step 1: Auto-Resolve - Check if this is a Lineage URN
+        # Step 1: Resolve filename to URN if needed
+        try:
+            resolved_id = resolve_file_to_urn(project_id, file_id)
+        except ValueError as e:
+            return f"❌ {str(e)}"
+
+        # Step 2: Auto-Resolve - Check if this is a Lineage URN
         version_urn = None
 
-        if "lineage" in file_id:
+        if "lineage" in resolved_id:
             logger.info("  Detected Lineage URN - resolving to latest version...")
-            version_urn = get_latest_version_urn(project_id, file_id)
+            version_urn = get_latest_version_urn(project_id, resolved_id)
 
             if not version_urn:
                 return "❌ Error: Could not resolve Lineage URN to Version URN. File may not exist or has no versions."
 
-        elif "fs.file" in file_id or "version=" in file_id:
+        elif "fs.file" in resolved_id or "version=" in resolved_id:
             logger.info("  Detected Version URN - proceeding directly")
-            version_urn = file_id
+            version_urn = resolved_id
         else:
             # Assume it might be a lineage URN without obvious markers
             logger.info("  URN type unclear - attempting resolution...")
-            version_urn = get_latest_version_urn(project_id, file_id)
+            version_urn = get_latest_version_urn(project_id, resolved_id)
 
             if not version_urn:
                 # If resolution fails, try using it as-is
-                version_urn = file_id
+                version_urn = resolved_id
 
         # Step 2: Encode the URN (Base64, strip padding)
         encoded_urn = safe_b64encode(version_urn)
@@ -1270,4 +1360,87 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
 
     except Exception as e:
         logger.error(f"File Inspection Exception: {str(e)}")
+        return f"❌ Error: {str(e)}"
+
+def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, Any], str]:
+    """
+    Fetches the complete object tree (hierarchy) for a translated model.
+    Accepts filename, Lineage URN, or Version URN.
+
+    Args:
+        project_id: The project ID
+        file_identifier: Filename (e.g., "MyFile.rvt"), Lineage URN, or Version URN
+
+    Returns:
+        Object tree data dict or error string
+    """
+    try:
+        logger.info(f"[Data Extraction] Fetching object tree for: {file_identifier[:60] if len(file_identifier) > 60 else file_identifier}...")
+
+        # Step 1: Resolve filename to URN if needed
+        try:
+            resolved_id = resolve_file_to_urn(project_id, file_identifier)
+        except ValueError as e:
+            return f"❌ {str(e)}"
+
+        # Step 2: Auto-resolve if this is a Lineage URN
+        resolved_urn = resolved_id
+        if "lineage" in resolved_id:
+            logger.info("  Resolving Lineage URN to Version URN...")
+            resolved_urn = get_latest_version_urn(project_id, resolved_id)
+            if not resolved_urn:
+                return "❌ Error: Could not resolve URN to version"
+
+        # Step 2: Encode the URN (Base64, no padding)
+        encoded_urn = safe_b64encode(resolved_urn)
+
+        # Get auth token
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Step 3: Get metadata to find the view GUID
+        metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
+        resp = requests.get(metadata_url, headers=headers)
+
+        if resp.status_code == 404:
+            return "❌ Model not found or not yet translated. Run inspect_file first to check translation status."
+
+        if resp.status_code != 200:
+            logger.error(f"Metadata API Error {resp.status_code}: {resp.text}")
+            return f"❌ Error {resp.status_code}: {resp.text}"
+
+        # Extract the first view GUID
+        metadata = resp.json()
+        views = metadata.get("data", {}).get("metadata", [])
+
+        if not views:
+            return "❌ No 3D views found in this model. It may not contain extractable geometry."
+
+        guid = views[0].get("guid")
+        view_name = views[0].get("name", "Unknown")
+        logger.info(f"  Using view: {view_name} (GUID: {guid})")
+
+        # Step 4: Get the object tree for this view
+        tree_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}"
+
+        # Important: Add forceget=true to ensure we get the full tree
+        # The API handles GZIP compression automatically via requests library
+        resp_tree = requests.get(tree_url, headers=headers, params={"forceget": "true"})
+
+        if resp_tree.status_code == 202:
+            return "⏳ Object tree is still being processed. Please wait a moment and try again."
+
+        if resp_tree.status_code != 200:
+            logger.error(f"Object Tree API Error {resp_tree.status_code}: {resp_tree.text}")
+            return f"❌ Error {resp_tree.status_code}: Failed to fetch object tree"
+
+        # Return the full JSON data
+        tree_data = resp_tree.json()
+        object_count = len(tree_data.get("data", {}).get("objects", []))
+        logger.info(f"✅ Successfully fetched object tree with {object_count} root objects")
+
+        return tree_data
+
+    except Exception as e:
+        logger.error(f"Object Tree Exception: {str(e)}")
         return f"❌ Error: {str(e)}"

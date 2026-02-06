@@ -44,7 +44,8 @@ from api import (
     get_latest_version_urn,
     get_model_manifest,
     get_model_metadata,
-    inspect_generic_file
+    inspect_generic_file,
+    fetch_object_tree
 )
 
 # Initialize Logging
@@ -327,17 +328,24 @@ def find_files(project_name: Optional[str] = None, project_id: Optional[str] = N
 @mcp.tool()
 def inspect_file(project_id: str, file_id: str) -> str:
     """
-    Smart file inspector with automatic URN resolution.
-    Automatically detects and handles both Lineage URNs and Version URNs.
+    Smart file inspector with automatic name and URN resolution.
+    Accepts file by **ID OR Name** - no need to find the URN manually!
 
     Args:
         project_id: The project ID
-        file_id: Either Item ID (Lineage URN) or Version URN
-                 - Lineage: urn:adsk.wipp:dm.lineage:...
-                 - Version: urn:adsk.wipp:fs.file:vf...
+        file_id: Can be ANY of the following:
+                 - Filename: "MyFile.rvt", "Grasbaan102026.rvt"
+                 - Lineage URN: urn:adsk.wipp:dm.lineage:...
+                 - Version URN: urn:adsk.wipp:fs.file:vf...
 
-    The tool will automatically convert Lineage URNs to Version URNs before inspection.
-    Returns translation status (Ready, Processing, Failed, Not Translated, etc.)
+    Examples:
+        inspect_file(proj_id, "Grasbaan102026.rvt")  ← Just use the filename!
+        inspect_file(proj_id, "urn:adsk.wipp:dm.lineage:...")  ← Or use the URN
+
+    The tool automatically:
+    - Searches for files by name if a filename is provided
+    - Converts Lineage URNs to Version URNs
+    - Returns translation status (Ready, Processing, Failed, Not Translated, etc.)
     """
     return inspect_generic_file(project_id, file_id)
 
@@ -565,19 +573,19 @@ def get_model_tree(project_id: str, file_id: str) -> str:
     headers = {"Authorization": f"Bearer {token}"}
     urn = safe_b64encode(version_id)
     resp = requests.get(f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn}/metadata", headers=headers)
-    
+
     if resp.status_code == 404: return "❌ File found, but it has no metadata. (Has it been fully processed in the viewer?)"
     if resp.status_code != 200: return f"❌ Autodesk API Error ({resp.status_code}): {resp.text}"
-        
+
     data = resp.json().get("data", {}).get("metadata", [])
     if not data: return "❌ No 3D views found."
     guid = data[0]["guid"]
-    
+
     resp_tree = requests.get(f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn}/metadata/{guid}", headers=headers, params={"forceget": "true"})
-    
+
     if resp_tree.status_code == 202: return "⏳ The Model Tree is currently processing. Please try again in 1 minute."
     if resp_tree.status_code != 200: return f"❌ Failed to retrieve object tree (Status: {resp_tree.status_code})."
-    
+
     try:
         objects = resp_tree.json().get("data", {}).get("objects", [])
         categories = {}
@@ -586,12 +594,87 @@ def get_model_tree(project_id: str, file_id: str) -> str:
                 if "objects" in node:
                     categories[node.get("name", "Unknown")] = categories.get(node.get("name", "Unknown"), 0) + len(node["objects"])
         if objects: traverse(objects[0].get("objects", []))
-        
+
         output = f"🏗️ **Model Structure (View GUID: `{guid}`):**\n"
         for cat, count in sorted(categories.items(), key=lambda item: item[1], reverse=True)[:15]:
             output += f"- **{cat}**: {count} items\n"
         return output
     except Exception as e: return f"❌ Parsing Error: {str(e)}"
+
+@mcp.tool()
+def count_elements(project_id: str, file_id: str, category_name: str) -> str:
+    """
+    Counts elements in a model that match a specific category.
+    Traverses the full object tree hierarchy to find and count matching elements.
+    Accepts file by ID OR Name!
+
+    Args:
+        project_id: The project ID
+        file_id: Filename (e.g., "MyFile.rvt") OR URN (Lineage/Version)
+        category_name: Category to search for (e.g., "Walls", "Doors", "Windows")
+
+    Examples:
+        count_elements(proj_id, "Grasbaan102026.rvt", "Walls")  ← Use filename!
+        count_elements(proj_id, "urn:adsk.wipp...", "Doors")     ← Or URN
+
+    Note: Search is case-insensitive and matches partial names.
+    """
+    try:
+        logger.info(f"Counting elements in category: {category_name}")
+
+        # Step 1: Fetch the object tree
+        tree_data = fetch_object_tree(project_id, file_id)
+
+        # Check if we got an error string instead of data
+        if isinstance(tree_data, str):
+            return tree_data
+
+        # Step 2: Extract objects from the tree
+        objects = tree_data.get("data", {}).get("objects", [])
+
+        if not objects:
+            return "❌ No objects found in model. The model may be empty or not properly translated."
+
+        # Step 3: Recursive traversal to count matching elements
+        category_lower = category_name.lower()
+        match_count = 0
+        total_objects = 0
+
+        def traverse(nodes, depth=0):
+            nonlocal match_count, total_objects
+
+            for node in nodes:
+                total_objects += 1
+                node_name = node.get("name", "").lower()
+
+                # Check if node name contains the category name
+                if category_lower in node_name:
+                    match_count += 1
+                    logger.debug(f"  Match found: {node.get('name', 'Unknown')} (depth {depth})")
+
+                # Traverse nested objects
+                if "objects" in node and isinstance(node["objects"], list):
+                    traverse(node["objects"], depth + 1)
+
+        # Start traversal from root
+        logger.info(f"  Starting recursive traversal...")
+        traverse(objects)
+
+        # Step 4: Format output
+        if match_count == 0:
+            return f"❌ No elements found matching category '{category_name}'.\n\nSearched {total_objects} total objects. Try a different category name or check the model structure with get_model_tree."
+
+        output = f"✅ **Element Count Results:**\n\n"
+        output += f"**Category:** {category_name}\n"
+        output += f"**Matches Found:** {match_count}\n"
+        output += f"**Total Objects Searched:** {total_objects}\n"
+
+        logger.info(f"✅ Found {match_count} elements matching '{category_name}'")
+        return output
+
+    except Exception as e:
+        logger.error(f"Element Count Exception: {str(e)}")
+        return f"❌ Error counting elements: {str(e)}"
 
 # ==========================================
 # ADMIN TOOLS
