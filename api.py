@@ -1512,6 +1512,63 @@ def fetch_object_tree(project_id: str, file_identifier: str) -> Union[Dict[str, 
         return f"❌ Error: {str(e)}"
 
 
+def get_view_guid_only(version_urn: str) -> Union[str, None]:
+    """
+    Lightweight function to fetch only the view GUID from a model.
+    Does NOT download the full object tree - only fetches the metadata list.
+
+    Args:
+        version_urn: The version URN (e.g., urn:adsk.wipp:fs.file:vf...)
+
+    Returns:
+        View GUID (str) or None if not found
+    """
+    try:
+        logger.info(f"[Lightweight GUID Fetch] Getting view GUID for model...")
+
+        # Step 1: Encode the URN (Base64, no padding)
+        encoded_urn = safe_b64encode(version_urn)
+
+        # Step 2: Get auth token
+        token = get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-ads-region": "EMEA"
+        }
+
+        # Step 3: Call metadata endpoint (LIGHTWEIGHT - returns only view list, not object tree)
+        metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
+
+        logger.info(f"  Calling: GET {metadata_url}")
+        resp = requests.get(metadata_url, headers=headers, timeout=30)
+
+        if resp.status_code == 404:
+            logger.error("Model not found or not yet translated")
+            return None
+
+        if resp.status_code != 200:
+            logger.error(f"Metadata API Error {resp.status_code}: {resp.text}")
+            return None
+
+        # Step 4: Extract the first view GUID from the metadata list
+        metadata = resp.json()
+        views = metadata.get("data", {}).get("metadata", [])
+
+        if not views:
+            logger.error("No 3D views found in model metadata")
+            return None
+
+        guid = views[0].get("guid")
+        view_name = views[0].get("name", "Unknown")
+
+        logger.info(f"✅ Found view: {view_name} (GUID: {guid})")
+        return guid
+
+    except Exception as e:
+        logger.error(f"Error fetching view GUID: {str(e)}")
+        return None
+
+
 def query_model_elements(project_id: str, file_identifier: str, category_name: str) -> Union[int, str]:
     """
     Queries a model for elements matching a category using server-side filtering.
@@ -1542,37 +1599,17 @@ def query_model_elements(project_id: str, file_identifier: str, category_name: s
             if not resolved_urn:
                 return "❌ Error: Could not resolve URN to version"
 
-        # Step 3: Encode the URN (Base64, no padding)
+        # Step 3: Get view GUID (lightweight - no object tree download)
+        guid = get_view_guid_only(resolved_urn)
+
+        if not guid:
+            return "❌ Could not get view GUID. Model may not be translated or may not contain 3D views."
+
+        # Step 4: Encode the URN for the query endpoint
         encoded_urn = safe_b64encode(resolved_urn)
 
         # Get auth token
         token = get_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-ads-region": "EMEA"
-        }
-
-        # Step 4: Get metadata to find the view GUID
-        metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata"
-        resp = requests.get(metadata_url, headers=headers)
-
-        if resp.status_code == 404:
-            return "❌ Model not found or not yet translated. Run inspect_file first to check translation status."
-
-        if resp.status_code != 200:
-            logger.error(f"Metadata API Error {resp.status_code}: {resp.text}")
-            return f"❌ Error {resp.status_code}: {resp.text}"
-
-        # Extract the first view GUID
-        metadata = resp.json()
-        views = metadata.get("data", {}).get("metadata", [])
-
-        if not views:
-            return "❌ No 3D views found in this model. It may not contain extractable geometry."
-
-        guid = views[0].get("guid")
-        view_name = views[0].get("name", "Unknown")
-        logger.info(f"  Using view: {view_name} (GUID: {guid})")
 
         # Step 5: Execute server-side query
         query_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded_urn}/metadata/{guid}/properties:query"
