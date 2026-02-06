@@ -47,18 +47,89 @@ def make_api_request(url: str):
         return f"Error: {str(e)}"
 
 def make_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None):
-    """Wrapper for GraphQL requests."""
+    """
+    Wrapper for AEC GraphQL requests.
+    Critical: GraphQL returns 200 OK even with errors - must check response.data.errors.
+    """
     try:
         token = get_token()
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        resp = requests.post(BASE_URL_GRAPHQL, headers=headers, json={"query": query, "variables": variables or {}})
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "x-ads-region": "EMEA"
+        }
+        payload = {"query": query, "variables": variables or {}}
+        resp = requests.post(BASE_URL_GRAPHQL, headers=headers, json=payload)
+
         if resp.status_code != 200:
-            logger.warning(f"GraphQL Error {resp.status_code}: {resp.text}")
+            logger.warning(f"GraphQL HTTP Error {resp.status_code}: {resp.text}")
             return f"GraphQL Error {resp.status_code}: {resp.text}"
-        return resp.json().get("data", {})
+
+        json_data = resp.json()
+
+        # Critical: GraphQL returns 200 even on errors - check errors field
+        if "errors" in json_data:
+            error_messages = [err.get("message", str(err)) for err in json_data["errors"]]
+            error_str = "; ".join(error_messages)
+            logger.error(f"GraphQL Query Errors: {error_str}")
+            return f"GraphQL Query Error: {error_str}"
+
+        return json_data.get("data", {})
     except Exception as e:
         logger.error(f"GraphQL Exception: {str(e)}")
         return f"GraphQL Exception: {str(e)}"
+
+def get_hubs_aec() -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches all hubs using AEC Data Model GraphQL API.
+    Returns list of hubs or error string.
+    """
+    query = """
+    query {
+        hubs {
+            results {
+                id
+                name
+            }
+        }
+    }
+    """
+    result = make_graphql_request(query)
+
+    if isinstance(result, str):
+        return result
+
+    if not result or "hubs" not in result:
+        return "No hubs data returned from GraphQL API"
+
+    return result["hubs"].get("results", [])
+
+def get_projects_aec(hub_id: str) -> Union[List[Dict[str, Any]], str]:
+    """
+    Fetches all projects for a given hub using AEC Data Model GraphQL API.
+    Returns list of projects or error string.
+    """
+    query = """
+    query($hubId: ID!) {
+        projects(hubId: $hubId) {
+            results {
+                id
+                name
+                hubId
+            }
+        }
+    }
+    """
+    variables = {"hubId": hub_id}
+    result = make_graphql_request(query, variables)
+
+    if isinstance(result, str):
+        return result
+
+    if not result or "projects" not in result:
+        return f"No projects data returned for hub {hub_id}"
+
+    return result["projects"].get("results", [])
 
 # --- CACHE ---
 # Cache for hub_id to avoid repeated calls

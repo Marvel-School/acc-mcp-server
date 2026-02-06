@@ -31,7 +31,9 @@ from api import (
     get_project_assets,
     get_account_users,
     invite_user_to_project,
-    get_account_user_details
+    get_account_user_details,
+    get_hubs_aec,
+    get_projects_aec
 )
 
 # Initialize Logging
@@ -104,7 +106,47 @@ def list_projects(hub_id: Optional[str] = None, name_filter: Optional[str] = Non
         
     if len(all_projs) > limit:
         output += f"\n*(Displaying {limit} of {len(all_projs)} results. Use 'name_filter' to refine.)*"
-        
+
+    return output
+
+@mcp.tool()
+def list_aec_hubs() -> str:
+    """
+    Lists all hubs using AEC Data Model GraphQL API.
+    Alternative to list_hubs() using GraphQL instead of REST.
+    """
+    result = get_hubs_aec()
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return "No hubs found."
+
+    output = "🏢 **Hubs (via AEC GraphQL):**\n"
+    for hub in result:
+        output += f"- {hub.get('name', 'Unknown')} (ID: `{hub.get('id')}`)\n"
+
+    return output
+
+@mcp.tool()
+def list_aec_projects(hub_id: str) -> str:
+    """
+    Lists all projects for a hub using AEC Data Model GraphQL API.
+    Alternative to list_projects() using GraphQL instead of REST.
+    """
+    result = get_projects_aec(hub_id)
+
+    if isinstance(result, str):
+        return f"❌ Error: {result}"
+
+    if not result:
+        return f"No projects found for hub {hub_id}."
+
+    output = f"📂 **Projects for Hub {hub_id} (via AEC GraphQL):**\n"
+    for project in result:
+        output += f"- **{project.get('name', 'Unknown')}**\n  ID: `{project.get('id')}`\n"
+
     return output
 
 # ==========================================
