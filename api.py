@@ -1230,3 +1230,42 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
     except Exception as e:
         logger.error(f"Translation Trigger Exception: {str(e)}")
         return f"Error: {str(e)}"
+
+
+# ==========================================================================
+# HUB & PROJECT MANAGEMENT
+# ==========================================================================
+
+
+def get_hubs() -> list:
+    """Fetches all accessible Hubs (BIM 360 / ACC) for the authenticated user."""
+    url = "https://developer.api.autodesk.com/project/v1/hubs"
+    resp = _make_request("GET", url, timeout=30)
+    if resp.status_code != 200:
+        logger.error(f"get_hubs failed ({resp.status_code}): {resp.text}")
+        return []
+    return resp.json().get("data", [])
+
+
+def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
+    """
+    Creates a new project in the specified Hub.
+
+    Args:
+        hub_id: The Hub ID (must start with 'b.').
+        project_name: The name of the project.
+        project_type: 'BIM360' or 'ACC'.
+    """
+    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
+    payload = {
+        "jsonapi": {"version": "1.0"},
+        "data": {
+            "type": "projects",
+            "attributes": {
+                "name": project_name,
+                "projectType": project_type,
+            },
+        },
+    }
+    resp = _make_request("POST", url, json=payload, timeout=30)
+    return resp.json()

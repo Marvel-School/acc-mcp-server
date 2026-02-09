@@ -8,6 +8,8 @@ from api import (
     get_latest_version_urn,
     trigger_translation,
     stream_count_elements,
+    get_hubs,
+    create_acc_project,
 )
 
 # Logging
@@ -155,6 +157,48 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
     except Exception as e:
         logger.error(f"count_elements failed: {e}")
         return f"Error scanning model: {e}"
+
+
+@mcp.tool()
+def list_hubs() -> str:
+    """
+    Lists all Autodesk Hubs (BIM 360 / ACC) accessible to the Agent.
+    Use this to find the 'hub_id' needed for creating projects.
+    """
+    try:
+        hubs = get_hubs()
+        if not hubs:
+            return "No hubs found. Check your Autodesk account permissions."
+
+        report = "Found Hubs:\n"
+        for hub in hubs:
+            name = hub.get("attributes", {}).get("name", "Unknown")
+            hub_id = hub.get("id")
+            report += f"- {name} (ID: {hub_id})\n"
+
+        return report
+    except Exception as e:
+        logger.error(f"list_hubs failed: {e}")
+        return f"Failed to list hubs: {e}"
+
+
+@mcp.tool()
+def create_project(hub_id: str, name: str, project_type: str = "BIM360") -> str:
+    """
+    Creates a new project in the specified Hub.
+
+    Args:
+        hub_id:       The Hub ID (starts with 'b.'). Use 'list_hubs' to find this.
+        name:         The name of the new project.
+        project_type: 'ACC' or 'BIM360' (Default: BIM360).
+    """
+    try:
+        result = create_acc_project(hub_id, name, project_type)
+        new_id = result.get("data", {}).get("id")
+        return f"Project '{name}' created successfully! ID: {new_id}"
+    except Exception as e:
+        logger.error(f"create_project failed: {e}")
+        return f"Failed to create project: {e}"
 
 
 # ==========================================================================
