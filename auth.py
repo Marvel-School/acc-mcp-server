@@ -10,6 +10,14 @@ APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL")
 
+# Fail fast — crash the container immediately if credentials are missing.
+# This prevents a "healthy" container that silently fails on every API call.
+if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
+    raise SystemExit(
+        "FATAL: APS_CLIENT_ID and APS_CLIENT_SECRET environment variables are required. "
+        "Copy .env.example to .env and fill in your Autodesk credentials."
+    )
+
 # OAuth Scopes — viewables:read is required for Model Derivative API
 APS_SCOPES = "data:read data:write data:create bucket:read viewables:read"
 
@@ -37,9 +45,6 @@ def get_token(force_refresh: bool = False) -> str:
         ValueError: If APS credentials are not configured.
         requests.exceptions.RequestException: If the token request fails.
     """
-    if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
-        raise ValueError("APS_CLIENT_ID and APS_CLIENT_SECRET must be set as environment variables.")
-
     # Return cached token if still valid and not forcing refresh
     if not force_refresh and time.time() < _token_cache["expires_at"]:
         logger.debug(f"Using cached token (expires in {int(_token_cache['expires_at'] - time.time())}s)")
