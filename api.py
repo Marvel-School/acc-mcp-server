@@ -1640,31 +1640,40 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     """
     logger.info(f"[Streaming Element Counter] Counting elements matching: {category_name}")
 
-    # Step 1: Get View GUID (lightweight - no object tree download)
+    # Step 1: Generate search terms (smart singularization)
+    # Build a set of terms: original + auto-singularized form
+    terms = {category_name}
+
+    # Auto-singularize: if the category ends with "s", also search without the trailing "s"
+    if category_name.lower().endswith("s") and len(category_name) > 2:
+        terms.add(category_name[:-1])
+
+    logger.info(f"  Scanning stream for terms: {list(terms)} ...")
+
+    # Step 2: Get View GUID (lightweight - no object tree download)
     guid = get_view_guid_only(version_urn)
     logger.info(f"  Using View GUID: {guid}")
 
-    # Step 2: Encode URN for metadata endpoint
+    # Step 3: Encode URN for metadata endpoint
     urn_b64 = safe_b64encode(version_urn)
     metadata_url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata/{guid}"
 
-    # Step 3: Get auth token
+    # Step 4: Get auth token
     token = get_token()
 
-    # Step 4: Prepare headers
+    # Step 5: Prepare headers
     headers = {
         "Authorization": f"Bearer {token}",
         "x-ads-region": "EMEA"
     }
 
-    logger.info(f"  Streaming metadata to scan for: {category_name}")
-    logger.info(f"  URL: {metadata_url}")
+    logger.info(f"  Streaming metadata URL: {metadata_url}")
 
-    # Step 5: Regex pattern to find "name" fields containing the category
-    # Pattern: "name"\s*:\s*"[^"]*CategoryName[^"]*"
-    # Case insensitive flag (?i)
-    # Use re.escape to properly handle special regex characters in category_name
-    pattern = re.compile(rb'"name"\s*:\s*"[^"]*' + re.escape(category_name).encode() + rb'[^"]*"', re.IGNORECASE)
+    # Step 6: Build composite regex (OR logic for all terms)
+    # Pattern: :\s*"[^"]*(TermA|TermB)[^"]*"
+    # Matches any JSON value that contains any of the terms (case-insensitive)
+    terms_pattern = b'|'.join([re.escape(t).encode() for t in terms])
+    pattern = re.compile(rb':\s*"[^"]*(' + terms_pattern + rb')[^"]*"', re.IGNORECASE)
 
     count = 0
     buffer = b""

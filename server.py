@@ -641,7 +641,7 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
 
         # Return success message
         logger.info(f"✅ Streaming scan complete. Found {count} elements.")
-        return f"✅ Scanned model data stream (SVF). Found {count} items matching '{category_name}'."
+        return f"✅ Smart Scan Complete. Found {count} items matching '{category_name}' (or singular variations)."
 
     except ValueError as ve:
         # These are user-friendly errors from the API functions
