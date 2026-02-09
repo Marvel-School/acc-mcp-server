@@ -9,7 +9,12 @@ from api import (
     trigger_translation,
     stream_count_elements,
     get_hubs,
+    get_projects,
+    get_top_folders,
+    get_folder_contents,
     create_acc_project,
+    get_project_users,
+    add_project_user,
 )
 
 # Logging
@@ -22,7 +27,7 @@ PORT = int(os.environ.get("PORT", 8000))
 
 
 # ==========================================================================
-# TOOLS
+# DISCOVERY TOOLS
 # ==========================================================================
 
 
@@ -58,6 +63,118 @@ def find_project(name_query: str) -> str:
 
 
 @mcp.tool()
+def list_hubs() -> str:
+    """
+    Lists all Autodesk Hubs (BIM 360 / ACC) accessible to the service account.
+    Use this to find the hub_id needed for list_projects or create_project.
+    """
+    try:
+        hubs = get_hubs()
+        if not hubs:
+            return "No hubs found. Check your Autodesk account permissions."
+
+        report = "Found Hubs:\n"
+        for hub in hubs:
+            name = hub.get("attributes", {}).get("name", "Unknown")
+            hub_id = hub.get("id")
+            report += f"- {name} (ID: {hub_id})\n"
+        return report
+    except Exception as e:
+        logger.error(f"list_hubs failed: {e}")
+        return f"Failed to list hubs: {e}"
+
+
+@mcp.tool()
+def list_projects(hub_id: str) -> str:
+    """
+    Lists all projects in a hub.
+
+    Args:
+        hub_id: The Hub ID (starts with 'b.'). Use list_hubs to find this.
+    """
+    try:
+        projects = get_projects(hub_id)
+        if not projects:
+            return f"No projects found in hub {hub_id}."
+
+        report = f"Found {len(projects)} Projects:\n"
+        for p in projects:
+            name = p.get("attributes", {}).get("name", "Unknown")
+            pid = p.get("id")
+            report += f"- {name} (ID: {pid})\n"
+        return report
+    except Exception as e:
+        logger.error(f"list_projects failed: {e}")
+        return f"Failed to list projects: {e}"
+
+
+# ==========================================================================
+# FILE & FOLDER NAVIGATION
+# ==========================================================================
+
+
+@mcp.tool()
+def list_top_folders(hub_id: str, project_id: str) -> str:
+    """
+    Lists top-level folders in a project (e.g. 'Project Files', 'Plans').
+    This is the starting point for navigating a project's file structure.
+
+    Args:
+        hub_id:     The Hub ID (starts with 'b.').
+        project_id: The Project ID (from find_project or list_projects).
+    """
+    try:
+        folders = get_top_folders(hub_id, project_id)
+        if isinstance(folders, str):
+            return f"Error: {folders}"
+        if not folders:
+            return "No top-level folders found."
+
+        report = "Top Folders:\n"
+        for f in folders:
+            name = f.get("name") or f.get("attributes", {}).get("displayName", "Unknown")
+            fid = f.get("id")
+            report += f"- {name} (ID: {fid})\n"
+        return report
+    except Exception as e:
+        logger.error(f"list_top_folders failed: {e}")
+        return f"Failed to list folders: {e}"
+
+
+@mcp.tool()
+def list_folder_contents(project_id: str, folder_id: str) -> str:
+    """
+    Lists files and subfolders inside a folder.
+    Use list_top_folders first, then drill down with this tool.
+
+    Args:
+        project_id: The Project ID.
+        folder_id:  The Folder ID (from list_top_folders or a previous list_folder_contents call).
+    """
+    try:
+        items = get_folder_contents(project_id, folder_id)
+        if isinstance(items, str):
+            return f"Error: {items}"
+        if not items:
+            return "Folder is empty."
+
+        report = f"Folder Contents ({len(items)} items):\n"
+        for item in items:
+            name = item.get("name") or item.get("attributes", {}).get("displayName", "Unknown")
+            iid = item.get("id")
+            item_type = item.get("itemType") or item.get("type", "unknown")
+            icon = "[folder]" if item_type in ("folder", "folders") else "[file]"
+            report += f"  {icon} {name} (ID: {iid})\n"
+            tip = item.get("tipVersionUrn")
+            if tip:
+                report += f"         Version URN: {tip}\n"
+        return report
+    except Exception as e:
+        logger.error(f"list_folder_contents failed: {e}")
+        return f"Failed to list folder contents: {e}"
+
+
+@mcp.tool()
 def inspect_file(project_id: str, file_id: str) -> str:
     """
     Inspect a file's translation/processing status in the Model Derivative service.
@@ -68,15 +185,17 @@ def inspect_file(project_id: str, file_id: str) -> str:
     Args:
         project_id: The project ID (from find_project).
         file_id:    Filename (e.g. "MyFile.rvt"), lineage URN, or version URN.
-
-    Returns:
-        Human-readable translation status report.
     """
     try:
         return inspect_generic_file(project_id, file_id)
     except Exception as e:
         logger.error(f"inspect_file failed: {e}")
         return f"Error inspecting file: {e}"
+
+
+# ==========================================================================
+# MODEL TOOLS
+# ==========================================================================
 
 
 @mcp.tool()
@@ -91,22 +210,17 @@ def reprocess_file(project_id: str, file_id: str) -> str:
         project_id: The project ID (from find_project).
         file_id:    Filename (e.g. "MyFile.rvt"), lineage URN, or version URN.
 
-    Returns:
-        Confirmation that the job was started, or an error message.
-        Translation typically takes 5-10 minutes. Use inspect_file to check progress.
+    Note: Translation typically takes 5-10 minutes. Use inspect_file to check progress.
     """
     try:
-        # Resolve filename/URN -> lineage URN
         lineage_urn = resolve_file_to_urn(project_id, file_id)
         if not lineage_urn or not lineage_urn.startswith("urn:"):
             return f"Error: Could not resolve '{file_id}' to a valid lineage URN."
 
-        # Lineage URN -> version URN
         version_urn = get_latest_version_urn(project_id, lineage_urn)
         if not version_urn or not version_urn.startswith("urn:"):
             return f"Error: Could not resolve lineage URN to a version URN."
 
-        # Trigger translation
         result = trigger_translation(version_urn)
         if isinstance(result, str):
             return result
@@ -134,22 +248,16 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
         project_id:    The project ID (from find_project).
         file_id:       Filename (e.g. "MyFile.rvt"), lineage URN, or version URN.
         category_name: Category to count (e.g. "Walls", "Doors", "Windows", "Floors").
-
-    Returns:
-        The number of matching elements, or an error message.
     """
     try:
-        # Resolve filename/URN -> lineage URN
         lineage_urn = resolve_file_to_urn(project_id, file_id)
         if not lineage_urn or not lineage_urn.startswith("urn:"):
             return f"Error: Could not resolve '{file_id}' to a valid URN."
 
-        # Lineage URN -> version URN
         version_urn = get_latest_version_urn(project_id, lineage_urn)
         if not version_urn or not version_urn.startswith("urn:"):
             return f"Error: Could not resolve to a version URN."
 
-        # Stream and count
         count = stream_count_elements(version_urn, category_name)
         return f"Found {count} elements matching '{category_name}' (including singular variations)."
     except ValueError as ve:
@@ -159,46 +267,95 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
         return f"Error scanning model: {e}"
 
 
-@mcp.tool()
-def list_hubs() -> str:
-    """
-    Lists all Autodesk Hubs (BIM 360 / ACC) accessible to the Agent.
-    Use this to find the 'hub_id' needed for creating projects.
-    """
-    try:
-        hubs = get_hubs()
-        if not hubs:
-            return "No hubs found. Check your Autodesk account permissions."
-
-        report = "Found Hubs:\n"
-        for hub in hubs:
-            name = hub.get("attributes", {}).get("name", "Unknown")
-            hub_id = hub.get("id")
-            report += f"- {name} (ID: {hub_id})\n"
-
-        return report
-    except Exception as e:
-        logger.error(f"list_hubs failed: {e}")
-        return f"Failed to list hubs: {e}"
+# ==========================================================================
+# PROJECT MANAGEMENT
+# ==========================================================================
 
 
 @mcp.tool()
-def create_project(hub_id: str, name: str, project_type: str = "BIM360") -> str:
+def create_project(hub_id_or_name: str, name: str, project_type: str = "BIM360") -> str:
     """
     Creates a new project in the specified Hub.
 
+    Smart feature: accepts a Hub ID ('b.xxx') OR a Hub Name.
+    If a name is provided, it automatically resolves it to the correct hub_id.
+
     Args:
-        hub_id:       The Hub ID (starts with 'b.'). Use 'list_hubs' to find this.
-        name:         The name of the new project.
-        project_type: 'ACC' or 'BIM360' (Default: BIM360).
+        hub_id_or_name: Hub ID (starts with 'b.') OR Hub name (e.g. "TBI Holding").
+        name:           The name of the new project.
+        project_type:   'ACC' or 'BIM360' (Default: BIM360).
     """
     try:
-        result = create_acc_project(hub_id, name, project_type)
+        real_hub_id = hub_id_or_name
+
+        if not real_hub_id.startswith("b."):
+            hubs = get_hubs()
+            found = None
+            for h in hubs:
+                h_name = h.get("attributes", {}).get("name", "")
+                if h_name.lower() == hub_id_or_name.lower():
+                    found = h.get("id")
+                    break
+            if found:
+                real_hub_id = found
+            else:
+                return f"Could not find a hub named '{hub_id_or_name}'. Run list_hubs to see valid names."
+
+        result = create_acc_project(real_hub_id, name, project_type)
         new_id = result.get("data", {}).get("id")
         return f"Project '{name}' created successfully! ID: {new_id}"
     except Exception as e:
         logger.error(f"create_project failed: {e}")
         return f"Failed to create project: {e}"
+
+
+@mcp.tool()
+def list_project_users(project_id: str) -> str:
+    """
+    Lists users assigned to a project (requires Admin permissions).
+
+    Args:
+        project_id: The Project ID.
+    """
+    try:
+        users = get_project_users(project_id)
+        if not users:
+            return f"No users found in project {project_id} (or insufficient permissions)."
+
+        report = f"Project Members ({len(users)}):\n"
+        for u in users[:30]:
+            name = u.get("name", u.get("email", "Unknown"))
+            email = u.get("email", "")
+            report += f"- {name} ({email})\n"
+
+        if len(users) > 30:
+            report += f"\n(Showing 30 of {len(users)} users)"
+        return report
+    except Exception as e:
+        logger.error(f"list_project_users failed: {e}")
+        return f"Failed to list project users: {e}"
+
+
+@mcp.tool()
+def add_user(project_id: str, email: str, products: str = "projectAdministration,docs") -> str:
+    """
+    Adds a user to a project by email.
+
+    Args:
+        project_id: The Project ID.
+        email:      The user's email address.
+        products:   Comma-separated product keys to grant access to.
+                    Default: "projectAdministration,docs".
+                    Options: projectAdministration, docs, build, cost, insight, etc.
+    """
+    try:
+        product_list = [p.strip() for p in products.split(",") if p.strip()]
+        result = add_project_user(project_id, email, product_list)
+        user_id = result.get("id", "unknown")
+        return f"User '{email}' added to project. User ID: {user_id}"
+    except Exception as e:
+        logger.error(f"add_user failed: {e}")
+        return f"Failed to add user: {e}"
 
 
 # ==========================================================================

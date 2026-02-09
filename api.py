@@ -1269,3 +1269,55 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     }
     resp = _make_request("POST", url, json=payload, timeout=30)
     return resp.json()
+
+
+# ==========================================================================
+# NAVIGATION TOOLS
+# ==========================================================================
+
+
+def get_projects(hub_id: str) -> list:
+    """List all projects in a hub."""
+    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
+    resp = _make_request("GET", url, timeout=30)
+    if resp.status_code != 200:
+        logger.error(f"get_projects failed ({resp.status_code}): {resp.text}")
+        return []
+    return resp.json().get("data", [])
+
+
+# NOTE: get_top_folders and get_folder_contents already defined earlier in this file
+# (lines ~277 and ~302) with full b-prefix handling and URN extraction.
+
+
+# ==========================================================================
+# ADMIN TOOLS
+# ==========================================================================
+
+
+def get_project_users(project_id: str) -> list:
+    """List users in a project (requires Admin)."""
+    url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{project_id}/users"
+    resp = _make_request("GET", url, timeout=30)
+    if resp.status_code != 200:
+        logger.error(f"get_project_users failed ({resp.status_code}): {resp.text}")
+        return []
+    return resp.json().get("results", [])
+
+
+def add_project_user(project_id: str, email: str, products: list) -> dict:
+    """
+    Add a user to a project.
+
+    Args:
+        project_id: The project ID.
+        email: User's email address.
+        products: List of product keys (e.g. ["projectAdministration", "docs"]).
+    """
+    url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{project_id}/users"
+    payload = {
+        "email": email,
+        "products": [{"key": p, "access": "administrator"} for p in products],
+    }
+    resp = _make_request("POST", url, json=payload, timeout=30)
+    return resp.json()
