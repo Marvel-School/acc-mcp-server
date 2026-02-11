@@ -8,7 +8,6 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
-ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL")
 
 # Fail fast — crash the container immediately if credentials are missing.
 # This prevents a "healthy" container that silently fails on every API call.
@@ -20,12 +19,6 @@ if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
 
 # OAuth Scopes — viewables:read is required for Model Derivative API
 APS_SCOPES = "data:read data:write data:create bucket:read viewables:read account:read account:write"
-
-# API Base URLs
-BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
-BASE_URL_HQ_US = "https://developer.api.autodesk.com/hq/v1/accounts"
-BASE_URL_HQ_EU = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts"
-BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
 # Token cache
 _token_cache = {"access_token": None, "expires_at": 0}
@@ -42,7 +35,6 @@ def get_token(force_refresh: bool = False) -> str:
         Access token string.
 
     Raises:
-        ValueError: If APS credentials are not configured.
         requests.exceptions.RequestException: If the token request fails.
     """
     # Return cached token if still valid and not forcing refresh
@@ -75,10 +67,3 @@ def get_token(force_refresh: bool = False) -> str:
     _token_cache["expires_at"] = time.time() + token_data["expires_in"] - 60
     logger.info("Token acquired successfully.")
     return _token_cache["access_token"]
-
-
-def clear_token_cache():
-    """Resets the token cache so the next call to get_token fetches a fresh token."""
-    _token_cache["access_token"] = None
-    _token_cache["expires_at"] = 0
-    logger.info("Token cache cleared.")
