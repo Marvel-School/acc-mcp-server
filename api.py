@@ -712,10 +712,20 @@ def add_project_user(project_id: str, email: str, products: list) -> dict:
         products: Product keys (e.g. ["projectAdministration", "docs"]).
     """
     pid = clean_id(project_id)
+
+    # Resolve Admin User-Id (required for 2-legged ACC Admin API calls)
+    admin_email = os.getenv("ACC_ADMIN_EMAIL")
+    if not admin_email:
+        raise ValueError(
+            "CRITICAL: ACC_ADMIN_EMAIL environment variable is missing. "
+            "It is required for App-Only user management."
+        )
+    user_id = get_user_id_by_email(pid, admin_email)
+
     url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{pid}/users"
     payload = {
         "email": email,
         "products": [{"key": p, "access": "administrator"} for p in products],
     }
-    resp = _make_request("POST", url, json=payload)
+    resp = _make_request("POST", url, json=payload, extra_headers={"User-Id": user_id})
     return resp.json()
