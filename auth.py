@@ -3,17 +3,23 @@ import requests
 import time
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION ---
+# --- Configuration ---
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID")
 APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET")
 ACC_ADMIN_EMAIL = os.environ.get("ACC_ADMIN_EMAIL")
 
-# OAuth Scopes - CRITICAL: viewables:read is required for Model Derivative API
-APS_SCOPES = "data:read data:write data:create bucket:read viewables:read"
+# Fail fast — crash the container immediately if credentials are missing.
+# This prevents a "healthy" container that silently fails on every API call.
+if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
+    raise SystemExit(
+        "FATAL: APS_CLIENT_ID and APS_CLIENT_SECRET environment variables are required. "
+        "Copy .env.example to .env and fill in your Autodesk credentials."
+    )
+
+# OAuth Scopes — viewables:read is required for Model Derivative API
+APS_SCOPES = "data:read data:write data:create bucket:read viewables:read account:read account:write"
 
 # API Base URLs
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
@@ -21,63 +27,58 @@ BASE_URL_HQ_US = "https://developer.api.autodesk.com/hq/v1/accounts"
 BASE_URL_HQ_EU = "https://developer.api.autodesk.com/hq/v1/regions/eu/accounts"
 BASE_URL_GRAPHQL = "https://developer.api.autodesk.com/aec/graphql"
 
-# Global token cache
-token_cache = {"access_token": None, "expires_at": 0}
+# Token cache
+_token_cache = {"access_token": None, "expires_at": 0}
+
 
 def get_token(force_refresh: bool = False) -> str:
     """
-    Retrieves or refreshes the 2-legged access token.
+    Retrieves a 2-legged OAuth access token, using a cached value when possible.
 
     Args:
-        force_refresh: If True, ignores cached token and fetches a fresh one
+        force_refresh: If True, ignores the cache and requests a new token immediately.
 
     Returns:
-        Access token string
-    """
-    global token_cache
-    if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
-        logger.error("APS credentials missing.")
-        raise ValueError("Error: APS credentials missing.")
+        Access token string.
 
-    # Check cache only if not forcing refresh
-    if not force_refresh and time.time() < token_cache["expires_at"]:
-        logger.debug(f"Using cached token (expires in {int(token_cache['expires_at'] - time.time())}s)")
-        return token_cache["access_token"]
+    Raises:
+        ValueError: If APS credentials are not configured.
+        requests.exceptions.RequestException: If the token request fails.
+    """
+    # Return cached token if still valid and not forcing refresh
+    if not force_refresh and time.time() < _token_cache["expires_at"]:
+        logger.debug(f"Using cached token (expires in {int(_token_cache['expires_at'] - time.time())}s)")
+        return _token_cache["access_token"]
 
     if force_refresh:
-        logger.info("🔄 Force refreshing token (requested by caller)")
+        logger.info("Force refreshing token (requested by caller)")
 
-    logger.info("🔄 Authenticating with scopes: " + APS_SCOPES)
-    url = "https://developer.api.autodesk.com/authentication/v2/token"
+    logger.info(f"Authenticating with scopes: {APS_SCOPES}")
 
-    # Using POST Body for credentials to avoid 400 Bad Request
-    data = {
-        "client_id": APS_CLIENT_ID,
-        "client_secret": APS_CLIENT_SECRET,
-        "grant_type": "client_credentials",
-        "scope": APS_SCOPES  # Use the global constant
-    }
+    resp = requests.post(
+        "https://developer.api.autodesk.com/authentication/v2/token",
+        data={
+            "client_id": APS_CLIENT_ID,
+            "client_secret": APS_CLIENT_SECRET,
+            "grant_type": "client_credentials",
+            "scope": APS_SCOPES,
+        },
+        timeout=15,
+    )
 
-    try:
-        resp = requests.post(url, data=data)
-        
-        # Loud Fail: Log the exact error from Autodesk if 400
-        if resp.status_code == 400:
-            logger.error(f"❌ Token Refresh Failed (400): {resp.text}")
-            resp.raise_for_status()
-
+    if resp.status_code != 200:
+        logger.error(f"Token request failed ({resp.status_code}): {resp.text}")
         resp.raise_for_status()
-        token_data = resp.json()
-        token_cache["access_token"] = token_data["access_token"]
-        token_cache["expires_at"] = time.time() + token_data["expires_in"] - 60
-        return token_cache["access_token"]
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to get token: {e}")
-        raise
+
+    token_data = resp.json()
+    _token_cache["access_token"] = token_data["access_token"]
+    _token_cache["expires_at"] = time.time() + token_data["expires_in"] - 60
+    logger.info("Token acquired successfully.")
+    return _token_cache["access_token"]
 
 
 def clear_token_cache():
-    """Force clears the token cache to request a fresh token on next call."""
-    global token_cache
-    token_cache = {"access_token": None, "expires_at": 0}
-    logger.info("🗑️ Token cache cleared. Next API call will request fresh token.")
+    """Resets the token cache so the next call to get_token fetches a fresh token."""
+    _token_cache["access_token"] = None
+    _token_cache["expires_at"] = 0
+    logger.info("Token cache cleared.")
