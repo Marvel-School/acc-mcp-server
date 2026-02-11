@@ -113,7 +113,10 @@ def _make_request(
             error_detail = last_resp.text
             try:
                 error_json = last_resp.json()
-                error_detail = error_json.get("detail", error_json.get("errors", last_resp.text))
+                if "errors" in error_json:
+                    error_detail = str(error_json["errors"])
+                else:
+                    error_detail = error_json.get("detail", last_resp.text)
             except ValueError:
                 pass
             logger.error(f"API HTTP Error ({last_resp.status_code}): {error_detail}")
@@ -646,16 +649,19 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
 # PROJECT MANAGEMENT
 # ==========================================================================
 
-def create_acc_project(hub_id: str, project_name: str, platform: str = "acc") -> dict:
+def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
     """Creates a project using the ACC Account Admin API."""
+    logger.info(f"Preparing to create project: {project_name}")
     account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
     payload = {
         "name": project_name,
-        "platform": platform,
-        "projectType": "Commercial",
+        "type": "Office",
+        "platform": "acc" if project_type.upper() == "ACC" else "bim360",
     }
+    logger.info(f"POSTing to {endpoint} with payload: {payload}")
     resp = _make_request("POST", endpoint, json=payload)
+    logger.info("Project creation API responded successfully.")
     return resp.json()
 
 

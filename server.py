@@ -273,7 +273,7 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
 
 
 @mcp.tool()
-def create_project(hub_id_or_name: str, name: str, platform: str = "acc") -> str:
+def create_project(hub_id_or_name: str, name: str, project_type: str = "ACC") -> str:
     """
     Creates a new project in the specified Hub.
 
@@ -283,7 +283,7 @@ def create_project(hub_id_or_name: str, name: str, platform: str = "acc") -> str
     Args:
         hub_id_or_name: Hub ID (starts with 'b.') OR Hub name (e.g. "TBI Holding").
         name:           The name of the new project.
-        platform:       'acc' or 'bim360' (Default: acc).
+        project_type:   'ACC' or 'BIM360' (Default: ACC).
     """
     try:
         real_hub_id = hub_id_or_name
@@ -301,7 +301,7 @@ def create_project(hub_id_or_name: str, name: str, platform: str = "acc") -> str
             else:
                 return f"Could not find a hub named '{hub_id_or_name}'. Run list_hubs to see valid names."
 
-        result = create_acc_project(real_hub_id, name, platform)
+        result = create_acc_project(real_hub_id, name, project_type)
 
         # ACC Admin API returns the ID directly at the root
         new_id = result.get("id") or result.get("projectId")
