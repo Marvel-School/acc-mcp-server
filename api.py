@@ -6,7 +6,7 @@ All HTTP requests go through _make_request() which provides:
   - Auto-EMEA (x-ads-region header)
   - Auto-retry on 401 (stale token refresh)
   - Auto-retry on 429 (rate limit with Retry-After)
-  - Default 30s timeout (prevents hanging requests)
+  - Default 15s timeout (prevents hanging requests)
 """
 
 import os
@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 # UTILITIES
 # ==========================================================================
 
-def clean_id(id_str: Optional[str]) -> str:
-    """Remove 'b.' prefix from a hub/project ID."""
-    return id_str.replace("b.", "") if id_str else ""
+def _strip_b_prefix(id_str: str) -> str:
+    """Safely removes the 'b.' prefix from Hub/Project IDs."""
+    return id_str[2:] if id_str.startswith("b.") else id_str
 
 
 def ensure_b_prefix(id_str: Optional[str]) -> str:
@@ -133,6 +133,29 @@ def _make_request(
 
 
 # ==========================================================================
+# ADMIN USER-ID HELPER
+# ==========================================================================
+
+def _get_admin_user_id(account_id: str) -> str:
+    """Fetches the Autodesk User ID for the Account Admin, using a local dev fallback if needed."""
+    admin_email = os.getenv("ACC_ADMIN_EMAIL")
+    if not admin_email:
+        logger.warning("ACC_ADMIN_EMAIL missing from env. Defaulting to local dev fallback...")
+        admin_email = "marvel.tiyjudy@ssc4tbi.nl"
+    return get_user_id_by_email(account_id, admin_email)
+
+
+def get_user_id_by_email(account_id: str, email: str) -> str:
+    """Fetches the internal Autodesk User ID for an email address."""
+    endpoint = f"https://developer.api.autodesk.com/hq/v1/regions/eu/accounts/{account_id}/users/search?email={email}"
+    resp = _make_request("GET", endpoint)
+    users = resp.json()
+    if not users:
+        raise ValueError(f"Could not find an Autodesk user with email: {email}")
+    return users[0].get("id")
+
+
+# ==========================================================================
 # HUB & PROJECT DISCOVERY
 # ==========================================================================
 
@@ -152,9 +175,6 @@ def _get_hub_id() -> Optional[str]:
 def get_hubs() -> list:
     """Fetches all accessible Hubs (BIM 360 / ACC)."""
     resp = _make_request("GET", "https://developer.api.autodesk.com/project/v1/hubs")
-    if resp.status_code != 200:
-        logger.error(f"get_hubs failed ({resp.status_code}): {resp.text}")
-        return []
     return resp.json().get("data", [])
 
 
@@ -165,10 +185,6 @@ def get_projects(hub_id: str) -> list:
 
     for _ in range(50):  # safety cap
         resp = _make_request("GET", url)  # type: ignore[arg-type]
-        if resp.status_code != 200:
-            logger.error(f"get_projects failed ({resp.status_code}): {resp.text}")
-            break
-
         data = resp.json()
         all_projects.extend(data.get("data", []))
 
@@ -239,10 +255,6 @@ def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]],
         url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_clean}/projects/{proj_clean}/topFolders"
         resp = _make_request("GET", url)
 
-        if resp.status_code != 200:
-            logger.error(f"Top Folders API Error {resp.status_code}: {resp.text}")
-            return f"Error {resp.status_code}: {resp.text}"
-
         return [
             {
                 "id": f.get("id"),
@@ -264,10 +276,6 @@ def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str,
 
         url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders/{folder_encoded}/contents"
         resp = _make_request("GET", url)
-
-        if resp.status_code != 200:
-            logger.error(f"Folder Contents API Error {resp.status_code}: {resp.text}")
-            return f"Error {resp.status_code}: {resp.text}"
 
         result = []
         for item in resp.json().get("data", []):
@@ -434,10 +442,6 @@ def get_latest_version_urn(project_id: str, item_id: str) -> Optional[str]:
         url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/items/{item_encoded}"
         resp = _make_request("GET", url)
 
-        if resp.status_code != 200:
-            logger.error(f"Version resolution failed {resp.status_code}: {resp.text}")
-            return None
-
         tip = (
             resp.json()
             .get("data", {})
@@ -485,12 +489,9 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
         url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded}/manifest"
         resp = _make_request("GET", url)
 
-        if resp.status_code == 404:
-            return "Not Translated. The file exists but hasn't been processed yet."
+        # 202 Accepted = translation still in progress (2xx, not caught by raise_for_status)
         if resp.status_code == 202:
             return "Processing — translation in progress."
-        if resp.status_code != 200:
-            return f"Error {resp.status_code}: Unable to inspect file."
 
         manifest = resp.json()
         status = manifest.get("status", "unknown").lower()
@@ -517,19 +518,12 @@ def get_view_guid_only(version_urn: str) -> str:
     Fetches the first available view GUID for a model.
 
     Raises:
-        ValueError on auth failure, 404, or missing views.
+        ValueError on missing views.
     """
     urn_b64 = safe_b64encode(version_urn)
     url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata"
 
     resp = _make_request("GET", url)
-
-    if resp.status_code == 401:
-        raise ValueError("Auth failure (401). Verify 'viewables:read' scope.")
-    if resp.status_code == 404:
-        raise ValueError("Model not found (404). Translation may be missing.")
-    if resp.status_code != 200:
-        raise ValueError(f"Metadata API error {resp.status_code}: {resp.text}")
 
     views = resp.json().get("data", {}).get("metadata", [])
     if not views:
@@ -628,11 +622,6 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
             json=payload,
         )
 
-        if resp.status_code not in (200, 201):
-            error = f"Translation API error {resp.status_code}: {resp.text}"
-            logger.error(f"  {error}")
-            return error
-
         result = resp.json()
         logger.info(f"  Job submitted: {result.get('result', 'unknown')}")
         return result
@@ -650,33 +639,11 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
 # PROJECT MANAGEMENT
 # ==========================================================================
 
-def get_user_id_by_email(account_id: str, email: str) -> str:
-    """Fetches the internal Autodesk User ID for an email address."""
-    endpoint = f"https://developer.api.autodesk.com/hq/v1/regions/eu/accounts/{account_id}/users/search?email={email}"
-    resp = _make_request("GET", endpoint)
-    users = resp.json()
-    if not users:
-        raise ValueError(f"Could not find an Autodesk user with email: {email}")
-    return users[0].get("id")
-
-
 def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
     """Creates a project using the ACC Account Admin API."""
-    account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
+    account_id = _strip_b_prefix(hub_id)
+    user_id = _get_admin_user_id(account_id)
 
-    # 1. Get the Admin Email from environment
-    admin_email = os.getenv("ACC_ADMIN_EMAIL")
-    if not admin_email:
-        raise ValueError(
-            "CRITICAL: ACC_ADMIN_EMAIL environment variable is missing. "
-            "It is required for App-Only project creation."
-        )
-
-    # 2. Lookup the Autodesk User ID
-    logger.info(f"Looking up User ID for admin email: {admin_email}")
-    user_id = get_user_id_by_email(account_id, admin_email)
-
-    # 3. Prepare the creation payload
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
     payload = {
         "name": project_name,
@@ -684,7 +651,6 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
         "platform": "acc" if project_type.upper() == "ACC" else "bim360",
     }
 
-    # 4. Inject the mandatory User-Id header
     logger.info(f"POSTing to {endpoint} with User-Id: {user_id}")
     resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
     logger.info("Project creation API responded successfully.")
@@ -693,12 +659,9 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
 
 def get_project_users(project_id: str) -> list:
     """List users in a project (requires Admin)."""
-    pid = clean_id(project_id)
+    pid = _strip_b_prefix(project_id)
     url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{pid}/users"
     resp = _make_request("GET", url)
-    if resp.status_code != 200:
-        logger.error(f"get_project_users failed ({resp.status_code}): {resp.text}")
-        return []
     return resp.json().get("results", [])
 
 
@@ -712,18 +675,13 @@ def add_project_user(hub_id: str, project_id: str, email: str, products: Optiona
         email: User's email address.
         products: Product keys (e.g. ["docs"]). Defaults to ["docs"].
     """
-    account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
-    clean_project_id = project_id[2:] if project_id.startswith("b.") else project_id
+    account_id = _strip_b_prefix(hub_id)
+    clean_project_id = _strip_b_prefix(project_id)
 
     if products is None:
         products = ["docs"]
 
-    # Resolve Admin User-Id (required for 2-legged ACC Admin API calls)
-    admin_email = os.getenv("ACC_ADMIN_EMAIL")
-    if not admin_email:
-        logger.warning("ACC_ADMIN_EMAIL missing, using local fallback...")
-        admin_email = "marvel.tiyjudy@ssc4tbi.nl"
-    user_id = get_user_id_by_email(account_id, admin_email)
+    user_id = _get_admin_user_id(account_id)
 
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
     payload = {
