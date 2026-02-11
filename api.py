@@ -9,6 +9,7 @@ All HTTP requests go through _make_request() which provides:
   - Default 30s timeout (prevents hanging requests)
 """
 
+import os
 import re
 import logging
 import time
@@ -649,18 +650,43 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
 # PROJECT MANAGEMENT
 # ==========================================================================
 
+def get_user_id_by_email(account_id: str, email: str) -> str:
+    """Fetches the internal Autodesk User ID for an email address."""
+    endpoint = f"https://developer.api.autodesk.com/hq/v1/regions/eu/accounts/{account_id}/users/search?email={email}"
+    resp = _make_request("GET", endpoint)
+    users = resp.json()
+    if not users:
+        raise ValueError(f"Could not find an Autodesk user with email: {email}")
+    return users[0].get("id")
+
+
 def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
     """Creates a project using the ACC Account Admin API."""
-    logger.info(f"Preparing to create project: {project_name}")
     account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
+
+    # 1. Get the Admin Email from environment
+    admin_email = os.getenv("ACC_ADMIN_EMAIL")
+    if not admin_email:
+        raise ValueError(
+            "CRITICAL: ACC_ADMIN_EMAIL environment variable is missing. "
+            "It is required for App-Only project creation."
+        )
+
+    # 2. Lookup the Autodesk User ID
+    logger.info(f"Looking up User ID for admin email: {admin_email}")
+    user_id = get_user_id_by_email(account_id, admin_email)
+
+    # 3. Prepare the creation payload
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
     payload = {
         "name": project_name,
         "type": "Office",
         "platform": "acc" if project_type.upper() == "ACC" else "bim360",
     }
-    logger.info(f"POSTing to {endpoint} with payload: {payload}")
-    resp = _make_request("POST", endpoint, json=payload)
+
+    # 4. Inject the mandatory User-Id header
+    logger.info(f"POSTing to {endpoint} with User-Id: {user_id}")
+    resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
     logger.info("Project creation API responded successfully.")
     return resp.json()
 
