@@ -273,7 +273,7 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
 
 
 @mcp.tool()
-def create_project(hub_id_or_name: str, name: str, project_type: str = "BIM360") -> str:
+def create_project(hub_id_or_name: str, name: str, platform: str = "acc") -> str:
     """
     Creates a new project in the specified Hub.
 
@@ -283,7 +283,7 @@ def create_project(hub_id_or_name: str, name: str, project_type: str = "BIM360")
     Args:
         hub_id_or_name: Hub ID (starts with 'b.') OR Hub name (e.g. "TBI Holding").
         name:           The name of the new project.
-        project_type:   'ACC' or 'BIM360' (Default: BIM360).
+        platform:       'acc' or 'bim360' (Default: acc).
     """
     try:
         real_hub_id = hub_id_or_name
@@ -301,9 +301,15 @@ def create_project(hub_id_or_name: str, name: str, project_type: str = "BIM360")
             else:
                 return f"Could not find a hub named '{hub_id_or_name}'. Run list_hubs to see valid names."
 
-        result = create_acc_project(real_hub_id, name, project_type)
-        new_id = result.get("data", {}).get("id")
-        return f"Project '{name}' created successfully! ID: {new_id}"
+        result = create_acc_project(real_hub_id, name, platform)
+
+        # ACC Admin API returns the ID directly at the root
+        new_id = result.get("id") or result.get("projectId")
+
+        if new_id:
+            return f"✅ Project '{name}' successfully created! Project ID: {new_id}"
+        else:
+            return f"⚠️ API succeeded, but couldn't parse ID. Raw response: {result}"
     except Exception as e:
         logger.error(f"create_project failed: {e}")
         return f"Failed to create project: {e}"

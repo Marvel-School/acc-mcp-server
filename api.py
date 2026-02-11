@@ -68,11 +68,11 @@ def _make_request(
     Every request automatically gets:
       - Authorization: Bearer <token>
       - x-ads-region: EMEA
-      - 30 s default timeout (callers can override)
+      - 15 s default timeout (callers can override)
       - One retry on 401 (token refresh)
       - One retry on 429 (respects Retry-After header)
     """
-    kwargs.setdefault("timeout", 30)
+    kwargs.setdefault("timeout", 15)
     max_attempts = 2 if retry_on_401 else 1
     last_resp: requests.Response = None  # type: ignore[assignment]
 
@@ -623,22 +623,16 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
 # PROJECT MANAGEMENT
 # ==========================================================================
 
-def create_acc_project(
-    hub_id: str, project_name: str, project_type: str = "BIM360"
-) -> dict:
-    """Creates a new project in the specified Hub."""
-    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
+def create_acc_project(hub_id: str, project_name: str, platform: str = "acc") -> dict:
+    """Creates a project using the ACC Account Admin API."""
+    account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
+    endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
     payload = {
-        "jsonapi": {"version": "1.0"},
-        "data": {
-            "type": "projects",
-            "attributes": {
-                "name": project_name,
-                "projectType": project_type,
-            },
-        },
+        "name": project_name,
+        "platform": platform,
+        "projectType": "Commercial",
     }
-    resp = _make_request("POST", url, json=payload)
+    resp = _make_request("POST", endpoint, json=payload)
     return resp.json()
 
 

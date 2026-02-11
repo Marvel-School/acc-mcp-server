@@ -19,7 +19,7 @@ if not APS_CLIENT_ID or not APS_CLIENT_SECRET:
     )
 
 # OAuth Scopes — viewables:read is required for Model Derivative API
-APS_SCOPES = "data:read data:write data:create bucket:read viewables:read"
+APS_SCOPES = "data:read data:write data:create bucket:read viewables:read account:read account:write"
 
 # API Base URLs
 BASE_URL_ACC = "https://developer.api.autodesk.com/construction"
