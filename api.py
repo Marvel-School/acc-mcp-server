@@ -140,6 +140,9 @@ def _get_admin_user_id(account_id: str) -> str:
     """Fetches the Autodesk User ID for the Account Admin, using a local dev fallback if needed."""
     admin_email = os.getenv("ACC_ADMIN_EMAIL")
     if not admin_email:
+        # In Azure (App Service / Functions), fail loudly — missing env var is a deploy mistake.
+        if os.getenv("WEBSITE_SITE_NAME") or os.getenv("FUNCTIONS_WORKER_RUNTIME"):
+            raise ValueError("CRITICAL: ACC_ADMIN_EMAIL environment variable is missing in production environment.")
         logger.warning("ACC_ADMIN_EMAIL missing from env. Defaulting to local dev fallback...")
         admin_email = "marvel.tiyjudy@ssc4tbi.nl"
     return get_user_id_by_email(account_id, admin_email)
@@ -152,7 +155,10 @@ def get_user_id_by_email(account_id: str, email: str) -> str:
     users = resp.json()
     if not users:
         raise ValueError(f"Could not find an Autodesk user with email: {email}")
-    return users[0].get("id")
+    user_id = users[0].get("id")
+    if not user_id:
+        raise ValueError(f"Autodesk returned a user for {email}, but the 'id' field is missing.")
+    return user_id
 
 
 # ==========================================================================
@@ -657,12 +663,26 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     return resp.json()
 
 
-def get_project_users(project_id: str) -> list:
-    """List users in a project (requires Admin)."""
-    pid = _strip_b_prefix(project_id)
-    url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{pid}/users"
-    resp = _make_request("GET", url)
-    return resp.json().get("results", [])
+def get_project_users(hub_id: str, project_id: str) -> list:
+    """List users in a project (requires Admin). Paginates up to 5 pages."""
+    clean_project_id = _strip_b_prefix(project_id)
+    endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
+
+    all_users: list = []
+    url: Optional[str] = endpoint
+
+    for _ in range(5):  # safety cap
+        resp = _make_request("GET", url)  # type: ignore[arg-type]
+        data = resp.json()
+        all_users.extend(data.get("results", []))
+
+        next_url = data.get("pagination", {}).get("nextUrl")
+        if next_url:
+            url = next_url
+        else:
+            break
+
+    return all_users
 
 
 def add_project_user(hub_id: str, project_id: str, email: str, products: Optional[list] = None) -> dict:

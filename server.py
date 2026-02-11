@@ -316,15 +316,16 @@ def create_project(hub_id_or_name: str, name: str, project_type: str = "ACC") ->
 
 
 @mcp.tool()
-def list_project_users(project_id: str) -> str:
+def list_project_users(hub_id: str, project_id: str) -> str:
     """
     Lists users assigned to a project (requires Admin permissions).
 
     Args:
+        hub_id:     The Hub ID (starts with 'b.').
         project_id: The Project ID.
     """
     try:
-        users = get_project_users(project_id)
+        users = get_project_users(hub_id, project_id)
         if not users:
             return f"No users found in project {project_id} (or insufficient permissions)."
 
