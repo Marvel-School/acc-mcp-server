@@ -71,38 +71,61 @@ def _make_request(
       - 15 s default timeout (callers can override)
       - One retry on 401 (token refresh)
       - One retry on 429 (respects Retry-After header)
+
+    Raises:
+        ValueError: On any 4xx/5xx response (with Autodesk error detail).
     """
     kwargs.setdefault("timeout", 15)
     max_attempts = 2 if retry_on_401 else 1
     last_resp: requests.Response = None  # type: ignore[assignment]
 
-    for attempt in range(max_attempts):
-        token = get_token(force_refresh=(attempt > 0))
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-ads-region": "EMEA",
-        }
-        if extra_headers:
-            headers.update(extra_headers)
+    try:
+        for attempt in range(max_attempts):
+            token = get_token(force_refresh=(attempt > 0))
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "x-ads-region": "EMEA",
+            }
+            if extra_headers:
+                headers.update(extra_headers)
 
-        last_resp = requests.request(method, url, headers=headers, **kwargs)
-
-        # 429 — rate limited: honour Retry-After, retry once
-        if last_resp.status_code == 429:
-            wait = int(last_resp.headers.get("Retry-After", 5))
-            logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
-            time.sleep(wait)
             last_resp = requests.request(method, url, headers=headers, **kwargs)
-            return last_resp
 
-        # 401 — stale token: refresh and retry
-        if last_resp.status_code == 401 and attempt == 0 and retry_on_401:
-            logger.warning(f"401 on {method} {url[:80]} — refreshing token")
-            continue
+            # 429 — rate limited: honour Retry-After, retry once
+            if last_resp.status_code == 429:
+                wait = int(last_resp.headers.get("Retry-After", 5))
+                logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
+                time.sleep(wait)
+                last_resp = requests.request(method, url, headers=headers, **kwargs)
+                break
+
+            # 401 — stale token: refresh and retry
+            if last_resp.status_code == 401 and attempt == 0 and retry_on_401:
+                logger.warning(f"401 on {method} {url[:80]} — refreshing token")
+                continue
+
+            break
+
+        # LOUD FAILURE: If the status is 4xx or 5xx, crash immediately
+        try:
+            last_resp.raise_for_status()
+        except requests.exceptions.HTTPError as http_err:
+            error_detail = last_resp.text
+            try:
+                error_json = last_resp.json()
+                error_detail = error_json.get("detail", error_json.get("errors", last_resp.text))
+            except ValueError:
+                pass
+            logger.error(f"API HTTP Error ({last_resp.status_code}): {error_detail}")
+            raise ValueError(f"Autodesk API Error {last_resp.status_code}: {error_detail}") from http_err
 
         return last_resp
 
-    return last_resp
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.error(f"Request Execution Failed: {str(e)}")
+        raise
 
 
 # ==========================================================================
