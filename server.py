@@ -343,20 +343,17 @@ def list_project_users(project_id: str) -> str:
 
 
 @mcp.tool()
-def add_user(project_id: str, email: str, products: str = "projectAdministration,docs") -> str:
+def add_user(hub_id: str, project_id: str, email: str) -> str:
     """
     Adds a user to a project by email.
 
     Args:
+        hub_id:     The Hub ID (starts with 'b.'). Needed for admin auth.
         project_id: The Project ID.
         email:      The user's email address.
-        products:   Comma-separated product keys to grant access to.
-                    Default: "projectAdministration,docs".
-                    Options: projectAdministration, docs, build, cost, insight, etc.
     """
     try:
-        product_list = [p.strip() for p in products.split(",") if p.strip()]
-        result = add_project_user(project_id, email, product_list)
+        result = add_project_user(hub_id, project_id, email, products=["docs"])
         user_id = result.get("id", "unknown")
         return f"User '{email}' added to project. User ID: {user_id}"
     except Exception as e:
