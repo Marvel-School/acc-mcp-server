@@ -192,6 +192,7 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
         limit:  Max projects per page (default 50, max 100 per Autodesk API).
         fields: Optional list of extra fields to include (e.g. ["status", "projectValue"]).
     """
+    hub_id = ensure_b_prefix(hub_id)
     base = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects?page[limit]={limit}"
     if fields:
         base += f"&fields[projects]={','.join(fields)}"
@@ -835,10 +836,11 @@ def replicate_folders(
     source_project_id: str,
     dest_project_id: str,
     max_depth: int = 5,
-) -> List[str]:
+) -> str:
     """Recursively copies the folder structure from a source project to a destination project.
 
     Only replicates folders (not files). Starts from the 'Project Files' root.
+    Returns a short summary string (not the full folder list) to avoid content-filter issues.
 
     Args:
         hub_id:             Hub ID (both projects must be in the same hub).
@@ -847,7 +849,7 @@ def replicate_folders(
         max_depth:          Maximum folder nesting depth (default 5).
 
     Returns:
-        List of created folder names/paths for logging.
+        Summary string with the count of created folders.
     """
     def _find_project_files_root(pid: str) -> str:
         folders = get_top_folders(hub_id, pid)
@@ -863,9 +865,10 @@ def replicate_folders(
     source_root = _find_project_files_root(source_project_id)
     dest_root = _find_project_files_root(dest_project_id)
 
-    created: List[str] = []
+    count = 0
 
     def _recurse(src_folder_id: str, dst_parent_id: str, path: str, depth: int) -> None:
+        nonlocal count
         if depth > max_depth:
             return
 
@@ -884,8 +887,8 @@ def replicate_folders(
             try:
                 result = create_folder(dest_project_id, dst_parent_id, name)
                 new_folder_id = result.get("data", {}).get("id")
+                count += 1
                 logger.info(f"  Created: {full_path}")
-                created.append(full_path)
 
                 if new_folder_id:
                     _recurse(item["id"], new_folder_id, full_path, depth + 1)
@@ -894,5 +897,5 @@ def replicate_folders(
 
     logger.info(f"[Replicate] Copying folder structure from {source_project_id} to {dest_project_id}")
     _recurse(source_root, dest_root, "Project Files", 0)
-    logger.info(f"[Replicate] Done — {len(created)} folders created")
-    return created
+    logger.info(f"[Replicate] Done — {count} folders created")
+    return f"Successfully copied {count} folders from source to destination."

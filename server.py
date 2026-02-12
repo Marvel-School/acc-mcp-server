@@ -466,15 +466,8 @@ def apply_folder_template(hub_id: str, source_project_name: str, dest_project_na
         if not dst_id:
             return f"Destination project '{dest_project_name}' not found. Run list_projects to see valid names."
 
-        created = replicate_folders(hub_id, src_id, dst_id)
-
-        if not created:
-            return f"No folders to copy — the source project '{src_name}' has no subfolders under Project Files."
-
-        report = f"Copied {len(created)} folders from '{src_name}' to '{dst_name}':\n"
-        for path in created:
-            report += f"  - {path}\n"
-        return report
+        summary = replicate_folders(hub_id, src_id, dst_id)
+        return f"Template applied from '{src_name}' to '{dst_name}': {summary}"
     except Exception as e:
         logger.error(f"apply_folder_template failed: {e}")
         return f"Failed to replicate folder structure: {e}"
