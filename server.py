@@ -13,7 +13,6 @@ from api import (
     get_top_folders,
     get_folder_contents,
     create_acc_project,
-    archive_acc_project,
     replicate_folders,
     get_project_users,
     add_project_user,
@@ -401,39 +400,6 @@ def audit_hub_users(hub_id: str) -> str:
     except Exception as e:
         logger.error(f"audit_hub_users failed: {e}")
         return f"Failed to audit hub users: {e}"
-
-
-@mcp.tool()
-def archive_project(hub_id: str, project_name: str) -> str:
-    """
-    Archives (soft-deletes) a project so it no longer appears in the active list.
-    Resolves the project by name first, then archives it.
-
-    Args:
-        hub_id:        The Hub ID (starts with 'b.').
-        project_name:  The exact name of the project to archive.
-    """
-    try:
-        projects = get_projects(hub_id)
-        target = project_name.lower().strip()
-        found_id = None
-        found_name = None
-        for p in projects:
-            p_name = p.get("attributes", {}).get("name", "")
-            if p_name.lower() == target:
-                found_id = p.get("id")
-                found_name = p_name
-                break
-
-        if not found_id:
-            return f"Could not find a project named '{project_name}' in this hub. Run list_projects to see valid names."
-
-        result = archive_acc_project(hub_id, found_id)
-        status = result.get("status", "unknown")
-        return f"Project '{found_name}' has been archived (status: {status})."
-    except Exception as e:
-        logger.error(f"archive_project failed: {e}")
-        return f"Failed to archive project: {e}"
 
 
 @mcp.tool()

@@ -772,26 +772,6 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
     return sorted(result, key=lambda u: u["email"])
 
 
-def archive_acc_project(hub_id: str, project_id: str) -> dict:
-    """Archives (soft-deletes) a project via the ACC Account Admin API.
-
-    Args:
-        hub_id:     Hub ID (needed to resolve admin User-Id).
-        project_id: The project ID to archive.
-    """
-    account_id = _strip_b_prefix(hub_id)
-    clean_pid = _strip_b_prefix(project_id)
-    user_id = _get_admin_user_id(account_id)
-
-    endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_pid}"
-    payload = {"status": "archived"}
-
-    logger.info(f"Archiving project {clean_pid} with User-Id: {user_id}")
-    resp = _make_request("PATCH", endpoint, json=payload, extra_headers={"User-Id": user_id})
-    logger.info("Project archived successfully.")
-    return resp.json()
-
-
 def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> dict:
     """Creates a subfolder inside a parent folder using the Data Management API.
 
