@@ -13,6 +13,8 @@ from api import (
     get_top_folders,
     get_folder_contents,
     create_acc_project,
+    archive_acc_project,
+    replicate_folders,
     get_project_users,
     add_project_user,
     get_all_hub_users,
@@ -399,6 +401,83 @@ def audit_hub_users(hub_id: str) -> str:
     except Exception as e:
         logger.error(f"audit_hub_users failed: {e}")
         return f"Failed to audit hub users: {e}"
+
+
+@mcp.tool()
+def archive_project(hub_id: str, project_name: str) -> str:
+    """
+    Archives (soft-deletes) a project so it no longer appears in the active list.
+    Resolves the project by name first, then archives it.
+
+    Args:
+        hub_id:        The Hub ID (starts with 'b.').
+        project_name:  The exact name of the project to archive.
+    """
+    try:
+        projects = get_projects(hub_id)
+        target = project_name.lower().strip()
+        found_id = None
+        found_name = None
+        for p in projects:
+            p_name = p.get("attributes", {}).get("name", "")
+            if p_name.lower() == target:
+                found_id = p.get("id")
+                found_name = p_name
+                break
+
+        if not found_id:
+            return f"Could not find a project named '{project_name}' in this hub. Run list_projects to see valid names."
+
+        result = archive_acc_project(hub_id, found_id)
+        status = result.get("status", "unknown")
+        return f"Project '{found_name}' has been archived (status: {status})."
+    except Exception as e:
+        logger.error(f"archive_project failed: {e}")
+        return f"Failed to archive project: {e}"
+
+
+@mcp.tool()
+def apply_folder_template(hub_id: str, source_project_name: str, dest_project_name: str) -> str:
+    """
+    Copies the folder structure from a Source Project to a Destination Project.
+    Useful for setting up new projects from a template. Only folders are copied, not files.
+
+    Args:
+        hub_id:               The Hub ID (starts with 'b.').
+        source_project_name:  Name of the template project to copy FROM.
+        dest_project_name:    Name of the target project to copy TO.
+    """
+    try:
+        projects = get_projects(hub_id)
+
+        def _resolve(name: str) -> tuple:
+            target = name.lower().strip()
+            for p in projects:
+                p_name = p.get("attributes", {}).get("name", "")
+                if p_name.lower() == target:
+                    return p.get("id"), p_name
+            return None, None
+
+        src_id, src_name = _resolve(source_project_name)
+        if not src_id:
+            return f"Source project '{source_project_name}' not found. Run list_projects to see valid names."
+
+        dst_id, dst_name = _resolve(dest_project_name)
+        if not dst_id:
+            return f"Destination project '{dest_project_name}' not found. Run list_projects to see valid names."
+
+        created = replicate_folders(hub_id, src_id, dst_id)
+
+        if not created:
+            return f"No folders to copy — the source project '{src_name}' has no subfolders under Project Files."
+
+        report = f"Copied {len(created)} folders from '{src_name}' to '{dst_name}':\n"
+        for path in created:
+            report += f"  - {path}\n"
+        return report
+    except Exception as e:
+        logger.error(f"apply_folder_template failed: {e}")
+        return f"Failed to replicate folder structure: {e}"
 
 
 # ==========================================================================

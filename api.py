@@ -769,3 +769,130 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
 
     logger.info(f"[Hub Audit] Found {len(result)} unique users across {len(projects)} projects")
     return sorted(result, key=lambda u: u["email"])
+
+
+def archive_acc_project(hub_id: str, project_id: str) -> dict:
+    """Archives (soft-deletes) a project via the ACC Account Admin API.
+
+    Args:
+        hub_id:     Hub ID (needed to resolve admin User-Id).
+        project_id: The project ID to archive.
+    """
+    account_id = _strip_b_prefix(hub_id)
+    clean_pid = _strip_b_prefix(project_id)
+    user_id = _get_admin_user_id(account_id)
+
+    endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_pid}"
+    payload = {"status": "archived"}
+
+    logger.info(f"Archiving project {clean_pid} with User-Id: {user_id}")
+    resp = _make_request("PATCH", endpoint, json=payload, extra_headers={"User-Id": user_id})
+    logger.info("Project archived successfully.")
+    return resp.json()
+
+
+def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> dict:
+    """Creates a subfolder inside a parent folder using the Data Management API.
+
+    Args:
+        project_id:       Project ID (will be b.-prefixed automatically).
+        parent_folder_id: The ID of the parent folder.
+        folder_name:      Name for the new folder.
+
+    Returns:
+        The created folder object from the API.
+    """
+    proj_clean = ensure_b_prefix(project_id)
+    payload = {
+        "jsonapi": {"version": "1.0"},
+        "data": {
+            "type": "folders",
+            "attributes": {
+                "name": folder_name,
+                "extension": {
+                    "type": "folders:autodesk.bim360:Folder",
+                    "version": "1.0",
+                },
+            },
+            "relationships": {
+                "parent": {
+                    "data": {"type": "folders", "id": parent_folder_id}
+                }
+            },
+        },
+    }
+
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders"
+    resp = _make_request(
+        "POST", url, json=payload,
+        extra_headers={"Content-Type": "application/vnd.api+json"},
+    )
+    return resp.json()
+
+
+def replicate_folders(
+    hub_id: str,
+    source_project_id: str,
+    dest_project_id: str,
+    max_depth: int = 5,
+) -> List[str]:
+    """Recursively copies the folder structure from a source project to a destination project.
+
+    Only replicates folders (not files). Starts from the 'Project Files' root.
+
+    Args:
+        hub_id:             Hub ID (both projects must be in the same hub).
+        source_project_id:  Source project ID.
+        dest_project_id:    Destination project ID.
+        max_depth:          Maximum folder nesting depth (default 5).
+
+    Returns:
+        List of created folder names/paths for logging.
+    """
+    def _find_project_files_root(pid: str) -> str:
+        folders = get_top_folders(hub_id, pid)
+        if isinstance(folders, str):
+            raise ValueError(f"Could not list top folders: {folders}")
+        for f in folders:
+            if (f.get("name") or "").lower() == "project files":
+                return f["id"]
+        if folders:
+            return folders[0]["id"]
+        raise ValueError(f"No top-level folders found in project {pid}")
+
+    source_root = _find_project_files_root(source_project_id)
+    dest_root = _find_project_files_root(dest_project_id)
+
+    created: List[str] = []
+
+    def _recurse(src_folder_id: str, dst_parent_id: str, path: str, depth: int) -> None:
+        if depth > max_depth:
+            return
+
+        contents = get_folder_contents(source_project_id, src_folder_id)
+        if isinstance(contents, str):
+            logger.warning(f"  Could not read source folder {path}: {contents}")
+            return
+
+        for item in contents:
+            if item.get("itemType") != "folder":
+                continue
+
+            name = item.get("name", "Unnamed")
+            full_path = f"{path}/{name}"
+
+            try:
+                result = create_folder(dest_project_id, dst_parent_id, name)
+                new_folder_id = result.get("data", {}).get("id")
+                logger.info(f"  Created: {full_path}")
+                created.append(full_path)
+
+                if new_folder_id:
+                    _recurse(item["id"], new_folder_id, full_path, depth + 1)
+            except Exception as e:
+                logger.warning(f"  Failed to create '{full_path}': {e}")
+
+    logger.info(f"[Replicate] Copying folder structure from {source_project_id} to {dest_project_id}")
+    _recurse(source_root, dest_root, "Project Files", 0)
+    logger.info(f"[Replicate] Done — {len(created)} folders created")
+    return created
