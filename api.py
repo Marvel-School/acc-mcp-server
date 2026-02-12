@@ -879,3 +879,73 @@ def replicate_folders(
     _recurse(source_root, dest_root, "Project Files", 0)
     logger.info(f"[Replicate] Done — {count} folders created")
     return f"Successfully copied {count} folders from source to destination."
+
+
+def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
+    """Hides a top-level folder inside a project's 'Project Files' root.
+
+    Searches for the folder by name (case-insensitive), then sends a PATCH
+    to set ``hidden: true`` on it.
+
+    Args:
+        hub_id:     Hub ID (needed to list top folders).
+        project_id: Project ID.
+        folder_name: Name of the folder to hide.
+
+    Returns:
+        Success or not-found message.
+    """
+    top_folders = get_top_folders(hub_id, project_id)
+    if isinstance(top_folders, str):
+        raise ValueError(f"Could not list top folders: {top_folders}")
+
+    # Find "Project Files" root
+    root_id = None
+    for f in top_folders:
+        if (f.get("name") or "").lower() == "project files":
+            root_id = f["id"]
+            break
+    if not root_id and top_folders:
+        root_id = top_folders[0]["id"]
+    if not root_id:
+        raise ValueError("No top-level folders found in project.")
+
+    # List children and match by name
+    contents = get_folder_contents(project_id, root_id)
+    if isinstance(contents, str):
+        raise ValueError(f"Could not read folder contents: {contents}")
+
+    target = folder_name.lower().strip()
+    folder_id = None
+    matched_name = None
+    for item in contents:
+        if item.get("itemType") != "folder":
+            continue
+        name = (item.get("name") or "").strip()
+        if name.lower() == target:
+            folder_id = item["id"]
+            matched_name = name
+            break
+
+    if not folder_id:
+        return f"Folder '{folder_name}' not found under Project Files."
+
+    # PATCH to hide
+    proj_clean = ensure_b_prefix(project_id)
+    folder_encoded = encode_urn(folder_id)
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders/{folder_encoded}"
+    payload = {
+        "jsonapi": {"version": "1.0"},
+        "data": {
+            "type": "folders",
+            "id": folder_id,
+            "attributes": {"hidden": True},
+        },
+    }
+
+    _make_request(
+        "PATCH", url, json=payload,
+        extra_headers={"Content-Type": "application/vnd.api+json"},
+    )
+    logger.info(f"Folder '{matched_name}' hidden in project {project_id}")
+    return f"Successfully deleted folder '{matched_name}'."

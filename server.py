@@ -17,6 +17,7 @@ from api import (
     get_project_users,
     add_project_user,
     get_all_hub_users,
+    soft_delete_folder,
 )
 
 # Logging
@@ -437,6 +438,36 @@ def apply_folder_template(hub_id: str, source_project_name: str, dest_project_na
     except Exception as e:
         logger.error(f"apply_folder_template failed: {e}")
         return f"Failed to replicate folder structure: {e}"
+
+
+@mcp.tool()
+def delete_folder(hub_id: str, project_name: str, folder_name: str) -> str:
+    """
+    Deletes (hides) a specific top-level folder within a project.
+    Useful for cleaning up mistakes or removing unwanted template folders.
+
+    Args:
+        hub_id:        The Hub ID (starts with 'b.').
+        project_name:  The name of the project containing the folder.
+        folder_name:   The name of the folder to delete (e.g. '01_WIP').
+    """
+    try:
+        projects = get_projects(hub_id)
+        target = project_name.lower().strip()
+        found_id = None
+        for p in projects:
+            p_name = p.get("attributes", {}).get("name", "")
+            if p_name.lower() == target:
+                found_id = p.get("id")
+                break
+
+        if not found_id:
+            return f"Could not find a project named '{project_name}'. Run list_projects to see valid names."
+
+        return soft_delete_folder(hub_id, found_id, folder_name)
+    except Exception as e:
+        logger.error(f"delete_folder failed: {e}")
+        return f"Failed to delete folder: {e}"
 
 
 # ==========================================================================
