@@ -15,6 +15,7 @@ from api import (
     create_acc_project,
     get_project_users,
     add_project_user,
+    get_all_hub_users,
 )
 
 # Logging
@@ -85,23 +86,36 @@ def list_hubs() -> str:
 
 
 @mcp.tool()
-def list_projects(hub_id: str) -> str:
+def list_projects(hub_id: str, fields: str = "") -> str:
     """
     Lists all projects in a hub.
 
+    Optionally request extra metadata by passing a comma-separated list of fields
+    (e.g. "status,projectValue,postalCode,city,constructionType").
+
     Args:
         hub_id: The Hub ID (starts with 'b.'). Use list_hubs to find this.
+        fields: Comma-separated extra fields (optional). Leave empty for default view.
     """
     try:
-        projects = get_projects(hub_id)
+        field_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
+        projects = get_projects(hub_id, fields=field_list)
         if not projects:
             return f"No projects found in hub {hub_id}."
 
         report = f"Found {len(projects)} Projects:\n"
         for p in projects:
-            name = p.get("attributes", {}).get("name", "Unknown")
+            attrs = p.get("attributes", {})
+            name = attrs.get("name", "Unknown")
             pid = p.get("id")
             report += f"- {name} (ID: {pid})\n"
+
+            # Show any extra fields that were requested
+            for key in (field_list or []):
+                val = attrs.get(key)
+                if val is not None:
+                    report += f"    {key}: {val}\n"
+
         return report
     except Exception as e:
         logger.error(f"list_projects failed: {e}")
@@ -360,6 +374,31 @@ def add_user(hub_id: str, project_id: str, email: str) -> str:
     except Exception as e:
         logger.error(f"add_user failed: {e}")
         return f"Failed to add user: {e}"
+
+
+@mcp.tool()
+def audit_hub_users(hub_id: str) -> str:
+    """
+    Scans the entire hub to list all users and the products they are assigned
+    (e.g. Build, Docs, Takeoff). Aggregates across up to 20 projects.
+
+    Args:
+        hub_id: The Hub ID (starts with 'b.'). Use list_hubs to find this.
+    """
+    try:
+        users = get_all_hub_users(hub_id)
+        if not users:
+            return f"No users found across projects in hub {hub_id}."
+
+        report = f"Hub User Audit ({len(users)} unique users):\n\n"
+        for u in users:
+            products = ", ".join(u["products"]) if u["products"] else "none"
+            report += f"- {u['name']} ({u['email']})\n    Products: {products}\n"
+
+        return report
+    except Exception as e:
+        logger.error(f"audit_hub_users failed: {e}")
+        return f"Failed to audit hub users: {e}"
 
 
 # ==========================================================================

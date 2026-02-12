@@ -184,9 +184,18 @@ def get_hubs() -> list:
     return resp.json().get("data", [])
 
 
-def get_projects(hub_id: str) -> list:
-    """List all projects in a hub (follows pagination automatically)."""
-    url: Optional[str] = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
+def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) -> list:
+    """List all projects in a hub (follows pagination automatically).
+
+    Args:
+        hub_id: Hub ID (starts with 'b.').
+        limit:  Max projects per page (default 50, max 100 per Autodesk API).
+        fields: Optional list of extra fields to include (e.g. ["status", "projectValue"]).
+    """
+    base = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects?page[limit]={limit}"
+    if fields:
+        base += f"&fields[projects]={','.join(fields)}"
+    url: Optional[str] = base
     all_projects: list = []
 
     for _ in range(50):  # safety cap
@@ -710,3 +719,53 @@ def add_project_user(hub_id: str, project_id: str, email: str, products: Optiona
     }
     resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
     return resp.json()
+
+
+def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
+    """Aggregate users and their product entitlements across all projects in a hub.
+
+    Scans up to *max_projects* projects, collects every user encountered, and
+    merges their product assignments into a single record per email.
+
+    Returns:
+        List of dicts: [{"email": ..., "name": ..., "products": ["Build", ...]}]
+    """
+    projects = get_projects(hub_id)[:max_projects]
+    logger.info(f"[Hub Audit] Scanning {len(projects)} projects in hub {hub_id}")
+
+    user_map: Dict[str, Dict[str, Any]] = {}
+
+    for p in projects:
+        pid = p.get("id", "")
+        p_name = p.get("attributes", {}).get("name", "Unknown")
+        try:
+            members = get_project_users(hub_id, pid)
+        except Exception as e:
+            logger.warning(f"  Skipping project '{p_name}': {e}")
+            continue
+
+        for member in members:
+            email = (member.get("email") or "").lower()
+            if not email:
+                continue
+
+            if email not in user_map:
+                user_map[email] = {
+                    "email": email,
+                    "name": member.get("name", email),
+                    "products": set(),
+                }
+
+            for prod in member.get("products", []):
+                key = prod.get("key", "")
+                if key:
+                    user_map[email]["products"].add(key)
+
+    # Convert sets to sorted lists for clean output
+    result = []
+    for entry in user_map.values():
+        entry["products"] = sorted(entry["products"])
+        result.append(entry)
+
+    logger.info(f"[Hub Audit] Found {len(result)} unique users across {len(projects)} projects")
+    return sorted(result, key=lambda u: u["email"])
