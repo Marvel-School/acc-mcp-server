@@ -1,6 +1,9 @@
 import os
 import logging
+import pathlib
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
+from auth import get_token
 from api import (
     find_project_globally,
     inspect_generic_file,
@@ -18,6 +21,7 @@ from api import (
     add_project_user,
     get_all_hub_users,
     soft_delete_folder,
+    safe_b64encode,
 )
 
 # Logging
@@ -468,6 +472,83 @@ def delete_folder(hub_id: str, project_name: str, folder_name: str) -> str:
     except Exception as e:
         logger.error(f"delete_folder failed: {e}")
         return f"Failed to delete folder: {e}"
+
+
+# ==========================================================================
+# MCP APPS — APS VIEWER (SEP-1865)
+# ==========================================================================
+
+# Path to the viewer HTML file (same directory as this script)
+_VIEWER_HTML_PATH = pathlib.Path(__file__).parent / "viewer.html"
+
+# Content Security Policy — allows Autodesk CDN resources inside the Copilot iframe sandbox
+_CSP_HEADER = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline' 'unsafe-eval' https://developer.api.autodesk.com https://esm.sh; "
+    "style-src 'unsafe-inline' https://developer.api.autodesk.com; "
+    "connect-src https://developer.api.autodesk.com https://cdn.derivative.autodesk.com; "
+    "img-src https://developer.api.autodesk.com blob: data:; "
+    "font-src https://developer.api.autodesk.com; "
+    "worker-src blob:; "
+    "frame-src 'none'"
+)
+
+
+@mcp.resource(
+    "ui://preview-design/viewer.html",
+    mime_type="text/html; MCP_EXT_APP",
+    meta={
+        "headers": {
+            "Content-Security-Policy": _CSP_HEADER,
+        }
+    },
+)
+def viewer_resource() -> str:
+    """Serves the APS Viewer HTML app for MCP Apps (SEP-1865)."""
+    return _VIEWER_HTML_PATH.read_text(encoding="utf-8")
+
+
+@mcp.tool(
+    meta={
+        "ui": {
+            "resourceUri": "ui://preview-design/viewer.html",
+        }
+    },
+)
+def preview_model(urn: str) -> ToolResult:
+    """
+    Opens a 3D preview of a translated model in the Autodesk Viewer.
+    Accepts a version URN (base64-encoded or raw) and renders it in an embedded viewer.
+
+    Args:
+        urn: The version URN of the model to preview (e.g. from inspect_file or count_elements).
+    """
+    try:
+        # Ensure the URN is base64url-encoded (no padding) as the viewer expects
+        if urn.startswith("urn:"):
+            encoded_urn = safe_b64encode(urn)
+        else:
+            encoded_urn = urn
+
+        # Generate a fresh 2-legged token for the viewer
+        access_token = get_token()
+
+        structured = {
+            "urn": encoded_urn,
+            "config": {
+                "accessToken": access_token,
+                "env": "AutodeskProduction",
+                "api": "derivativeV2_EU",
+            },
+        }
+
+        return ToolResult(
+            content=f"Loading 3D preview for model URN: {urn[:60]}...",
+            structured_content=structured,
+        )
+    except Exception as e:
+        logger.error(f"preview_model failed: {e}")
+        return ToolResult(content=f"Failed to preview model: {e}")
 
 
 # ==========================================================================
