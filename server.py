@@ -548,22 +548,42 @@ def preview_model(urn: str) -> ToolResult:
 # ==========================================================================
 # MCP APPS RUNTIME PATCHES (SEP-1865)
 # ==========================================================================
-# Two patches are needed for the MCP Apps / UI extension to work:
+# Three patches are needed for the MCP Apps / UI extension to work:
 #
-# 1) _meta injection — tools/list must include "_meta": {"ui": ...} on the
-#    preview_model tool.  We wrap the low-level list_tools handler because
-#    FunctionTool is a Pydantic V2 model (cannot monkey-patch).  The handler
-#    returns mcp.types.Tool objects whose `meta` field (alias="_meta",
-#    extra="allow") IS safe to set.
+# 1) _meta injection on tools/list — so the client knows preview_model has a UI.
+# 2) UI extension handshake — so the client enables iframe rendering at all.
+# 3) CSP _meta on resources/read — so the iframe is allowed to load Autodesk CDNs.
 #
-# 2) UI extension handshake — the initialize response must advertise
-#    "extensions": {"io.modelcontextprotocol/ui": {}} inside capabilities.
-#    We wrap get_capabilities() on the low-level server; ServerCapabilities
-#    has extra="allow" so we inject via __pydantic_extra__.
+# All three operate on Pydantic models that declare `meta = Field(alias="_meta")`
+# or have `extra="allow"`, making field assignment safe.
 
-from mcp.types import ListToolsRequest
+from mcp.types import ListToolsRequest, ReadResourceRequest
 
-_UI_META = {"ui": {"resourceUri": "ui://preview-design/viewer.html"}}
+_VIEWER_URI = "ui://preview-design/viewer.html"
+
+_UI_META = {"ui": {"resourceUri": _VIEWER_URI}}
+
+_CSP_META = {
+    "ui": {
+        "csp": {
+            "resourceDomains": [
+                "https://developer.api.autodesk.com",
+                "https://cdn.derivative.autodesk.com",
+                "https://fonts.autodesk.com",
+                "https://esm.sh",
+                "blob:",
+                "data:",
+            ],
+            "connectDomains": [
+                "https://developer.api.autodesk.com",
+                "https://cdn.derivative.autodesk.com",
+                "https://fonts.autodesk.com",
+                "wss://cdn.derivative.autodesk.com",
+            ],
+            "frameDomains": [],
+        }
+    }
+}
 
 
 def _inject_meta_via_handler() -> None:
@@ -600,14 +620,33 @@ def _inject_ui_extension_capability() -> None:
         ] = {}
         return caps
 
-    # Shadow the class method on the instance — Server.create_initialization_options
-    # calls self.get_capabilities(...) which will find this in __dict__ first.
     low_level.get_capabilities = _patched_get_caps
     logger.info("Patch 2 applied — UI extension will appear in initialize response")
 
 
+def _inject_csp_into_resource() -> None:
+    """Patch 3: Inject CSP _meta into the viewer resource contents."""
+    low_level = mcp._mcp_server
+    original_handler = low_level.request_handlers.get(ReadResourceRequest)
+    if not original_handler:
+        logger.warning("read_resource handler not found — CSP injection skipped")
+        return
+
+    async def _wrapped_handler(req):
+        result = await original_handler(req)
+        inner = getattr(result, "root", result)
+        for content in getattr(inner, "contents", []):
+            if str(content.uri) == _VIEWER_URI:
+                content.meta = _CSP_META
+        return result
+
+    low_level.request_handlers[ReadResourceRequest] = _wrapped_handler
+    logger.info("Patch 3 applied — CSP _meta will be injected into viewer resource")
+
+
 _inject_meta_via_handler()
 _inject_ui_extension_capability()
+_inject_csp_into_resource()
 
 
 # ==========================================================================
