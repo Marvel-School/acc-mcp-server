@@ -24,18 +24,12 @@ from api import (
     safe_b64encode,
 )
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# FastMCP
 mcp = FastMCP("Autodesk ACC Agent")
 PORT = int(os.environ.get("PORT", 8000))
 
-
-# ==========================================================================
-# DISCOVERY TOOLS
-# ==========================================================================
 
 
 @mcp.tool()
@@ -128,10 +122,6 @@ def list_projects(hub_id: str, fields: str = "") -> str:
         return f"Failed to list projects: {e}"
 
 
-# ==========================================================================
-# FILE & FOLDER NAVIGATION
-# ==========================================================================
-
 
 @mcp.tool()
 def list_top_folders(hub_id: str, project_id: str) -> str:
@@ -213,10 +203,6 @@ def inspect_file(project_id: str, file_id: str) -> str:
         return f"Error inspecting file: {e}"
 
 
-# ==========================================================================
-# MODEL TOOLS
-# ==========================================================================
-
 
 @mcp.tool()
 def reprocess_file(project_id: str, file_id: str) -> str:
@@ -286,10 +272,6 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
         logger.error(f"count_elements failed: {e}")
         return f"Error scanning model: {e}"
 
-
-# ==========================================================================
-# PROJECT MANAGEMENT
-# ==========================================================================
 
 
 @mcp.tool()
@@ -474,14 +456,8 @@ def delete_folder(hub_id: str, project_name: str, folder_name: str) -> str:
         return f"Failed to delete folder: {e}"
 
 
-# ==========================================================================
-# MCP APPS — APS VIEWER (SEP-1865)
-# ==========================================================================
-
-# Path to the viewer HTML file (same directory as this script)
 _VIEWER_HTML_PATH = pathlib.Path(__file__).parent / "viewer.html"
 
-# Content Security Policy — allows Autodesk CDN resources inside the Copilot iframe sandbox
 _CSP_HEADER = (
     "default-src 'none'; "
     "script-src 'unsafe-inline' 'unsafe-eval' https://*.autodesk.com https://cdn.jsdelivr.net; "
@@ -506,7 +482,7 @@ VIEWER_URI = "ui://preview-design/viewer-v8.html"
     },
 )
 def viewer_resource() -> str:
-    """Serves the APS Viewer HTML app for MCP Apps (SEP-1865)."""
+    """Serves the APS Viewer HTML app."""
     return _VIEWER_HTML_PATH.read_text(encoding="utf-8")
 
 
@@ -520,13 +496,7 @@ def preview_model(urn: str) -> ToolResult:
         urn: The version URN of the model to preview (e.g. from inspect_file or count_elements).
     """
     try:
-        # Ensure the URN is base64url-encoded (no padding) as the viewer expects
-        if urn.startswith("urn:"):
-            encoded_urn = safe_b64encode(urn)
-        else:
-            encoded_urn = urn
-
-        # Generate a fresh 2-legged token for the viewer
+        encoded_urn = safe_b64encode(urn) if urn.startswith("urn:") else urn
         access_token = get_token()
 
         structured = {
@@ -545,19 +515,6 @@ def preview_model(urn: str) -> ToolResult:
     except Exception as e:
         logger.error(f"preview_model failed: {e}")
         return ToolResult(content=f"Failed to preview model: {e}")
-
-
-# ==========================================================================
-# MCP APPS RUNTIME PATCHES (SEP-1865)
-# ==========================================================================
-# Three patches are needed for the MCP Apps / UI extension to work:
-#
-# 1) _meta injection on tools/list — so the client knows preview_model has a UI.
-# 2) UI extension handshake — so the client enables iframe rendering at all.
-# 3) CSP _meta on resources/read — so the iframe is allowed to load Autodesk CDNs.
-#
-# All three operate on Pydantic models that declare `meta = Field(alias="_meta")`
-# or have `extra="allow"`, making field assignment safe.
 
 from mcp.types import ListToolsRequest, ReadResourceRequest
 
@@ -588,7 +545,7 @@ _CSP_META = {
 
 
 def _inject_meta_via_handler() -> None:
-    """Patch 1: Inject _meta into preview_model in the tools/list response."""
+    """Inject UI _meta into preview_model on tools/list responses."""
     low_level = mcp._mcp_server
     original_handler = low_level.request_handlers.get(ListToolsRequest)
     if not original_handler:
@@ -604,11 +561,11 @@ def _inject_meta_via_handler() -> None:
         return result
 
     low_level.request_handlers[ListToolsRequest] = _wrapped_handler
-    logger.info("Patch 1 applied — _meta will be injected into preview_model")
+    logger.info("Patch applied: _meta on preview_model")
 
 
 def _inject_ui_extension_capability() -> None:
-    """Patch 2: Advertise io.modelcontextprotocol/ui in the initialize handshake."""
+    """Advertise io.modelcontextprotocol/ui in the initialize handshake."""
     low_level = mcp._mcp_server
     _orig_get_caps = low_level.get_capabilities  # bound method
 
@@ -622,11 +579,11 @@ def _inject_ui_extension_capability() -> None:
         return caps
 
     low_level.get_capabilities = _patched_get_caps
-    logger.info("Patch 2 applied — UI extension will appear in initialize response")
+    logger.info("Patch applied: UI extension capability")
 
 
 def _inject_csp_into_resource() -> None:
-    """Patch 3: Inject CSP _meta into the viewer resource contents."""
+    """Inject CSP _meta into the viewer resource on read."""
     low_level = mcp._mcp_server
     original_handler = low_level.request_handlers.get(ReadResourceRequest)
     if not original_handler:
@@ -642,17 +599,13 @@ def _inject_csp_into_resource() -> None:
         return result
 
     low_level.request_handlers[ReadResourceRequest] = _wrapped_handler
-    logger.info("Patch 3 applied — CSP _meta will be injected into viewer resource")
+    logger.info("Patch applied: CSP on viewer resource")
 
 
 _inject_meta_via_handler()
 _inject_ui_extension_capability()
 _inject_csp_into_resource()
 
-
-# ==========================================================================
-# ENTRYPOINT
-# ==========================================================================
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")

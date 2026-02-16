@@ -23,9 +23,6 @@ from auth import get_token
 logger = logging.getLogger(__name__)
 
 
-# ==========================================================================
-# UTILITIES
-# ==========================================================================
 
 def _strip_b_prefix(id_str: str) -> str:
     """Safely removes the 'b.' prefix from Hub/Project IDs."""
@@ -51,9 +48,6 @@ def safe_b64encode(value: Optional[str]) -> str:
     return base64.urlsafe_b64encode(value.encode("utf-8")).decode("utf-8").rstrip("=")
 
 
-# ==========================================================================
-# CENTRALIZED REQUEST HELPER
-# ==========================================================================
 
 def _make_request(
     method: str,
@@ -92,7 +86,6 @@ def _make_request(
 
             last_resp = requests.request(method, url, headers=headers, **kwargs)
 
-            # 429 — rate limited: honour Retry-After, retry once
             if last_resp.status_code == 429:
                 wait = int(last_resp.headers.get("Retry-After", 5))
                 logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
@@ -100,14 +93,12 @@ def _make_request(
                 last_resp = requests.request(method, url, headers=headers, **kwargs)
                 break
 
-            # 401 — stale token: refresh and retry
             if last_resp.status_code == 401 and attempt == 0 and retry_on_401:
                 logger.warning(f"401 on {method} {url[:80]} — refreshing token")
                 continue
 
             break
 
-        # LOUD FAILURE: If the status is 4xx or 5xx, crash immediately
         try:
             last_resp.raise_for_status()
         except requests.exceptions.HTTPError as http_err:
@@ -132,15 +123,11 @@ def _make_request(
         raise
 
 
-# ==========================================================================
-# ADMIN USER-ID HELPER
-# ==========================================================================
 
 def _get_admin_user_id(account_id: str) -> str:
     """Fetches the Autodesk User ID for the Account Admin, using a local dev fallback if needed."""
     admin_email = os.getenv("ACC_ADMIN_EMAIL")
     if not admin_email:
-        # In Azure (App Service / Functions), fail loudly — missing env var is a deploy mistake.
         if os.getenv("WEBSITE_SITE_NAME") or os.getenv("FUNCTIONS_WORKER_RUNTIME"):
             raise ValueError("CRITICAL: ACC_ADMIN_EMAIL environment variable is missing in production environment.")
         logger.warning("ACC_ADMIN_EMAIL missing from env. Defaulting to local dev fallback...")
@@ -161,9 +148,6 @@ def get_user_id_by_email(account_id: str, email: str) -> str:
     return user_id
 
 
-# ==========================================================================
-# HUB & PROJECT DISCOVERY
-# ==========================================================================
 
 _hub_cache: Dict[str, Optional[str]] = {"id": None}
 
@@ -204,7 +188,6 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
         data = resp.json()
         all_projects.extend(data.get("data", []))
 
-        # Follow pagination link
         next_link = data.get("links", {}).get("next")
         if isinstance(next_link, dict):
             url = next_link.get("href")
@@ -258,9 +241,6 @@ def find_project_globally(name_query: str) -> Optional[tuple]:
         return None
 
 
-# ==========================================================================
-# FOLDER NAVIGATION
-# ==========================================================================
 
 def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]], str]:
     """Fetches top-level folders for a project."""
@@ -339,7 +319,6 @@ def find_design_files(
         if isinstance(top_folders, str):
             return f"Failed to get top folders: {top_folders}"
 
-        # Find "Project Files" (fall back to first folder)
         root_id = None
         for folder in top_folders:
             if folder.get("name") == "Project Files":
@@ -394,9 +373,6 @@ def find_design_files(
         return f"Error: {e}"
 
 
-# ==========================================================================
-# FILE RESOLUTION
-# ==========================================================================
 
 def resolve_file_to_urn(project_id: str, identifier: str) -> str:
     """
@@ -489,7 +465,6 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
         except ValueError as e:
             return str(e)
 
-        # Resolve to version URN
         if "lineage" in resolved:
             version_urn = get_latest_version_urn(project_id, resolved)
             if not version_urn:
@@ -505,7 +480,6 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
         url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded}/manifest"
         resp = _make_request("GET", url)
 
-        # 202 Accepted = translation still in progress (2xx, not caught by raise_for_status)
         if resp.status_code == 202:
             return "Processing — translation in progress."
 
@@ -525,9 +499,6 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
         return f"Error: {e}"
 
 
-# ==========================================================================
-# MODEL DERIVATIVE — STREAMING SCANNER & TRANSLATION
-# ==========================================================================
 
 def get_view_guid_only(version_urn: str) -> str:
     """
@@ -562,7 +533,6 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     """
     logger.info(f"[Streaming Scanner] Counting: {category_name}")
 
-    # Smart singularization
     terms = {category_name}
     if category_name.lower().endswith("s") and len(category_name) > 2:
         terms.add(category_name[:-1])
@@ -573,7 +543,6 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     urn_b64 = safe_b64encode(version_urn)
     url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata/{guid}"
 
-    # Composite regex — matches JSON values containing any search term
     terms_pattern = b"|".join(re.escape(t).encode() for t in terms)
     pattern = re.compile(
         rb':\s*"[^"]*(' + terms_pattern + rb')[^"]*"', re.IGNORECASE
@@ -594,8 +563,6 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
             matches = list(pattern.finditer(buffer))
             count += len(matches)
 
-            # Advance past fully-processed matches to prevent double-counting.
-            # Only the tail after the last match is carried over.
             if matches:
                 buffer = buffer[matches[-1].end():]
             else:
@@ -651,9 +618,6 @@ def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
         return f"Error: {e}"
 
 
-# ==========================================================================
-# PROJECT MANAGEMENT
-# ==========================================================================
 
 def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
     """Creates a project using the ACC Account Admin API."""
@@ -762,7 +726,6 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
                 if key:
                     user_map[email]["products"].add(key)
 
-    # Convert sets to sorted lists for clean output
     result = []
     for entry in user_map.values():
         entry["products"] = sorted(entry["products"])
@@ -899,7 +862,6 @@ def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
     if isinstance(top_folders, str):
         raise ValueError(f"Could not list top folders: {top_folders}")
 
-    # Find "Project Files" root
     root_id = None
     for f in top_folders:
         if (f.get("name") or "").lower() == "project files":
@@ -910,7 +872,6 @@ def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
     if not root_id:
         raise ValueError("No top-level folders found in project.")
 
-    # List children and match by name
     contents = get_folder_contents(project_id, root_id)
     if isinstance(contents, str):
         raise ValueError(f"Could not read folder contents: {contents}")
@@ -930,7 +891,6 @@ def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
     if not folder_id:
         return f"Folder '{folder_name}' not found under Project Files."
 
-    # PATCH to hide
     proj_clean = ensure_b_prefix(project_id)
     folder_encoded = encode_urn(folder_id)
     url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders/{folder_encoded}"
