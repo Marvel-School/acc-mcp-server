@@ -496,7 +496,7 @@ _CSP_HEADER = (
 
 @mcp.resource(
     "ui://preview-design/viewer.html",
-    mime_type="text/html; MCP_EXT_APP",
+    mime_type="text/html;profile=mcp-app",
     meta={
         "headers": {
             "Content-Security-Policy": _CSP_HEADER,
