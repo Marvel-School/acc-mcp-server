@@ -76,14 +76,25 @@
                         hideStatus();
                         viewer.loadDocumentNode(doc, defaultModel);
 
-                        viewer.addEventListener(Autodesk.Viewing.SELECTION_CHANGED_EVENT, async () => {
+                        viewer.addEventListener(Autodesk.Viewing.SELECTION_CHANGED_EVENT, () => {
                             const ids = viewer.getSelection();
                             if (ids.length > 0) {
-                                await app.updateModelContext({
-                                    content: [{
-                                        type: "text",
-                                        text: `User selected objects with IDs: ${ids.join(", ")}`
-                                    }]
+                                viewer.getProperties(ids[0], async (result) => {
+                                    let propText = `User selected element: ${result.name || ids[0]}\n`;
+                                    if (result.properties) {
+                                        result.properties.forEach(p => {
+                                            if (p.displayCategory && !p.hidden && !p.displayName.startsWith("__")) {
+                                                propText += `- [${p.displayCategory}] ${p.displayName}: ${p.displayValue}\n`;
+                                            }
+                                        });
+                                    }
+
+                                    await app.updateModelContext({
+                                        content: [{
+                                            type: "text",
+                                            text: propText
+                                        }]
+                                    });
                                 });
                             }
                         });
