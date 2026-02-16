@@ -484,18 +484,18 @@ _VIEWER_HTML_PATH = pathlib.Path(__file__).parent / "viewer.html"
 # Content Security Policy — allows Autodesk CDN resources inside the Copilot iframe sandbox
 _CSP_HEADER = (
     "default-src 'none'; "
-    "script-src 'unsafe-inline' 'unsafe-eval' https://developer.api.autodesk.com https://esm.sh; "
-    "style-src 'unsafe-inline' https://developer.api.autodesk.com; "
-    "connect-src https://developer.api.autodesk.com https://cdn.derivative.autodesk.com; "
-    "img-src https://developer.api.autodesk.com blob: data:; "
-    "font-src https://developer.api.autodesk.com; "
+    "script-src 'unsafe-inline' 'unsafe-eval' https://*.autodesk.com https://cdn.jsdelivr.net; "
+    "style-src 'unsafe-inline' https://*.autodesk.com; "
+    "connect-src https://*.autodesk.com https://*.autodesk360.com https://*.amazonaws.com wss://*.autodesk.com https://cdn.jsdelivr.net; "
+    "img-src https://*.autodesk.com blob: data:; "
+    "font-src https://*.autodesk.com; "
     "worker-src blob:; "
     "frame-src 'none'"
 )
 
 
 @mcp.resource(
-    "ui://preview-design/viewer-v3.html",
+    "ui://preview-design/viewer-v4.html",
     mime_type="text/html;profile=mcp-app",
     meta={
         "headers": {
@@ -559,7 +559,7 @@ def preview_model(urn: str) -> ToolResult:
 
 from mcp.types import ListToolsRequest, ReadResourceRequest
 
-_VIEWER_URI = "ui://preview-design/viewer-v3.html"
+_VIEWER_URI = "ui://preview-design/viewer-v4.html"
 
 _UI_META = {"ui": {"resourceUri": _VIEWER_URI}}
 
@@ -567,22 +567,19 @@ _CSP_META = {
     "ui": {
         "csp": {
             "resourceDomains": [
-                "https://developer.api.autodesk.com",
-                "https://cdn.derivative.autodesk.com",
-                "https://cdn-eu.derivative.autodesk.com",
-                "https://fonts.autodesk.com",
-                "https://esm.sh",
+                "https://*.autodesk.com",
+                "https://*.autodesk360.com",
+                "https://*.amazonaws.com",
+                "https://cdn.jsdelivr.net",
                 "blob:",
                 "data:",
             ],
             "connectDomains": [
-                "https://developer.api.autodesk.com",
-                "https://cdn.derivative.autodesk.com",
-                "https://cdn-eu.derivative.autodesk.com",
-                "https://fonts.autodesk.com",
-                "wss://cdn.derivative.autodesk.com",
-                "wss://cdn-eu.derivative.autodesk.com",
-                "https://js.autodesk.com",
+                "https://*.autodesk.com",
+                "https://*.autodesk360.com",
+                "https://*.amazonaws.com",
+                "wss://*.autodesk.com",
+                "https://cdn.jsdelivr.net",
             ],
             "frameDomains": [],
         }
