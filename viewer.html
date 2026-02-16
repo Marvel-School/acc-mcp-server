@@ -84,7 +84,7 @@
         }
 
         // Initialize MCP App and listen for tool results
-        const app = new App();
+        const app = new App({ name: "Autodesk Viewer", version: "1.0.0" });
 
         app.ontoolresult = (result) => {
             try {

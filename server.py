@@ -493,9 +493,11 @@ _CSP_HEADER = (
     "frame-src 'none'"
 )
 
+VIEWER_URI = "ui://preview-design/viewer-v6.html"
+
 
 @mcp.resource(
-    "ui://preview-design/viewer-v5.html",
+    VIEWER_URI,
     mime_type="text/html;profile=mcp-app",
     meta={
         "headers": {
@@ -559,9 +561,7 @@ def preview_model(urn: str) -> ToolResult:
 
 from mcp.types import ListToolsRequest, ReadResourceRequest
 
-_VIEWER_URI = "ui://preview-design/viewer-v5.html"
-
-_UI_META = {"ui": {"resourceUri": _VIEWER_URI}}
+_UI_META = {"ui": {"resourceUri": VIEWER_URI}}
 
 _CSP_META = {
     "ui": {
@@ -637,7 +637,7 @@ def _inject_csp_into_resource() -> None:
         result = await original_handler(req)
         inner = getattr(result, "root", result)
         for content in getattr(inner, "contents", []):
-            if str(content.uri) == _VIEWER_URI:
+            if str(content.uri) == VIEWER_URI:
                 content.meta = _CSP_META
         return result
 
