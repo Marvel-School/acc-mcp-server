@@ -493,7 +493,7 @@ _CSP_HEADER = (
     "frame-src 'none'"
 )
 
-VIEWER_URI = "ui://preview-design/viewer-v6.html"
+VIEWER_URI = "ui://preview-design/viewer-v7.html"
 
 
 @mcp.resource(

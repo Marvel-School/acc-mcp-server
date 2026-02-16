@@ -12,7 +12,7 @@
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { width: 100%; height: 100%; overflow: hidden; }
-        #viewer-container { width: 100vw; height: 100vh; position: relative; }
+        #viewer-container { width: 100%; height: 100vh; min-height: 500px; position: relative; }
         #status {
             position: absolute; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
@@ -75,6 +75,18 @@
                         }
                         hideStatus();
                         viewer.loadDocumentNode(doc, defaultModel);
+
+                        viewer.addEventListener(Autodesk.Viewing.SELECTION_CHANGED_EVENT, async () => {
+                            const ids = viewer.getSelection();
+                            if (ids.length > 0) {
+                                await app.updateModelContext({
+                                    content: [{
+                                        type: "text",
+                                        text: `User selected objects with IDs: ${ids.join(", ")}`
+                                    }]
+                                });
+                            }
+                        });
                     },
                     (errorCode, errorMsg) => {
                         setStatus(`Error loading document: ${errorMsg} (code ${errorCode})`);
