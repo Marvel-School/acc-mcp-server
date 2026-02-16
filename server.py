@@ -546,14 +546,20 @@ def preview_model(urn: str) -> ToolResult:
 
 
 # ==========================================================================
-# FORCE _meta INJECTION (MCP Apps / SEP-1865)
+# MCP APPS RUNTIME PATCHES (SEP-1865)
 # ==========================================================================
-# The MCP Apps spec requires "_meta": {"ui": {"resourceUri": ...}} on the
-# preview_model tool in the tools/list JSON response.  We cannot patch the
-# FastMCP FunctionTool directly (Pydantic V2 forbids setting undeclared
-# attributes).  Instead we wrap the low-level list_tools request handler:
-# it returns mcp.types.Tool objects which DO declare a `meta` field
-# (alias="_meta", extra="allow"), so setting tool.meta = {...} is safe.
+# Two patches are needed for the MCP Apps / UI extension to work:
+#
+# 1) _meta injection — tools/list must include "_meta": {"ui": ...} on the
+#    preview_model tool.  We wrap the low-level list_tools handler because
+#    FunctionTool is a Pydantic V2 model (cannot monkey-patch).  The handler
+#    returns mcp.types.Tool objects whose `meta` field (alias="_meta",
+#    extra="allow") IS safe to set.
+#
+# 2) UI extension handshake — the initialize response must advertise
+#    "extensions": {"io.modelcontextprotocol/ui": {}} inside capabilities.
+#    We wrap get_capabilities() on the low-level server; ServerCapabilities
+#    has extra="allow" so we inject via __pydantic_extra__.
 
 from mcp.types import ListToolsRequest
 
@@ -561,6 +567,7 @@ _UI_META = {"ui": {"resourceUri": "ui://preview-design/viewer.html"}}
 
 
 def _inject_meta_via_handler() -> None:
+    """Patch 1: Inject _meta into preview_model in the tools/list response."""
     low_level = mcp._mcp_server
     original_handler = low_level.request_handlers.get(ListToolsRequest)
     if not original_handler:
@@ -569,7 +576,6 @@ def _inject_meta_via_handler() -> None:
 
     async def _wrapped_handler(req):
         result = await original_handler(req)
-        # result is ServerResult (RootModel) wrapping ListToolsResult
         inner = getattr(result, "root", result)
         for tool in getattr(inner, "tools", []):
             if tool.name == "preview_model":
@@ -577,10 +583,31 @@ def _inject_meta_via_handler() -> None:
         return result
 
     low_level.request_handlers[ListToolsRequest] = _wrapped_handler
-    logger.info("Wrapped list_tools handler — _meta will be injected into preview_model")
+    logger.info("Patch 1 applied — _meta will be injected into preview_model")
+
+
+def _inject_ui_extension_capability() -> None:
+    """Patch 2: Advertise io.modelcontextprotocol/ui in the initialize handshake."""
+    low_level = mcp._mcp_server
+    _orig_get_caps = low_level.get_capabilities  # bound method
+
+    def _patched_get_caps(notification_options, experimental_capabilities):
+        caps = _orig_get_caps(notification_options, experimental_capabilities)
+        if caps.__pydantic_extra__ is None:
+            caps.__pydantic_extra__ = {}
+        caps.__pydantic_extra__.setdefault("extensions", {})[
+            "io.modelcontextprotocol/ui"
+        ] = {}
+        return caps
+
+    # Shadow the class method on the instance — Server.create_initialization_options
+    # calls self.get_capabilities(...) which will find this in __dict__ first.
+    low_level.get_capabilities = _patched_get_caps
+    logger.info("Patch 2 applied — UI extension will appear in initialize response")
 
 
 _inject_meta_via_handler()
+_inject_ui_extension_capability()
 
 
 # ==========================================================================
