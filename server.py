@@ -495,7 +495,7 @@ _CSP_HEADER = (
 
 
 @mcp.resource(
-    "ui://preview-design/viewer-v2.html",
+    "ui://preview-design/viewer-v3.html",
     mime_type="text/html;profile=mcp-app",
     meta={
         "headers": {
@@ -559,7 +559,7 @@ def preview_model(urn: str) -> ToolResult:
 
 from mcp.types import ListToolsRequest, ReadResourceRequest
 
-_VIEWER_URI = "ui://preview-design/viewer-v2.html"
+_VIEWER_URI = "ui://preview-design/viewer-v3.html"
 
 _UI_META = {"ui": {"resourceUri": _VIEWER_URI}}
 
@@ -569,6 +569,7 @@ _CSP_META = {
             "resourceDomains": [
                 "https://developer.api.autodesk.com",
                 "https://cdn.derivative.autodesk.com",
+                "https://cdn-eu.derivative.autodesk.com",
                 "https://fonts.autodesk.com",
                 "https://esm.sh",
                 "blob:",
@@ -577,8 +578,11 @@ _CSP_META = {
             "connectDomains": [
                 "https://developer.api.autodesk.com",
                 "https://cdn.derivative.autodesk.com",
+                "https://cdn-eu.derivative.autodesk.com",
                 "https://fonts.autodesk.com",
                 "wss://cdn.derivative.autodesk.com",
+                "wss://cdn-eu.derivative.autodesk.com",
+                "https://js.autodesk.com",
             ],
             "frameDomains": [],
         }
