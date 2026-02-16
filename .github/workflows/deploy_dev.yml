@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - dev
+      - feature/mcp-aps-viewer
   workflow_dispatch:
 
 env:

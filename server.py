@@ -1,6 +1,9 @@
 import os
 import logging
+import pathlib
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
+from auth import get_token
 from api import (
     find_project_globally,
     inspect_generic_file,
@@ -18,20 +21,15 @@ from api import (
     add_project_user,
     get_all_hub_users,
     soft_delete_folder,
+    safe_b64encode,
 )
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# FastMCP
 mcp = FastMCP("Autodesk ACC Agent")
 PORT = int(os.environ.get("PORT", 8000))
 
-
-# ==========================================================================
-# DISCOVERY TOOLS
-# ==========================================================================
 
 
 @mcp.tool()
@@ -124,10 +122,6 @@ def list_projects(hub_id: str, fields: str = "") -> str:
         return f"Failed to list projects: {e}"
 
 
-# ==========================================================================
-# FILE & FOLDER NAVIGATION
-# ==========================================================================
-
 
 @mcp.tool()
 def list_top_folders(hub_id: str, project_id: str) -> str:
@@ -209,10 +203,6 @@ def inspect_file(project_id: str, file_id: str) -> str:
         return f"Error inspecting file: {e}"
 
 
-# ==========================================================================
-# MODEL TOOLS
-# ==========================================================================
-
 
 @mcp.tool()
 def reprocess_file(project_id: str, file_id: str) -> str:
@@ -282,10 +272,6 @@ def count_elements(project_id: str, file_id: str, category_name: str) -> str:
         logger.error(f"count_elements failed: {e}")
         return f"Error scanning model: {e}"
 
-
-# ==========================================================================
-# PROJECT MANAGEMENT
-# ==========================================================================
 
 
 @mcp.tool()
@@ -470,9 +456,156 @@ def delete_folder(hub_id: str, project_name: str, folder_name: str) -> str:
         return f"Failed to delete folder: {e}"
 
 
-# ==========================================================================
-# ENTRYPOINT
-# ==========================================================================
+_VIEWER_HTML_PATH = pathlib.Path(__file__).parent / "viewer.html"
+
+_CSP_HEADER = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline' 'unsafe-eval' https://*.autodesk.com https://cdn.jsdelivr.net; "
+    "style-src 'unsafe-inline' https://*.autodesk.com; "
+    "connect-src https://*.autodesk.com https://*.autodesk360.com https://*.amazonaws.com wss://*.autodesk.com https://cdn.jsdelivr.net; "
+    "img-src https://*.autodesk.com blob: data:; "
+    "font-src https://*.autodesk.com; "
+    "worker-src blob:; "
+    "frame-src 'none'"
+)
+
+VIEWER_URI = "ui://preview-design/viewer-v8.html"
+
+
+@mcp.resource(
+    VIEWER_URI,
+    mime_type="text/html;profile=mcp-app",
+    meta={
+        "headers": {
+            "Content-Security-Policy": _CSP_HEADER,
+        }
+    },
+)
+def viewer_resource() -> str:
+    """Serves the APS Viewer HTML app."""
+    return _VIEWER_HTML_PATH.read_text(encoding="utf-8")
+
+
+@mcp.tool()
+def preview_model(urn: str) -> ToolResult:
+    """
+    Opens a 3D preview of a translated model in the Autodesk Viewer.
+    Accepts a version URN (base64-encoded or raw) and renders it in an embedded viewer.
+
+    Args:
+        urn: The version URN of the model to preview (e.g. from inspect_file or count_elements).
+    """
+    try:
+        encoded_urn = safe_b64encode(urn) if urn.startswith("urn:") else urn
+        access_token = get_token()
+
+        structured = {
+            "urn": encoded_urn,
+            "config": {
+                "accessToken": access_token,
+                "env": "AutodeskProduction",
+                "api": "derivativeV2_EU",
+            },
+        }
+
+        return ToolResult(
+            content=f"Loading 3D preview for model URN: {urn[:60]}...",
+            structured_content=structured,
+        )
+    except Exception as e:
+        logger.error(f"preview_model failed: {e}")
+        return ToolResult(content=f"Failed to preview model: {e}")
+
+from mcp.types import ListToolsRequest, ReadResourceRequest
+
+_UI_META = {"ui": {"resourceUri": VIEWER_URI}}
+
+_CSP_META = {
+    "ui": {
+        "csp": {
+            "resourceDomains": [
+                "https://*.autodesk.com",
+                "https://*.autodesk360.com",
+                "https://*.amazonaws.com",
+                "https://cdn.jsdelivr.net",
+                "blob:",
+                "data:",
+            ],
+            "connectDomains": [
+                "https://*.autodesk.com",
+                "https://*.autodesk360.com",
+                "https://*.amazonaws.com",
+                "wss://*.autodesk.com",
+                "https://cdn.jsdelivr.net",
+            ],
+            "frameDomains": [],
+        }
+    }
+}
+
+
+def _inject_meta_via_handler() -> None:
+    """Inject UI _meta into preview_model on tools/list responses."""
+    low_level = mcp._mcp_server
+    original_handler = low_level.request_handlers.get(ListToolsRequest)
+    if not original_handler:
+        logger.warning("list_tools handler not found — _meta injection skipped")
+        return
+
+    async def _wrapped_handler(req):
+        result = await original_handler(req)
+        inner = getattr(result, "root", result)
+        for tool in getattr(inner, "tools", []):
+            if tool.name == "preview_model":
+                tool.meta = _UI_META
+        return result
+
+    low_level.request_handlers[ListToolsRequest] = _wrapped_handler
+    logger.info("Patch applied: _meta on preview_model")
+
+
+def _inject_ui_extension_capability() -> None:
+    """Advertise io.modelcontextprotocol/ui in the initialize handshake."""
+    low_level = mcp._mcp_server
+    _orig_get_caps = low_level.get_capabilities  # bound method
+
+    def _patched_get_caps(notification_options, experimental_capabilities):
+        caps = _orig_get_caps(notification_options, experimental_capabilities)
+        if caps.__pydantic_extra__ is None:
+            caps.__pydantic_extra__ = {}
+        caps.__pydantic_extra__.setdefault("extensions", {})[
+            "io.modelcontextprotocol/ui"
+        ] = {}
+        return caps
+
+    low_level.get_capabilities = _patched_get_caps
+    logger.info("Patch applied: UI extension capability")
+
+
+def _inject_csp_into_resource() -> None:
+    """Inject CSP _meta into the viewer resource on read."""
+    low_level = mcp._mcp_server
+    original_handler = low_level.request_handlers.get(ReadResourceRequest)
+    if not original_handler:
+        logger.warning("read_resource handler not found — CSP injection skipped")
+        return
+
+    async def _wrapped_handler(req):
+        result = await original_handler(req)
+        inner = getattr(result, "root", result)
+        for content in getattr(inner, "contents", []):
+            if str(content.uri) == VIEWER_URI:
+                content.meta = _CSP_META
+        return result
+
+    low_level.request_handlers[ReadResourceRequest] = _wrapped_handler
+    logger.info("Patch applied: CSP on viewer resource")
+
+
+_inject_meta_via_handler()
+_inject_ui_extension_capability()
+_inject_csp_into_resource()
+
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
