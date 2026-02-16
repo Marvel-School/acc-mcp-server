@@ -949,3 +949,53 @@ def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
     )
     logger.info(f"Folder '{matched_name}' hidden in project {project_id}")
     return f"Successfully deleted folder '{matched_name}'."
+
+
+# ==========================================================================
+# MODEL DERIVATIVE — ELEMENT PROPERTIES
+# ==========================================================================
+
+def get_element_properties(urn: str, object_id: int) -> Dict[str, Any]:
+    """
+    Fetch BIM properties for a specific element (dbId) from the Model Derivative API.
+
+    1. GET .../metadata          → find the 3D view GUID
+    2. GET .../metadata/{guid}/properties?objectid=...  → element props
+
+    Returns a dict with the element's name and properties, or raises ValueError.
+    """
+    base = "https://developer.api.autodesk.com/modelderivative/v2/designdata"
+
+    # Step 1: Get the metadata views and find the 3D GUID
+    meta_resp = _make_request("GET", f"{base}/{urn}/metadata")
+    views = meta_resp.json().get("data", {}).get("metadata", [])
+
+    guid = None
+    for view in views:
+        if view.get("role") == "3d":
+            guid = view.get("guid")
+            break
+
+    if not guid:
+        # Fallback: use the first view if no explicit 3D role
+        if views:
+            guid = views[0].get("guid")
+        else:
+            raise ValueError("No metadata views found for this URN. The model may not be translated yet.")
+
+    # Step 2: Fetch properties for the specific object ID
+    props_resp = _make_request(
+        "GET",
+        f"{base}/{urn}/metadata/{guid}/properties",
+        params={"objectid": object_id},
+    )
+    props_data = props_resp.json()
+
+    collection = props_data.get("data", {}).get("collection", [])
+    if not collection:
+        raise ValueError(
+            f"No properties found for objectId {object_id}. "
+            "The ID may be invalid or properties are still extracting."
+        )
+
+    return collection[0]

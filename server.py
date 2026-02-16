@@ -22,6 +22,7 @@ from api import (
     get_all_hub_users,
     soft_delete_folder,
     safe_b64encode,
+    get_element_properties,
 )
 
 # Logging
@@ -545,6 +546,37 @@ def preview_model(urn: str) -> ToolResult:
     except Exception as e:
         logger.error(f"preview_model failed: {e}")
         return ToolResult(content=f"Failed to preview model: {e}")
+
+
+@mcp.tool()
+def get_element_props(urn: str, object_id: int) -> str:
+    """
+    Fetch BIM properties (material, Revit parameters, constraints) for a
+    specific element selected in the Autodesk Viewer.
+
+    Args:
+        urn: The base64url-encoded URN of the translated model.
+        object_id: The dbId of the element (provided by the viewer selection context).
+    """
+    try:
+        props = get_element_properties(urn, object_id)
+        name = props.get("name", "Unknown element")
+        ext_id = props.get("externalId", "")
+        properties = props.get("properties", {})
+
+        lines = [f"Element: {name}", f"External ID: {ext_id}", ""]
+        for category, params in properties.items():
+            lines.append(f"--- {category} ---")
+            for key, val in params.items():
+                lines.append(f"  {key}: {val}")
+            lines.append("")
+
+        return "\n".join(lines)
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        logger.error(f"get_element_props failed: {e}")
+        return f"Failed to fetch element properties: {e}"
 
 
 # ==========================================================================
