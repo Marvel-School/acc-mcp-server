@@ -965,9 +965,16 @@ def get_element_properties(urn: str, object_id: int) -> Dict[str, Any]:
     Returns a dict with the element's name and properties, or raises ValueError.
     """
     base = "https://developer.api.autodesk.com/modelderivative/v2/designdata"
+    region_header = {"region": "EMEA"}
+
+    # Ensure the URN is base64url-encoded (no padding)
+    if urn.startswith("urn:"):
+        safe_urn = base64.urlsafe_b64encode(urn.encode("utf-8")).decode("utf-8").rstrip("=")
+    else:
+        safe_urn = urn
 
     # Step 1: Get the metadata views and find the 3D GUID
-    meta_resp = _make_request("GET", f"{base}/{urn}/metadata")
+    meta_resp = _make_request("GET", f"{base}/{safe_urn}/metadata", extra_headers=region_header)
     views = meta_resp.json().get("data", {}).get("metadata", [])
 
     guid = None
@@ -986,8 +993,9 @@ def get_element_properties(urn: str, object_id: int) -> Dict[str, Any]:
     # Step 2: Fetch properties for the specific object ID
     props_resp = _make_request(
         "GET",
-        f"{base}/{urn}/metadata/{guid}/properties",
+        f"{base}/{safe_urn}/metadata/{guid}/properties",
         params={"objectid": object_id},
+        extra_headers=region_header,
     )
     props_data = props_resp.json()
 
