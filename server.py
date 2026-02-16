@@ -548,35 +548,39 @@ def preview_model(urn: str) -> ToolResult:
 # ==========================================================================
 # FORCE _meta INJECTION (MCP Apps / SEP-1865)
 # ==========================================================================
-# The MCP Apps spec requires "_meta": {"ui": {"resourceUri": ...}} in the
-# tools/list JSON response.  FastMCP's meta= decorator parameter stores the
-# value on the Python object, but Claude Desktop expects the wire-format key
-# to be literally "_meta".  This monkey-patch bypasses get_meta() and injects
-# _meta directly via the to_mcp_tool() overrides mechanism so it is guaranteed
-# to appear in the serialised tools/list output.
+# The MCP Apps spec requires "_meta": {"ui": {"resourceUri": ...}} on the
+# preview_model tool in the tools/list JSON response.  We cannot patch the
+# FastMCP FunctionTool directly (Pydantic V2 forbids setting undeclared
+# attributes).  Instead we wrap the low-level list_tools request handler:
+# it returns mcp.types.Tool objects which DO declare a `meta` field
+# (alias="_meta", extra="allow"), so setting tool.meta = {...} is safe.
+
+from mcp.types import ListToolsRequest
 
 _UI_META = {"ui": {"resourceUri": "ui://preview-design/viewer.html"}}
 
 
-def _force_inject_meta() -> None:
-    tool = mcp._tool_manager._tools.get("preview_model")
-    if not tool:
-        logger.warning("preview_model tool not found — _meta injection skipped")
+def _inject_meta_via_handler() -> None:
+    low_level = mcp._mcp_server
+    original_handler = low_level.request_handlers.get(ListToolsRequest)
+    if not original_handler:
+        logger.warning("list_tools handler not found — _meta injection skipped")
         return
 
-    _original_to_mcp_tool = tool.to_mcp_tool
+    async def _wrapped_handler(req):
+        result = await original_handler(req)
+        # result is ServerResult (RootModel) wrapping ListToolsResult
+        inner = getattr(result, "root", result)
+        for tool in getattr(inner, "tools", []):
+            if tool.name == "preview_model":
+                tool.meta = _UI_META
+        return result
 
-    def _patched_to_mcp_tool(*, include_fastmcp_meta=None, **overrides):
-        overrides.setdefault("_meta", _UI_META)
-        return _original_to_mcp_tool(
-            include_fastmcp_meta=include_fastmcp_meta, **overrides
-        )
-
-    tool.to_mcp_tool = _patched_to_mcp_tool
-    logger.info("Force-injected _meta into preview_model tool definition")
+    low_level.request_handlers[ListToolsRequest] = _wrapped_handler
+    logger.info("Wrapped list_tools handler — _meta will be injected into preview_model")
 
 
-_force_inject_meta()
+_inject_meta_via_handler()
 
 
 # ==========================================================================
