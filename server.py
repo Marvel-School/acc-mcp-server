@@ -495,7 +495,7 @@ _CSP_HEADER = (
 
 
 @mcp.resource(
-    "ui://preview-design/viewer-v4.html",
+    "ui://preview-design/viewer-v5.html",
     mime_type="text/html;profile=mcp-app",
     meta={
         "headers": {
@@ -559,7 +559,7 @@ def preview_model(urn: str) -> ToolResult:
 
 from mcp.types import ListToolsRequest, ReadResourceRequest
 
-_VIEWER_URI = "ui://preview-design/viewer-v4.html"
+_VIEWER_URI = "ui://preview-design/viewer-v5.html"
 
 _UI_META = {"ui": {"resourceUri": _VIEWER_URI}}
 
