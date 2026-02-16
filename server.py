@@ -508,13 +508,7 @@ def viewer_resource() -> str:
     return _VIEWER_HTML_PATH.read_text(encoding="utf-8")
 
 
-@mcp.tool(
-    meta={
-        "ui": {
-            "resourceUri": "ui://preview-design/viewer.html",
-        }
-    },
-)
+@mcp.tool()
 def preview_model(urn: str) -> ToolResult:
     """
     Opens a 3D preview of a translated model in the Autodesk Viewer.
@@ -549,6 +543,40 @@ def preview_model(urn: str) -> ToolResult:
     except Exception as e:
         logger.error(f"preview_model failed: {e}")
         return ToolResult(content=f"Failed to preview model: {e}")
+
+
+# ==========================================================================
+# FORCE _meta INJECTION (MCP Apps / SEP-1865)
+# ==========================================================================
+# The MCP Apps spec requires "_meta": {"ui": {"resourceUri": ...}} in the
+# tools/list JSON response.  FastMCP's meta= decorator parameter stores the
+# value on the Python object, but Claude Desktop expects the wire-format key
+# to be literally "_meta".  This monkey-patch bypasses get_meta() and injects
+# _meta directly via the to_mcp_tool() overrides mechanism so it is guaranteed
+# to appear in the serialised tools/list output.
+
+_UI_META = {"ui": {"resourceUri": "ui://preview-design/viewer.html"}}
+
+
+def _force_inject_meta() -> None:
+    tool = mcp._tool_manager._tools.get("preview_model")
+    if not tool:
+        logger.warning("preview_model tool not found — _meta injection skipped")
+        return
+
+    _original_to_mcp_tool = tool.to_mcp_tool
+
+    def _patched_to_mcp_tool(*, include_fastmcp_meta=None, **overrides):
+        overrides.setdefault("_meta", _UI_META)
+        return _original_to_mcp_tool(
+            include_fastmcp_meta=include_fastmcp_meta, **overrides
+        )
+
+    tool.to_mcp_tool = _patched_to_mcp_tool
+    logger.info("Force-injected _meta into preview_model tool definition")
+
+
+_force_inject_meta()
 
 
 # ==========================================================================
