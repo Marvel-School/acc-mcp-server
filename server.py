@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import hashlib
 import logging
@@ -32,6 +33,15 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("Autodesk ACC Agent")
 PORT = int(os.environ.get("PORT", 8000))
 
+_HIGHLIGHT_STATE: dict[str, dict] = {}
+_COLOR_MAP: dict[str, list[float]] = {
+    "red": [1, 0, 0, 1],
+    "green": [0, 1, 0, 1],
+    "blue": [0, 0, 1, 1],
+    "yellow": [1, 1, 0, 1],
+    "orange": [1, 0.5, 0, 1],
+    "clear": [0, 0, 0, 0],
+}
 
 
 @mcp.tool()
@@ -516,6 +526,35 @@ async def preview_model(urn: str) -> ToolResult:
     except Exception as e:
         logger.error(f"preview_model failed: {e}")
         return ToolResult(content=f"Failed to preview model: {e}")
+
+
+@mcp.tool()
+async def highlight_elements(urn: str, ids: list[int], color: str = "red") -> str:
+    """
+    Highlight specific elements in the 3D viewer by coloring them.
+
+    Use this after preview_model to visually emphasize elements (e.g. all Walls,
+    specific doors, structural issues). The viewer polls for changes automatically.
+
+    Args:
+        urn:   The base64-encoded model URN (same as used in preview_model).
+        ids:   List of dbId integers to highlight (from selection context or count_elements).
+        color: Color name: "red", "green", "blue", "yellow", "orange", or "clear" to reset.
+    """
+    if color == "clear" or not ids:
+        _HIGHLIGHT_STATE[urn] = {"ids": [], "color": []}
+        return f"Cleared all highlights for model."
+
+    rgba = _COLOR_MAP.get(color, _COLOR_MAP["red"])
+    _HIGHLIGHT_STATE[urn] = {"ids": ids, "color": rgba}
+    return f"Highlighted {len(ids)} element(s) in {color}."
+
+
+@mcp.resource("highlight://{urn}")
+async def get_highlights(urn: str) -> str:
+    """Returns the current highlight state for a model URN."""
+    return json.dumps(_HIGHLIGHT_STATE.get(urn, {"ids": [], "color": []}))
+
 
 from mcp.types import ListToolsRequest, ReadResourceRequest
 
