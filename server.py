@@ -1,5 +1,6 @@
 import os
 import asyncio
+import hashlib
 import logging
 import pathlib
 from fastmcp import FastMCP
@@ -448,19 +449,28 @@ async def delete_folder(hub_id: str, project_name: str, folder_name: str) -> str
 
 
 _VIEWER_HTML_PATH = pathlib.Path(__file__).parent / "viewer.html"
+_VIEWER_HTML_CONTENT = _VIEWER_HTML_PATH.read_text(encoding="utf-8")
+_VIEWER_HASH = hashlib.md5(_VIEWER_HTML_CONTENT.encode()).hexdigest()[:8]
+
+VIEWER_URI = f"ui://preview-design/viewer-{_VIEWER_HASH}.html"
+
+_ALLOWED_DOMAINS = [
+    "https://*.autodesk.com",
+    "https://*.autodesk360.com",
+    "https://*.amazonaws.com",
+    "https://cdn.jsdelivr.net",
+]
 
 _CSP_HEADER = (
     "default-src 'none'; "
-    "script-src 'unsafe-inline' 'unsafe-eval' https://*.autodesk.com https://cdn.jsdelivr.net; "
-    "style-src 'unsafe-inline' https://*.autodesk.com; "
-    "connect-src https://*.autodesk.com https://*.autodesk360.com https://*.amazonaws.com wss://*.autodesk.com https://cdn.jsdelivr.net; "
-    "img-src https://*.autodesk.com blob: data:; "
-    "font-src https://*.autodesk.com; "
+    f"script-src 'unsafe-inline' 'unsafe-eval' {_ALLOWED_DOMAINS[0]} {_ALLOWED_DOMAINS[3]}; "
+    f"style-src 'unsafe-inline' {_ALLOWED_DOMAINS[0]}; "
+    f"connect-src {' '.join(_ALLOWED_DOMAINS)} wss://*.autodesk.com; "
+    f"img-src {_ALLOWED_DOMAINS[0]} blob: data:; "
+    f"font-src {_ALLOWED_DOMAINS[0]}; "
     "worker-src blob:; "
     "frame-src 'none'"
 )
-
-VIEWER_URI = "ui://preview-design/viewer-v8.html"
 
 
 @mcp.resource(
@@ -474,7 +484,7 @@ VIEWER_URI = "ui://preview-design/viewer-v8.html"
 )
 def viewer_resource() -> str:
     """Serves the APS Viewer HTML app."""
-    return _VIEWER_HTML_PATH.read_text(encoding="utf-8")
+    return _VIEWER_HTML_CONTENT
 
 
 @mcp.tool()
@@ -514,21 +524,8 @@ _UI_META = {"ui": {"resourceUri": VIEWER_URI}}
 _CSP_META = {
     "ui": {
         "csp": {
-            "resourceDomains": [
-                "https://*.autodesk.com",
-                "https://*.autodesk360.com",
-                "https://*.amazonaws.com",
-                "https://cdn.jsdelivr.net",
-                "blob:",
-                "data:",
-            ],
-            "connectDomains": [
-                "https://*.autodesk.com",
-                "https://*.autodesk360.com",
-                "https://*.amazonaws.com",
-                "wss://*.autodesk.com",
-                "https://cdn.jsdelivr.net",
-            ],
+            "resourceDomains": _ALLOWED_DOMAINS + ["blob:", "data:"],
+            "connectDomains": _ALLOWED_DOMAINS + ["wss://*.autodesk.com"],
             "frameDomains": [],
         }
     }

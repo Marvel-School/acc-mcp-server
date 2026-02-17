@@ -42,6 +42,8 @@
         }
 
         function initViewer(urn, accessToken) {
+            if (viewer) { viewer.finish(); viewer = null; }
+
             const options = {
                 env: "AutodeskProduction",
                 api: "derivativeV2_EU",
@@ -95,7 +97,7 @@
                                             text: propText
                                         }]
                                     });
-                                });
+                                }, (err) => console.warn("Property extraction failed:", err));
                             }
                         });
                     },
