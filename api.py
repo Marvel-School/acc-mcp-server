@@ -15,7 +15,7 @@ import logging
 import time
 import base64
 import requests
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 from urllib.parse import quote
 
 from auth import get_token
@@ -125,13 +125,10 @@ def _make_request(
 
 
 def _get_admin_user_id(account_id: str) -> str:
-    """Fetches the Autodesk User ID for the Account Admin, using a local dev fallback if needed."""
-    admin_email = os.getenv("ACC_ADMIN_EMAIL")
+    """Fetches the Autodesk User ID for the Account Admin."""
+    admin_email = os.environ.get("ACC_ADMIN_EMAIL")
     if not admin_email:
-        if os.getenv("WEBSITE_SITE_NAME") or os.getenv("FUNCTIONS_WORKER_RUNTIME"):
-            raise ValueError("CRITICAL: ACC_ADMIN_EMAIL environment variable is missing in production environment.")
-        logger.warning("ACC_ADMIN_EMAIL missing from env. Defaulting to local dev fallback...")
-        admin_email = "marvel.tiyjudy@ssc4tbi.nl"
+        raise ValueError("ACC_ADMIN_EMAIL environment variable is required.")
     return get_user_id_by_email(account_id, admin_email)
 
 
@@ -242,135 +239,121 @@ def find_project_globally(name_query: str) -> Optional[tuple]:
 
 
 
-def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]], str]:
+def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
     """Fetches top-level folders for a project."""
-    try:
-        hub_clean = ensure_b_prefix(hub_id)
-        proj_clean = ensure_b_prefix(project_id)
+    hub_clean = ensure_b_prefix(hub_id)
+    proj_clean = ensure_b_prefix(project_id)
 
-        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_clean}/projects/{proj_clean}/topFolders"
-        resp = _make_request("GET", url)
+    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_clean}/projects/{proj_clean}/topFolders"
+    resp = _make_request("GET", url)
 
-        return [
-            {
-                "id": f.get("id"),
-                "name": f.get("attributes", {}).get("displayName"),
-                "type": f.get("type"),
-            }
-            for f in resp.json().get("data", [])
-        ]
-    except Exception as e:
-        logger.error(f"Top Folders Exception: {e}")
-        return f"Error: {e}"
+    return [
+        {
+            "id": f.get("id"),
+            "name": f.get("attributes", {}).get("displayName"),
+            "type": f.get("type"),
+        }
+        for f in resp.json().get("data", [])
+    ]
 
 
-def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str, Any]], str]:
+def get_folder_contents(project_id: str, folder_id: str) -> List[Dict[str, Any]]:
     """Fetches contents of a folder with tip-version URN extraction for files."""
-    try:
-        proj_clean = ensure_b_prefix(project_id)
-        folder_encoded = encode_urn(folder_id)
+    proj_clean = ensure_b_prefix(project_id)
+    folder_encoded = encode_urn(folder_id)
 
-        url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders/{folder_encoded}/contents"
-        resp = _make_request("GET", url)
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders/{folder_encoded}/contents"
+    resp = _make_request("GET", url)
 
-        result = []
-        for item in resp.json().get("data", []):
-            item_type = item.get("type")
-            attrs = item.get("attributes", {})
+    result = []
+    for item in resp.json().get("data", []):
+        item_type = item.get("type")
+        attrs = item.get("attributes", {})
 
-            parsed = {
-                "id": item.get("id"),
-                "name": attrs.get("displayName"),
-                "type": item_type,
-            }
+        parsed = {
+            "id": item.get("id"),
+            "name": attrs.get("displayName"),
+            "type": item_type,
+        }
 
-            if item_type == "items":
-                tip = (
-                    item.get("relationships", {})
-                    .get("tip", {})
-                    .get("data", {})
-                    .get("id")
-                )
-                if tip:
-                    parsed["tipVersionUrn"] = tip
-                parsed["itemType"] = "file"
-            elif item_type == "folders":
-                parsed["itemType"] = "folder"
+        if item_type == "items":
+            tip = (
+                item.get("relationships", {})
+                .get("tip", {})
+                .get("data", {})
+                .get("id")
+            )
+            if tip:
+                parsed["tipVersionUrn"] = tip
+            parsed["itemType"] = "file"
+        elif item_type == "folders":
+            parsed["itemType"] = "folder"
 
-            result.append(parsed)
+        result.append(parsed)
 
-        return result
-    except Exception as e:
-        logger.error(f"Folder Contents Exception: {e}")
-        return f"Error: {e}"
+    return result
 
 
 def find_design_files(
     hub_id: str, project_id: str, extensions: str = "rvt"
-) -> Union[List[Dict[str, Any]], str]:
+) -> List[Dict[str, Any]]:
     """
     BFS file search through 'Project Files' folder.
     Depth-limited to 3 levels, max 50 folders scanned.
     """
-    try:
-        logger.info(f"Searching for files: {extensions}")
-        top_folders = get_top_folders(hub_id, project_id)
+    logger.info(f"Searching for files: {extensions}")
+    top_folders = get_top_folders(hub_id, project_id)
 
-        if isinstance(top_folders, str):
-            return f"Failed to get top folders: {top_folders}"
+    root_id = None
+    for folder in top_folders:
+        if folder.get("name") == "Project Files":
+            root_id = folder.get("id")
+            break
+    if not root_id and top_folders:
+        root_id = top_folders[0].get("id")
+    if not root_id:
+        raise ValueError("No folders found in project")
 
-        root_id = None
-        for folder in top_folders:
-            if folder.get("name") == "Project Files":
-                root_id = folder.get("id")
-                break
-        if not root_id and top_folders:
-            root_id = top_folders[0].get("id")
-        if not root_id:
-            return "No folders found in project"
+    queue = [{"id": root_id, "name": "Project Files", "depth": 0}]
+    matching = []
+    ext_list = [e.strip().lower() for e in extensions.split(",")]
+    max_folders = 50
+    max_depth = 3
+    scanned = 0
 
-        queue = [{"id": root_id, "name": "Project Files", "depth": 0}]
-        matching = []
-        ext_list = [e.strip().lower() for e in extensions.split(",")]
-        max_folders = 50
-        max_depth = 3
-        scanned = 0
+    while queue and scanned < max_folders:
+        current = queue.pop(0)
+        scanned += 1
 
-        while queue and scanned < max_folders:
-            current = queue.pop(0)
-            scanned += 1
-
-            logger.info(f"  Scanning {scanned}/{max_folders} (depth {current['depth']}): {current['name']}")
+        logger.info(f"  Scanning {scanned}/{max_folders} (depth {current['depth']}): {current['name']}")
+        try:
             contents = get_folder_contents(project_id, current["id"])
+        except Exception as e:
+            logger.warning(f"  Skipping folder '{current['name']}': {e}")
+            continue
 
-            if isinstance(contents, str):
-                continue
-
-            for item in contents:
-                if item.get("itemType") == "file":
-                    name = item.get("name", "")
-                    if any(name.lower().endswith(f".{ext}") for ext in ext_list):
-                        matching.append({
-                            "name": name,
-                            "item_id": item.get("id"),
-                            "version_id": item.get("tipVersionUrn"),
-                            "folder_path": current["name"],
-                        })
-                        logger.info(f"    Found: {name}")
-
-                elif item.get("itemType") == "folder" and current["depth"] < max_depth:
-                    sub_name = item.get("name", "Unknown")
-                    queue.append({
-                        "id": item.get("id"),
-                        "name": f"{current['name']}/{sub_name}",
-                        "depth": current["depth"] + 1,
+        for item in contents:
+            if item.get("itemType") == "file":
+                name = item.get("name", "")
+                if any(name.lower().endswith(f".{ext}") for ext in ext_list):
+                    matching.append({
+                        "name": name,
+                        "item_id": item.get("id"),
+                        "version_id": item.get("tipVersionUrn"),
+                        "folder_path": current["name"],
                     })
+                    logger.info(f"    Found: {name}")
 
-        logger.info(f"Search complete: {scanned} folders, {len(matching)} files")
-        return matching
-    except Exception as e:
-        logger.error(f"Design file search error: {e}")
-        return f"Error: {e}"
+            elif item.get("itemType") == "folder" and current["depth"] < max_depth:
+                sub_name = item.get("name", "Unknown")
+                queue.append({
+                    "id": item.get("id"),
+                    "name": f"{current['name']}/{sub_name}",
+                    "depth": current["depth"] + 1,
+                })
+
+    logger.info(f"Search complete: {scanned} folders, {len(matching)} files")
+    return matching
 
 
 
@@ -403,8 +386,9 @@ def resolve_file_to_urn(project_id: str, identifier: str) -> str:
         target = identifier.lower()
 
         for ext in extensions:
-            files = find_design_files(hub_id, project_id, ext)
-            if isinstance(files, str):
+            try:
+                files = find_design_files(hub_id, project_id, ext)
+            except Exception:
                 continue
             for f in files:
                 name = f.get("name", "").lower()
@@ -579,43 +563,34 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     return count
 
 
-def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
+def trigger_translation(version_urn: str) -> Dict[str, Any]:
     """
     Triggers a fresh Model Derivative translation job (SVF Classic).
     Uses x-ads-force to overwrite existing partial derivatives.
     """
-    try:
-        logger.info(f"[Translation] Starting job for: {version_urn[:80]}...")
+    logger.info(f"[Translation] Starting job for: {version_urn[:80]}...")
 
-        encoded = safe_b64encode(version_urn)
-        payload = {
-            "input": {"urn": encoded},
-            "output": {
-                "formats": [{"type": "svf", "views": ["2d", "3d"]}]
-            },
-        }
+    encoded = safe_b64encode(version_urn)
+    payload = {
+        "input": {"urn": encoded},
+        "output": {
+            "formats": [{"type": "svf", "views": ["2d", "3d"]}]
+        },
+    }
 
-        resp = _make_request(
-            "POST",
-            "https://developer.api.autodesk.com/modelderivative/v2/designdata/job",
-            extra_headers={
-                "x-ads-force": "true",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+    resp = _make_request(
+        "POST",
+        "https://developer.api.autodesk.com/modelderivative/v2/designdata/job",
+        extra_headers={
+            "x-ads-force": "true",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
 
-        result = resp.json()
-        logger.info(f"  Job submitted: {result.get('result', 'unknown')}")
-        return result
-
-    except requests.exceptions.Timeout:
-        return "Error: translation job request timed out."
-    except requests.exceptions.RequestException as e:
-        return f"Error: network error during translation: {e}"
-    except Exception as e:
-        logger.error(f"Translation exception: {e}")
-        return f"Error: {e}"
+    result = resp.json()
+    logger.info(f"  Job submitted: {result.get('result', 'unknown')}")
+    return result
 
 
 
@@ -796,8 +771,6 @@ def replicate_folders(
     """
     def _find_project_files_root(pid: str) -> str:
         folders = get_top_folders(hub_id, pid)
-        if isinstance(folders, str):
-            raise ValueError(f"Could not list top folders: {folders}")
         for f in folders:
             if (f.get("name") or "").lower() == "project files":
                 return f["id"]
@@ -815,9 +788,10 @@ def replicate_folders(
         if depth > max_depth:
             return
 
-        contents = get_folder_contents(source_project_id, src_folder_id)
-        if isinstance(contents, str):
-            logger.warning(f"  Could not read source folder {path}: {contents}")
+        try:
+            contents = get_folder_contents(source_project_id, src_folder_id)
+        except Exception as e:
+            logger.warning(f"  Could not read source folder {path}: {e}")
             return
 
         for item in contents:
@@ -859,8 +833,6 @@ def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
         Success or not-found message.
     """
     top_folders = get_top_folders(hub_id, project_id)
-    if isinstance(top_folders, str):
-        raise ValueError(f"Could not list top folders: {top_folders}")
 
     root_id = None
     for f in top_folders:
@@ -873,8 +845,6 @@ def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
         raise ValueError("No top-level folders found in project.")
 
     contents = get_folder_contents(project_id, root_id)
-    if isinstance(contents, str):
-        raise ValueError(f"Could not read folder contents: {contents}")
 
     target = folder_name.lower().strip()
     folder_id = None
