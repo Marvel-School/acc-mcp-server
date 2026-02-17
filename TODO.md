@@ -1,0 +1,1 @@
+- [ ] **Bidirectional Visual Overrides**: Implement a new tool that allows the LLM to send color-coding and isolation commands back to the Autodesk Viewer (e.g., highlighting all elements of a specific material).

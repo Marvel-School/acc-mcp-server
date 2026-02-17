@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>APS Viewer — MCP App</title>
+
+    <!-- Autodesk Forge Viewer -->
+    <link rel="stylesheet" href="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/style.min.css">
+    <script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.min.js"></script>
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; }
+        #viewer-container { width: 100%; height: 100vh; min-height: 500px; position: relative; }
+        #status {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            font-size: 1.1rem; color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div id="viewer-container">
+        <div id="status">Waiting for model data...</div>
+    </div>
+
+    <script type="module">
+        import { App } from "https://cdn.jsdelivr.net/npm/@modelcontextprotocol/ext-apps@1.0.1/+esm";
+
+        const statusEl = document.getElementById("status");
+        let viewer = null;
+
+        function setStatus(msg) {
+            statusEl.textContent = msg;
+            statusEl.style.display = "block";
+        }
+
+        function hideStatus() {
+            statusEl.style.display = "none";
+        }
+
+        function initViewer(urn, accessToken) {
+            if (viewer) { viewer.finish(); viewer = null; }
+
+            const options = {
+                env: "AutodeskProduction",
+                api: "derivativeV2_EU",
+                getAccessToken: (onTokenReady) => {
+                    onTokenReady(accessToken, 3600);
+                },
+            };
+
+            setStatus("Initializing viewer...");
+
+            Autodesk.Viewing.Initializer(options, () => {
+                const container = document.getElementById("viewer-container");
+
+                viewer = new Autodesk.Viewing.GuiViewer3D(container);
+                const startResult = viewer.start();
+                if (startResult > 0) {
+                    setStatus("Error: Viewer failed to start.");
+                    return;
+                }
+
+                const documentId = `urn:${urn}`;
+                setStatus("Loading document...");
+
+                Autodesk.Viewing.Document.load(
+                    documentId,
+                    (doc) => {
+                        const defaultModel = doc.getRoot().getDefaultGeometry();
+                        if (!defaultModel) {
+                            setStatus("Error: No viewable geometry found.");
+                            return;
+                        }
+                        hideStatus();
+                        viewer.loadDocumentNode(doc, defaultModel);
+
+                        viewer.addEventListener(Autodesk.Viewing.SELECTION_CHANGED_EVENT, () => {
+                            const ids = viewer.getSelection();
+                            if (ids.length > 0) {
+                                viewer.getProperties(ids[0], async (result) => {
+                                    let propText = `User selected element: ${result.name || ids[0]}\n`;
+                                    if (result.properties) {
+                                        result.properties.forEach(p => {
+                                            if (p.displayCategory && !p.hidden && !p.displayName.startsWith("__")) {
+                                                propText += `- [${p.displayCategory}] ${p.displayName}: ${p.displayValue}\n`;
+                                            }
+                                        });
+                                    }
+
+                                    await app.updateModelContext({
+                                        content: [{
+                                            type: "text",
+                                            text: propText
+                                        }]
+                                    });
+                                }, (err) => console.warn("Property extraction failed:", err));
+                            }
+                        });
+                    },
+                    (errorCode, errorMsg) => {
+                        setStatus(`Error loading document: ${errorMsg} (code ${errorCode})`);
+                    }
+                );
+            });
+        }
+
+        // Initialize MCP App and listen for tool results
+        const app = new App({ name: "Autodesk Viewer", version: "1.0.0" });
+
+        app.ontoolresult = (result) => {
+            try {
+                const data = result.structuredContent;
+                if (!data) {
+                    setStatus("Error: No structured content received.");
+                    return;
+                }
+
+                const urn = data.urn;
+                const token = data.config?.accessToken;
+
+                if (!urn || !token) {
+                    setStatus("Error: Missing URN or access token in payload.");
+                    return;
+                }
+
+                initViewer(urn, token);
+            } catch (err) {
+                setStatus(`Error: ${err.message}`);
+            }
+        };
+
+        app.connect();
+    </script>
+</body>
+</html>

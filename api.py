@@ -15,7 +15,7 @@ import logging
 import time
 import base64
 import requests
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 from urllib.parse import quote
 
 from auth import get_token
@@ -23,9 +23,6 @@ from auth import get_token
 logger = logging.getLogger(__name__)
 
 
-# ==========================================================================
-# UTILITIES
-# ==========================================================================
 
 def _strip_b_prefix(id_str: str) -> str:
     """Safely removes the 'b.' prefix from Hub/Project IDs."""
@@ -51,9 +48,6 @@ def safe_b64encode(value: Optional[str]) -> str:
     return base64.urlsafe_b64encode(value.encode("utf-8")).decode("utf-8").rstrip("=")
 
 
-# ==========================================================================
-# CENTRALIZED REQUEST HELPER
-# ==========================================================================
 
 def _make_request(
     method: str,
@@ -92,7 +86,6 @@ def _make_request(
 
             last_resp = requests.request(method, url, headers=headers, **kwargs)
 
-            # 429 — rate limited: honour Retry-After, retry once
             if last_resp.status_code == 429:
                 wait = int(last_resp.headers.get("Retry-After", 5))
                 logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
@@ -100,14 +93,12 @@ def _make_request(
                 last_resp = requests.request(method, url, headers=headers, **kwargs)
                 break
 
-            # 401 — stale token: refresh and retry
             if last_resp.status_code == 401 and attempt == 0 and retry_on_401:
                 logger.warning(f"401 on {method} {url[:80]} — refreshing token")
                 continue
 
             break
 
-        # LOUD FAILURE: If the status is 4xx or 5xx, crash immediately
         try:
             last_resp.raise_for_status()
         except requests.exceptions.HTTPError as http_err:
@@ -132,16 +123,12 @@ def _make_request(
         raise
 
 
-# ==========================================================================
-# ADMIN USER-ID HELPER
-# ==========================================================================
 
 def _get_admin_user_id(account_id: str) -> str:
-    """Fetches the Autodesk User ID for the Account Admin, using a local dev fallback if needed."""
-    admin_email = os.getenv("ACC_ADMIN_EMAIL")
+    """Fetches the Autodesk User ID for the Account Admin."""
+    admin_email = os.environ.get("ACC_ADMIN_EMAIL")
     if not admin_email:
-        logger.warning("ACC_ADMIN_EMAIL missing from env. Defaulting to local dev fallback...")
-        admin_email = "marvel.tiyjudy@ssc4tbi.nl"
+        raise ValueError("ACC_ADMIN_EMAIL environment variable is required.")
     return get_user_id_by_email(account_id, admin_email)
 
 
@@ -152,12 +139,12 @@ def get_user_id_by_email(account_id: str, email: str) -> str:
     users = resp.json()
     if not users:
         raise ValueError(f"Could not find an Autodesk user with email: {email}")
-    return users[0].get("id")
+    user_id = users[0].get("id")
+    if not user_id:
+        raise ValueError(f"Autodesk returned a user for {email}, but the 'id' field is missing.")
+    return user_id
 
 
-# ==========================================================================
-# HUB & PROJECT DISCOVERY
-# ==========================================================================
 
 _hub_cache: Dict[str, Optional[str]] = {"id": None}
 
@@ -178,9 +165,19 @@ def get_hubs() -> list:
     return resp.json().get("data", [])
 
 
-def get_projects(hub_id: str) -> list:
-    """List all projects in a hub (follows pagination automatically)."""
-    url: Optional[str] = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects"
+def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) -> list:
+    """List all projects in a hub (follows pagination automatically).
+
+    Args:
+        hub_id: Hub ID (starts with 'b.').
+        limit:  Max projects per page (default 50, max 100 per Autodesk API).
+        fields: Optional list of extra fields to include (e.g. ["status", "projectValue"]).
+    """
+    hub_id = ensure_b_prefix(hub_id)
+    base = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects?page[limit]={limit}"
+    if fields:
+        base += f"&fields[projects]={','.join(fields)}"
+    url: Optional[str] = base
     all_projects: list = []
 
     for _ in range(50):  # safety cap
@@ -188,7 +185,6 @@ def get_projects(hub_id: str) -> list:
         data = resp.json()
         all_projects.extend(data.get("data", []))
 
-        # Follow pagination link
         next_link = data.get("links", {}).get("next")
         if isinstance(next_link, dict):
             url = next_link.get("href")
@@ -242,145 +238,124 @@ def find_project_globally(name_query: str) -> Optional[tuple]:
         return None
 
 
-# ==========================================================================
-# FOLDER NAVIGATION
-# ==========================================================================
 
-def get_top_folders(hub_id: str, project_id: str) -> Union[List[Dict[str, Any]], str]:
+def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
     """Fetches top-level folders for a project."""
-    try:
-        hub_clean = ensure_b_prefix(hub_id)
-        proj_clean = ensure_b_prefix(project_id)
+    hub_clean = ensure_b_prefix(hub_id)
+    proj_clean = ensure_b_prefix(project_id)
 
-        url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_clean}/projects/{proj_clean}/topFolders"
-        resp = _make_request("GET", url)
+    url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_clean}/projects/{proj_clean}/topFolders"
+    resp = _make_request("GET", url)
 
-        return [
-            {
-                "id": f.get("id"),
-                "name": f.get("attributes", {}).get("displayName"),
-                "type": f.get("type"),
-            }
-            for f in resp.json().get("data", [])
-        ]
-    except Exception as e:
-        logger.error(f"Top Folders Exception: {e}")
-        return f"Error: {e}"
+    return [
+        {
+            "id": f.get("id"),
+            "name": f.get("attributes", {}).get("displayName"),
+            "type": f.get("type"),
+        }
+        for f in resp.json().get("data", [])
+    ]
 
 
-def get_folder_contents(project_id: str, folder_id: str) -> Union[List[Dict[str, Any]], str]:
+def get_folder_contents(project_id: str, folder_id: str) -> List[Dict[str, Any]]:
     """Fetches contents of a folder with tip-version URN extraction for files."""
-    try:
-        proj_clean = ensure_b_prefix(project_id)
-        folder_encoded = encode_urn(folder_id)
+    proj_clean = ensure_b_prefix(project_id)
+    folder_encoded = encode_urn(folder_id)
 
-        url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders/{folder_encoded}/contents"
-        resp = _make_request("GET", url)
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders/{folder_encoded}/contents"
+    resp = _make_request("GET", url)
 
-        result = []
-        for item in resp.json().get("data", []):
-            item_type = item.get("type")
-            attrs = item.get("attributes", {})
+    result = []
+    for item in resp.json().get("data", []):
+        item_type = item.get("type")
+        attrs = item.get("attributes", {})
 
-            parsed = {
-                "id": item.get("id"),
-                "name": attrs.get("displayName"),
-                "type": item_type,
-            }
+        parsed = {
+            "id": item.get("id"),
+            "name": attrs.get("displayName"),
+            "type": item_type,
+        }
 
-            if item_type == "items":
-                tip = (
-                    item.get("relationships", {})
-                    .get("tip", {})
-                    .get("data", {})
-                    .get("id")
-                )
-                if tip:
-                    parsed["tipVersionUrn"] = tip
-                parsed["itemType"] = "file"
-            elif item_type == "folders":
-                parsed["itemType"] = "folder"
+        if item_type == "items":
+            tip = (
+                item.get("relationships", {})
+                .get("tip", {})
+                .get("data", {})
+                .get("id")
+            )
+            if tip:
+                parsed["tipVersionUrn"] = tip
+            parsed["itemType"] = "file"
+        elif item_type == "folders":
+            parsed["itemType"] = "folder"
 
-            result.append(parsed)
+        result.append(parsed)
 
-        return result
-    except Exception as e:
-        logger.error(f"Folder Contents Exception: {e}")
-        return f"Error: {e}"
+    return result
 
 
 def find_design_files(
     hub_id: str, project_id: str, extensions: str = "rvt"
-) -> Union[List[Dict[str, Any]], str]:
+) -> List[Dict[str, Any]]:
     """
     BFS file search through 'Project Files' folder.
     Depth-limited to 3 levels, max 50 folders scanned.
     """
-    try:
-        logger.info(f"Searching for files: {extensions}")
-        top_folders = get_top_folders(hub_id, project_id)
+    logger.info(f"Searching for files: {extensions}")
+    top_folders = get_top_folders(hub_id, project_id)
 
-        if isinstance(top_folders, str):
-            return f"Failed to get top folders: {top_folders}"
+    root_id = None
+    for folder in top_folders:
+        if folder.get("name") == "Project Files":
+            root_id = folder.get("id")
+            break
+    if not root_id and top_folders:
+        root_id = top_folders[0].get("id")
+    if not root_id:
+        raise ValueError("No folders found in project")
 
-        # Find "Project Files" (fall back to first folder)
-        root_id = None
-        for folder in top_folders:
-            if folder.get("name") == "Project Files":
-                root_id = folder.get("id")
-                break
-        if not root_id and top_folders:
-            root_id = top_folders[0].get("id")
-        if not root_id:
-            return "No folders found in project"
+    queue = [{"id": root_id, "name": "Project Files", "depth": 0}]
+    matching = []
+    ext_list = [e.strip().lower() for e in extensions.split(",")]
+    max_folders = 50
+    max_depth = 3
+    scanned = 0
 
-        queue = [{"id": root_id, "name": "Project Files", "depth": 0}]
-        matching = []
-        ext_list = [e.strip().lower() for e in extensions.split(",")]
-        max_folders = 50
-        max_depth = 3
-        scanned = 0
+    while queue and scanned < max_folders:
+        current = queue.pop(0)
+        scanned += 1
 
-        while queue and scanned < max_folders:
-            current = queue.pop(0)
-            scanned += 1
-
-            logger.info(f"  Scanning {scanned}/{max_folders} (depth {current['depth']}): {current['name']}")
+        logger.info(f"  Scanning {scanned}/{max_folders} (depth {current['depth']}): {current['name']}")
+        try:
             contents = get_folder_contents(project_id, current["id"])
+        except Exception as e:
+            logger.warning(f"  Skipping folder '{current['name']}': {e}")
+            continue
 
-            if isinstance(contents, str):
-                continue
-
-            for item in contents:
-                if item.get("itemType") == "file":
-                    name = item.get("name", "")
-                    if any(name.lower().endswith(f".{ext}") for ext in ext_list):
-                        matching.append({
-                            "name": name,
-                            "item_id": item.get("id"),
-                            "version_id": item.get("tipVersionUrn"),
-                            "folder_path": current["name"],
-                        })
-                        logger.info(f"    Found: {name}")
-
-                elif item.get("itemType") == "folder" and current["depth"] < max_depth:
-                    sub_name = item.get("name", "Unknown")
-                    queue.append({
-                        "id": item.get("id"),
-                        "name": f"{current['name']}/{sub_name}",
-                        "depth": current["depth"] + 1,
+        for item in contents:
+            if item.get("itemType") == "file":
+                name = item.get("name", "")
+                if any(name.lower().endswith(f".{ext}") for ext in ext_list):
+                    matching.append({
+                        "name": name,
+                        "item_id": item.get("id"),
+                        "version_id": item.get("tipVersionUrn"),
+                        "folder_path": current["name"],
                     })
+                    logger.info(f"    Found: {name}")
 
-        logger.info(f"Search complete: {scanned} folders, {len(matching)} files")
-        return matching
-    except Exception as e:
-        logger.error(f"Design file search error: {e}")
-        return f"Error: {e}"
+            elif item.get("itemType") == "folder" and current["depth"] < max_depth:
+                sub_name = item.get("name", "Unknown")
+                queue.append({
+                    "id": item.get("id"),
+                    "name": f"{current['name']}/{sub_name}",
+                    "depth": current["depth"] + 1,
+                })
+
+    logger.info(f"Search complete: {scanned} folders, {len(matching)} files")
+    return matching
 
 
-# ==========================================================================
-# FILE RESOLUTION
-# ==========================================================================
 
 def resolve_file_to_urn(project_id: str, identifier: str) -> str:
     """
@@ -411,8 +386,9 @@ def resolve_file_to_urn(project_id: str, identifier: str) -> str:
         target = identifier.lower()
 
         for ext in extensions:
-            files = find_design_files(hub_id, project_id, ext)
-            if isinstance(files, str):
+            try:
+                files = find_design_files(hub_id, project_id, ext)
+            except Exception:
                 continue
             for f in files:
                 name = f.get("name", "").lower()
@@ -473,7 +449,6 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
         except ValueError as e:
             return str(e)
 
-        # Resolve to version URN
         if "lineage" in resolved:
             version_urn = get_latest_version_urn(project_id, resolved)
             if not version_urn:
@@ -489,7 +464,6 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
         url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{encoded}/manifest"
         resp = _make_request("GET", url)
 
-        # 202 Accepted = translation still in progress (2xx, not caught by raise_for_status)
         if resp.status_code == 202:
             return "Processing — translation in progress."
 
@@ -509,9 +483,6 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
         return f"Error: {e}"
 
 
-# ==========================================================================
-# MODEL DERIVATIVE — STREAMING SCANNER & TRANSLATION
-# ==========================================================================
 
 def get_view_guid_only(version_urn: str) -> str:
     """
@@ -546,7 +517,6 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     """
     logger.info(f"[Streaming Scanner] Counting: {category_name}")
 
-    # Smart singularization
     terms = {category_name}
     if category_name.lower().endswith("s") and len(category_name) > 2:
         terms.add(category_name[:-1])
@@ -557,7 +527,6 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     urn_b64 = safe_b64encode(version_urn)
     url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{urn_b64}/metadata/{guid}"
 
-    # Composite regex — matches JSON values containing any search term
     terms_pattern = b"|".join(re.escape(t).encode() for t in terms)
     pattern = re.compile(
         rb':\s*"[^"]*(' + terms_pattern + rb')[^"]*"', re.IGNORECASE
@@ -578,8 +547,6 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
             matches = list(pattern.finditer(buffer))
             count += len(matches)
 
-            # Advance past fully-processed matches to prevent double-counting.
-            # Only the tail after the last match is carried over.
             if matches:
                 buffer = buffer[matches[-1].end():]
             else:
@@ -596,48 +563,36 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     return count
 
 
-def trigger_translation(version_urn: str) -> Union[Dict[str, Any], str]:
+def trigger_translation(version_urn: str) -> Dict[str, Any]:
     """
     Triggers a fresh Model Derivative translation job (SVF Classic).
     Uses x-ads-force to overwrite existing partial derivatives.
     """
-    try:
-        logger.info(f"[Translation] Starting job for: {version_urn[:80]}...")
+    logger.info(f"[Translation] Starting job for: {version_urn[:80]}...")
 
-        encoded = safe_b64encode(version_urn)
-        payload = {
-            "input": {"urn": encoded},
-            "output": {
-                "formats": [{"type": "svf", "views": ["2d", "3d"]}]
-            },
-        }
+    encoded = safe_b64encode(version_urn)
+    payload = {
+        "input": {"urn": encoded},
+        "output": {
+            "formats": [{"type": "svf", "views": ["2d", "3d"]}]
+        },
+    }
 
-        resp = _make_request(
-            "POST",
-            "https://developer.api.autodesk.com/modelderivative/v2/designdata/job",
-            extra_headers={
-                "x-ads-force": "true",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+    resp = _make_request(
+        "POST",
+        "https://developer.api.autodesk.com/modelderivative/v2/designdata/job",
+        extra_headers={
+            "x-ads-force": "true",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
 
-        result = resp.json()
-        logger.info(f"  Job submitted: {result.get('result', 'unknown')}")
-        return result
-
-    except requests.exceptions.Timeout:
-        return "Error: translation job request timed out."
-    except requests.exceptions.RequestException as e:
-        return f"Error: network error during translation: {e}"
-    except Exception as e:
-        logger.error(f"Translation exception: {e}")
-        return f"Error: {e}"
+    result = resp.json()
+    logger.info(f"  Job submitted: {result.get('result', 'unknown')}")
+    return result
 
 
-# ==========================================================================
-# PROJECT MANAGEMENT
-# ==========================================================================
 
 def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
     """Creates a project using the ACC Account Admin API."""
@@ -657,12 +612,26 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     return resp.json()
 
 
-def get_project_users(project_id: str) -> list:
-    """List users in a project (requires Admin)."""
-    pid = _strip_b_prefix(project_id)
-    url = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{pid}/users"
-    resp = _make_request("GET", url)
-    return resp.json().get("results", [])
+def get_project_users(hub_id: str, project_id: str) -> list:
+    """List users in a project (requires Admin). Paginates up to 5 pages."""
+    clean_project_id = _strip_b_prefix(project_id)
+    endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
+
+    all_users: list = []
+    url: Optional[str] = endpoint
+
+    for _ in range(5):  # safety cap
+        resp = _make_request("GET", url)  # type: ignore[arg-type]
+        data = resp.json()
+        all_users.extend(data.get("results", []))
+
+        next_url = data.get("pagination", {}).get("nextUrl")
+        if next_url:
+            url = next_url
+        else:
+            break
+
+    return all_users
 
 
 def add_project_user(hub_id: str, project_id: str, email: str, products: Optional[list] = None) -> dict:
@@ -690,3 +659,224 @@ def add_project_user(hub_id: str, project_id: str, email: str, products: Optiona
     }
     resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
     return resp.json()
+
+
+def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
+    """Aggregate users and their product entitlements across all projects in a hub.
+
+    Scans up to *max_projects* projects, collects every user encountered, and
+    merges their product assignments into a single record per email.
+
+    Returns:
+        List of dicts: [{"email": ..., "name": ..., "products": ["Build", ...]}]
+    """
+    projects = get_projects(hub_id)[:max_projects]
+    logger.info(f"[Hub Audit] Scanning {len(projects)} projects in hub {hub_id}")
+
+    user_map: Dict[str, Dict[str, Any]] = {}
+
+    for p in projects:
+        pid = p.get("id", "")
+        p_name = p.get("attributes", {}).get("name", "Unknown")
+        try:
+            members = get_project_users(hub_id, pid)
+        except Exception as e:
+            logger.warning(f"  Skipping project '{p_name}': {e}")
+            continue
+
+        for member in members:
+            email = (member.get("email") or "").lower()
+            if not email:
+                continue
+
+            if email not in user_map:
+                user_map[email] = {
+                    "email": email,
+                    "name": member.get("name", email),
+                    "products": set(),
+                }
+
+            for prod in member.get("products", []):
+                key = prod.get("key", "")
+                if key:
+                    user_map[email]["products"].add(key)
+
+    result = []
+    for entry in user_map.values():
+        entry["products"] = sorted(entry["products"])
+        result.append(entry)
+
+    logger.info(f"[Hub Audit] Found {len(result)} unique users across {len(projects)} projects")
+    return sorted(result, key=lambda u: u["email"])
+
+
+def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> dict:
+    """Creates a subfolder inside a parent folder using the Data Management API.
+
+    Args:
+        project_id:       Project ID (will be b.-prefixed automatically).
+        parent_folder_id: The ID of the parent folder.
+        folder_name:      Name for the new folder.
+
+    Returns:
+        The created folder object from the API.
+    """
+    proj_clean = ensure_b_prefix(project_id)
+    payload = {
+        "jsonapi": {"version": "1.0"},
+        "data": {
+            "type": "folders",
+            "attributes": {
+                "name": folder_name,
+                "extension": {
+                    "type": "folders:autodesk.bim360:Folder",
+                    "version": "1.0",
+                },
+            },
+            "relationships": {
+                "parent": {
+                    "data": {"type": "folders", "id": parent_folder_id}
+                }
+            },
+        },
+    }
+
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders"
+    resp = _make_request(
+        "POST", url, json=payload,
+        extra_headers={"Content-Type": "application/vnd.api+json"},
+    )
+    return resp.json()
+
+
+def replicate_folders(
+    hub_id: str,
+    source_project_id: str,
+    dest_project_id: str,
+    max_depth: int = 5,
+) -> str:
+    """Recursively copies the folder structure from a source project to a destination project.
+
+    Only replicates folders (not files). Starts from the 'Project Files' root.
+    Returns a short summary string (not the full folder list) to avoid content-filter issues.
+
+    Args:
+        hub_id:             Hub ID (both projects must be in the same hub).
+        source_project_id:  Source project ID.
+        dest_project_id:    Destination project ID.
+        max_depth:          Maximum folder nesting depth (default 5).
+
+    Returns:
+        Summary string with the count of created folders.
+    """
+    def _find_project_files_root(pid: str) -> str:
+        folders = get_top_folders(hub_id, pid)
+        for f in folders:
+            if (f.get("name") or "").lower() == "project files":
+                return f["id"]
+        if folders:
+            return folders[0]["id"]
+        raise ValueError(f"No top-level folders found in project {pid}")
+
+    source_root = _find_project_files_root(source_project_id)
+    dest_root = _find_project_files_root(dest_project_id)
+
+    count = 0
+
+    def _recurse(src_folder_id: str, dst_parent_id: str, path: str, depth: int) -> None:
+        nonlocal count
+        if depth > max_depth:
+            return
+
+        try:
+            contents = get_folder_contents(source_project_id, src_folder_id)
+        except Exception as e:
+            logger.warning(f"  Could not read source folder {path}: {e}")
+            return
+
+        for item in contents:
+            if item.get("itemType") != "folder":
+                continue
+
+            name = item.get("name", "Unnamed")
+            full_path = f"{path}/{name}"
+
+            try:
+                result = create_folder(dest_project_id, dst_parent_id, name)
+                new_folder_id = result.get("data", {}).get("id")
+                count += 1
+                logger.info(f"  Created: {full_path}")
+
+                if new_folder_id:
+                    _recurse(item["id"], new_folder_id, full_path, depth + 1)
+            except Exception as e:
+                logger.warning(f"  Failed to create '{full_path}': {e}")
+
+    logger.info(f"[Replicate] Copying folder structure from {source_project_id} to {dest_project_id}")
+    _recurse(source_root, dest_root, "Project Files", 0)
+    logger.info(f"[Replicate] Done — {count} folders created")
+    return f"Successfully copied {count} folders from source to destination."
+
+
+def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
+    """Hides a top-level folder inside a project's 'Project Files' root.
+
+    Searches for the folder by name (case-insensitive), then sends a PATCH
+    to set ``hidden: true`` on it.
+
+    Args:
+        hub_id:     Hub ID (needed to list top folders).
+        project_id: Project ID.
+        folder_name: Name of the folder to hide.
+
+    Returns:
+        Success or not-found message.
+    """
+    top_folders = get_top_folders(hub_id, project_id)
+
+    root_id = None
+    for f in top_folders:
+        if (f.get("name") or "").lower() == "project files":
+            root_id = f["id"]
+            break
+    if not root_id and top_folders:
+        root_id = top_folders[0]["id"]
+    if not root_id:
+        raise ValueError("No top-level folders found in project.")
+
+    contents = get_folder_contents(project_id, root_id)
+
+    target = folder_name.lower().strip()
+    folder_id = None
+    matched_name = None
+    for item in contents:
+        if item.get("itemType") != "folder":
+            continue
+        name = (item.get("name") or "").strip()
+        if name.lower() == target:
+            folder_id = item["id"]
+            matched_name = name
+            break
+
+    if not folder_id:
+        return f"Folder '{folder_name}' not found under Project Files."
+
+    proj_clean = ensure_b_prefix(project_id)
+    folder_encoded = encode_urn(folder_id)
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/folders/{folder_encoded}"
+    payload = {
+        "jsonapi": {"version": "1.0"},
+        "data": {
+            "type": "folders",
+            "id": folder_id,
+            "attributes": {"hidden": True},
+        },
+    }
+
+    _make_request(
+        "PATCH", url, json=payload,
+        extra_headers={"Content-Type": "application/vnd.api+json"},
+    )
+    logger.info(f"Folder '{matched_name}' hidden in project {project_id}")
+    return f"Successfully deleted folder '{matched_name}'."
+
