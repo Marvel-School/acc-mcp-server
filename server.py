@@ -20,6 +20,7 @@ from api import (
     create_acc_project,
     replicate_folders,
     get_project_users,
+    get_project_user_permissions,
     add_project_user,
     get_all_hub_users,
     soft_delete_folder,
@@ -379,6 +380,107 @@ async def audit_hub_users(hub_id: str) -> str:
     except Exception as e:
         logger.error(f"audit_hub_users failed: {e}")
         return f"Failed to audit hub users: {e}"
+
+
+@mcp.tool()
+async def check_project_permissions(hub_name: str, project_name: str) -> str:
+    """
+    Audit the real-time permissions, roles, and company affiliations for every
+    user in an ACC project. Data is fetched live — no in-process caching —
+    so the result always reflects the current state in ACC.
+
+    Useful for answering questions like:
+    - "Who is the project admin?"
+    - "Which users belong to company X?"
+    - "Does user Y have Build access?"
+
+    Args:
+        hub_name:     Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
+        project_name: Project name (exact or close match, case-insensitive).
+    """
+    try:
+        # Resolve hub name → hub_id
+        hubs = await asyncio.to_thread(get_hubs)
+        hub_target = hub_name.lower().strip()
+        hub_id = None
+        for h in hubs:
+            if h.get("attributes", {}).get("name", "").lower() == hub_target:
+                hub_id = h.get("id")
+                break
+        if not hub_id:
+            return (
+                f"Hub '{hub_name}' not found. "
+                f"Run list_hubs to see valid names."
+            )
+
+        # Resolve project name → project_id
+        projects = await asyncio.to_thread(get_projects, hub_id)
+        proj_target = project_name.lower().strip()
+        project_id = None
+        resolved_name = None
+        for p in projects:
+            p_name = p.get("attributes", {}).get("name", "")
+            if proj_target in p_name.lower():
+                project_id = p.get("id")
+                resolved_name = p_name
+                break
+        if not project_id:
+            return (
+                f"Project '{project_name}' not found in hub '{hub_name}'. "
+                f"Run list_projects to see valid names."
+            )
+
+        # Fetch live permissions — explicitly uncached
+        users = await asyncio.to_thread(get_project_user_permissions, project_id)
+        if not users:
+            return (
+                f"No users found for project '{resolved_name}' "
+                f"(or insufficient admin permissions)."
+            )
+
+        # Partition by access level for readability
+        admins = [u for u in users if "projectAdmin" in u.get("accessLevels", [])]
+        members = [u for u in users if u not in admins]
+
+        def _fmt_user(u: dict) -> str:
+            name = u.get("name") or u.get("email") or "Unknown"
+            email = u.get("email", "")
+            company = u.get("companyName", "") or u.get("companyId", "")
+            roles = ", ".join(filter(None, u.get("roleNames", []))) or "—"
+            products = ", ".join(
+                f"{p['key']}:{p['access']}" for p in u.get("products", []) if p.get("key")
+            ) or "—"
+            parts = [f"  - {name}"]
+            if email:
+                parts.append(f"    Email:    {email}")
+            if company:
+                parts.append(f"    Company:  {company}")
+            parts.append(f"    Roles:    {roles}")
+            parts.append(f"    Products: {products}")
+            return "\n".join(parts)
+
+        lines = [
+            f"## Project Permissions — {resolved_name}",
+            f"Live fetch from ACC (uncached) · {len(users)} members total\n",
+        ]
+
+        lines.append(f"### Admins ({len(admins)})")
+        if admins:
+            lines.extend(_fmt_user(u) for u in admins)
+        else:
+            lines.append("  (none)")
+
+        lines.append(f"\n### Members ({len(members)})")
+        if members:
+            lines.extend(_fmt_user(u) for u in members)
+        else:
+            lines.append("  (none)")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"check_project_permissions failed: {e}")
+        return f"Failed to fetch permissions: {e}"
 
 
 @mcp.tool()
