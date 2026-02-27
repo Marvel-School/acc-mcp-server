@@ -23,6 +23,7 @@ from api import (
     replicate_folders,
     get_project_users,
     get_project_user_permissions,
+    get_user_projects,
     add_project_user,
     get_all_hub_users,
     soft_delete_folder,
@@ -518,6 +519,64 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
     except Exception as e:
         logger.error(f"check_project_permissions failed: {e}")
         return f"Failed to fetch permissions: {e}"
+
+
+@mcp.tool()
+async def find_user_projects(hub_name: str, user_name: str) -> str:
+    """
+    Lists every ACC project a specific user has access to within a hub.
+
+    Resolves the user by display name (substring, case-insensitive) or exact
+    email address, then returns their project assignments in real-time.
+    No results are cached — each call reflects the live state in ACC.
+
+    Args:
+        hub_name:  Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
+        user_name: User's full name (or part of it) or their email address.
+    """
+    try:
+        # Resolve hub name → raw account_id (strip 'b.' prefix)
+        hubs = await asyncio.to_thread(get_hubs)
+        hub_target = hub_name.lower().strip()
+        hub_id = None
+        for h in hubs:
+            if h.get("attributes", {}).get("name", "").lower() == hub_target:
+                hub_id = h.get("id")
+                break
+        if not hub_id:
+            return (
+                f"Hub '{hub_name}' not found. "
+                f"Run list_hubs to see valid names."
+            )
+
+        account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
+
+        # Fetch live user-project assignments — no caching
+        result = await asyncio.to_thread(get_user_projects, account_id, user_name)
+
+        display_name = result["user_name"]
+        email = result["user_email"]
+        projects = result["projects"]
+
+        header = f"**User**: {display_name} | **Hub**: {hub_name}"
+        if email:
+            header += f"\n**Email**: {email}"
+        header += f"\n**Total projects**: {len(projects)}\n"
+
+        if not projects:
+            return header + "\nNo project assignments found (or insufficient admin permissions)."
+
+        lines = [header]
+        for p in projects:
+            lines.append(f"* {p['name']} (Role: {p['role']})")
+
+        return "\n".join(lines)
+
+    except ValueError as ve:
+        return str(ve)
+    except Exception as e:
+        logger.error(f"find_user_projects failed: {e}")
+        return f"Failed to fetch user projects: {e}"
 
 
 @mcp.tool()

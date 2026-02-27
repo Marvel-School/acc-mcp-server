@@ -798,6 +798,110 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
     return sorted(result, key=lambda u: u["email"])
 
 
+def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
+    """
+    Resolves a user by display name or email and returns every project they
+    have access to within the account.
+
+    NEVER cached — every call executes live HTTP requests so that permission
+    changes made in ACC are reflected immediately.
+
+    Step 1 — User resolution (two strategies, no caching):
+      Email  → GET /hq/v1/regions/eu/accounts/{id}/users/search?email={email}
+      Name   → GET /hq/v1/regions/eu/accounts/{id}/users (paginated, local filter)
+
+    Step 2 — Project fetch:
+      GET /hq/v1/regions/eu/accounts/{id}/users/{uid}/projects
+
+    Args:
+        account_id:          Raw ACC account ID (no 'b.' prefix).
+        user_name_or_email:  Display name substring (case-insensitive) or exact email.
+
+    Returns:
+        {
+            "user_name":  str,
+            "user_email": str,
+            "projects":   [{"name": str, "role": str}],
+        }
+
+    Raises:
+        ValueError: If no matching user is found or an API call fails.
+    """
+    query = user_name_or_email.strip()
+
+    # --- Step 1: Resolve user → uid ----------------------------------------
+    if "@" in query:
+        # Fast path: direct email search
+        search_url = (
+            f"https://developer.api.autodesk.com/hq/v1/regions/eu"
+            f"/accounts/{account_id}/users/search?email={query.lower()}"
+        )
+        candidates: list = _make_request("GET", search_url).json()
+    else:
+        # Slow path: paginate through all account users, filter by name
+        candidates = []
+        target = query.lower()
+        limit = 100
+        offset = 0
+        for _ in range(20):  # safety cap: 2 000 users max
+            list_url = (
+                f"https://developer.api.autodesk.com/hq/v1/regions/eu"
+                f"/accounts/{account_id}/users?limit={limit}&offset={offset}"
+            )
+            page: list = _make_request("GET", list_url).json()
+            for u in page:
+                full = (
+                    u.get("name")
+                    or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+                )
+                if target in full.lower():
+                    candidates.append(u)
+            if len(page) < limit:
+                break
+            offset += limit
+
+    if not candidates:
+        raise ValueError(f"No ACC user found matching '{user_name_or_email}'")
+
+    match = candidates[0]
+    uid = match.get("uid") or match.get("id")
+    display_name = (
+        match.get("name")
+        or f"{match.get('first_name', '')} {match.get('last_name', '')}".strip()
+        or user_name_or_email
+    )
+    email = (match.get("email") or "").lower()
+
+    if not uid:
+        raise ValueError(
+            f"Resolved user '{display_name}' but could not determine their user ID"
+        )
+
+    logger.info(f"[UserProjects] Resolved '{display_name}' → uid={uid}")
+
+    # --- Step 2: Fetch projects assigned to this user -----------------------
+    proj_url = (
+        f"https://developer.api.autodesk.com/hq/v1/regions/eu"
+        f"/accounts/{account_id}/users/{uid}/projects"
+    )
+    raw = _make_request("GET", proj_url).json()
+    raw_projects = raw if isinstance(raw, list) else raw.get("data", [])
+
+    projects = []
+    for p in raw_projects:
+        role = (
+            "Project Admin"
+            if p.get("access_level") == "project_admin"
+            else "Member"
+        )
+        projects.append({"name": p.get("name", "—"), "role": role})
+
+    logger.info(
+        f"[UserProjects] Found {len(projects)} projects for '{display_name}' (live, uncached)"
+    )
+    return {"user_name": display_name, "user_email": email, "projects": projects}
+
+
 def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> dict:
     """Creates a subfolder inside a parent folder using the Data Management API.
 
