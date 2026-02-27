@@ -634,6 +634,72 @@ def get_project_users(hub_id: str, project_id: str) -> list:
     return all_users
 
 
+def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
+    """
+    Fetches all project members with full permission and role details.
+
+    NEVER cached — every call executes a live HTTP request to ACC to return
+    the absolute current truth. This prevents stale data from in-process caches
+    reflecting a state that has since changed in the platform.
+
+    Uses the ACC Admin API (construction/admin/v1) with automatic pagination
+    (up to 10 pages, 100 users/page = 1 000 users max).
+
+    Args:
+        project_id: Project ID (b. prefix is stripped automatically).
+
+    Returns:
+        List of user dicts with keys: name, email, companyId, companyName,
+        roleIds, products, accessLevels.
+
+    Raises:
+        ValueError: On any API or HTTP error.
+    """
+    clean_id = _strip_b_prefix(project_id)
+    base_url = (
+        f"https://developer.api.autodesk.com/construction/admin/v1"
+        f"/projects/{clean_id}/users?limit=100"
+    )
+
+    all_users: List[Dict[str, Any]] = []
+    url: Optional[str] = base_url
+
+    for _ in range(10):  # safety cap — 10 pages × 100 = 1 000 users max
+        resp = _make_request("GET", url)  # type: ignore[arg-type]
+        data = resp.json()
+
+        for raw in data.get("results", []):
+            company = raw.get("company") or {}
+            products_raw = raw.get("products") or []
+            roles_raw = raw.get("roles") or []
+            access_levels = raw.get("accessLevels") or []
+
+            all_users.append({
+                "name": raw.get("name", ""),
+                "email": (raw.get("email") or "").lower(),
+                "companyId": company.get("id", ""),
+                "companyName": company.get("name", ""),
+                "roleIds": [r.get("id", "") for r in roles_raw],
+                "roleNames": [r.get("name", "") for r in roles_raw],
+                "products": [
+                    {"key": p.get("key", ""), "access": p.get("access", "")}
+                    for p in products_raw
+                ],
+                "accessLevels": access_levels,
+            })
+
+        next_url = data.get("pagination", {}).get("nextUrl")
+        if next_url:
+            url = next_url
+        else:
+            break
+
+    logger.info(
+        f"[Permissions] Fetched {len(all_users)} users for project {clean_id} (live, uncached)"
+    )
+    return all_users
+
+
 def add_project_user(hub_id: str, project_id: str, email: str, products: Optional[list] = None) -> dict:
     """
     Add a user to a project.
