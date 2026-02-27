@@ -686,9 +686,15 @@ def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
                 if (_first or _last)
                 else (raw.get("name") or "").strip()
             )
+            # Pass 1 — strip standard 36-char UUIDs (8-4-4-4-12 with dashes)
             display_name = re.sub(
-                r"[0-9a-f]{8,}(?:-[0-9a-f]{4,})*", "", _raw_name, flags=re.IGNORECASE
-            ).strip() or "-"
+                r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
+                "",
+                _raw_name,
+            )
+            # Pass 2 — strip any remaining long hex-only run at end of string
+            # (catches non-standard IDs like "0c1e0b3b6b3a4" with no dashes)
+            display_name = re.sub(r"[a-fA-F0-9]{10,}$", "", display_name).strip() or "-"
 
             all_users.append({
                 "name": display_name,
