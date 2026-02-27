@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import hashlib
@@ -448,8 +449,18 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
                 f"(or insufficient admin permissions)."
             )
 
-        # Determine a human-readable role label per user.
-        # Priority: explicit role names > accessLevels label > fallback.
+        # UUID pattern — any value matching this is an internal system ID, not human text.
+        _UUID = re.compile(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            re.IGNORECASE,
+        )
+
+        def _safe(s: str) -> bool:
+            """True when s is a non-empty, non-UUID display string."""
+            return bool(s) and not _UUID.match(s.strip())
+
+        # Deduplicate by email (falls back to name).
+        # If ACC returns multiple rows per user (one per product/role), merge them.
         _LEVEL_LABEL = {
             "projectAdmin": "Project Admin",
             "projectMember": "Project Member",
@@ -457,34 +468,50 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
             "projectController": "Project Controller",
         }
 
-        def _role_label(u: dict) -> str:
-            names = [n for n in u.get("roleNames", []) if n]
+        user_map: dict = {}
+        for u in users:
+            key = u.get("email") or u.get("name") or "unknown"
+            if key not in user_map:
+                user_map[key] = {
+                    "name": u.get("name") or "Unknown",
+                    "company": u.get("companyName") or "—",
+                    "roles": set(),
+                    "levels": set(),
+                }
+            for rn in u.get("roleNames", []):
+                if _safe(rn):
+                    user_map[key]["roles"].add(rn)
+            user_map[key]["levels"].update(u.get("accessLevels", []))
+
+        def _role_label(entry: dict) -> str:
+            names = sorted(entry["roles"])
             if names:
-                return names[0]
-            levels = u.get("accessLevels", [])
-            for lvl in levels:
+                return ", ".join(names)
+            for lvl in entry["levels"]:
                 if lvl in _LEVEL_LABEL:
                     return _LEVEL_LABEL[lvl]
             return "Member"
 
-        def _fmt_user(u: dict) -> str:
-            name = u.get("name") or "Unknown"
-            company = u.get("companyName") or "—"
-            role = _role_label(u)
-            return f"* **Name**: {name} | **Company**: {company} | **Role**: {role}"
+        def _fmt_entry(entry: dict) -> str:
+            return (
+                f"* **Name**: {entry['name']} | "
+                f"**Company**: {entry['company']} | "
+                f"**Role**: {_role_label(entry)}"
+            )
 
-        admins = [u for u in users if "projectAdmin" in u.get("accessLevels", [])]
-        members = [u for u in users if u not in admins]
+        deduped = list(user_map.values())
+        admins = [e for e in deduped if "projectAdmin" in e["levels"]]
+        members = [e for e in deduped if e not in admins]
 
         lines = [
             f"## Project Members: {resolved_name}",
-            f"Total: {len(users)} ({len(admins)} admins, {len(members)} members)",
+            f"Total: {len(deduped)} ({len(admins)} admins, {len(members)} members)",
             "",
             "**Admins:**",
         ]
-        lines += [_fmt_user(u) for u in admins] or ["* (none)"]
+        lines += [_fmt_entry(e) for e in admins] or ["* (none)"]
         lines += ["", "**Members:**"]
-        lines += [_fmt_user(u) for u in members] or ["* (none)"]
+        lines += [_fmt_entry(e) for e in members] or ["* (none)"]
 
         return "\n".join(lines)
 
