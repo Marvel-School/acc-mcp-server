@@ -31,6 +31,8 @@
 
         const statusEl = document.getElementById("status");
         let viewer = null;
+        let currentUrn = null;
+        let lastHighlightJson = "";
 
         function setStatus(msg) {
             statusEl.textContent = msg;
@@ -43,6 +45,8 @@
 
         function initViewer(urn, accessToken) {
             if (viewer) { viewer.finish(); viewer = null; }
+            currentUrn = urn;
+            lastHighlightJson = "";
 
             const options = {
                 env: "AutodeskProduction",
@@ -77,6 +81,7 @@
                         }
                         hideStatus();
                         viewer.loadDocumentNode(doc, defaultModel);
+                        setInterval(pollHighlights, 2000);
 
                         viewer.addEventListener(Autodesk.Viewing.SELECTION_CHANGED_EVENT, () => {
                             const ids = viewer.getSelection();
@@ -108,7 +113,26 @@
             });
         }
 
-        // Initialize MCP App and listen for tool results
+        async function pollHighlights() {
+            if (!viewer || !currentUrn) return;
+            try {
+                const res = await app.readResource({ uri: "highlight://" + currentUrn });
+                const jsonString = res.contents[0].text;
+                if (jsonString === lastHighlightJson) return;
+                lastHighlightJson = jsonString;
+
+                const data = JSON.parse(jsonString);
+                viewer.clearThemingColors();
+                if (data.ids && data.ids.length > 0 && data.color && data.color.length === 4) {
+                    const [r, g, b, a] = data.color;
+                    const colorVec = new THREE.Vector4(r, g, b, a);
+                    data.ids.forEach(id => viewer.setThemingColor(id, colorVec));
+                }
+            } catch (err) {
+                console.warn("Highlight poll failed:", err);
+            }
+        }
+
         const app = new App({ name: "Autodesk Viewer", version: "1.0.0" });
 
         app.ontoolresult = (result) => {
