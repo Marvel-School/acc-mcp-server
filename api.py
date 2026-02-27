@@ -827,6 +827,10 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
     Raises:
         ValueError: If no matching user is found or an API call fails.
     """
+    # Strip 'b.' prefix — hq/v1 Account Admin endpoints require the raw UUID.
+    # Applied here so the function is self-defensive regardless of the caller.
+    clean_account_id = _strip_b_prefix(account_id)
+
     query = user_name_or_email.strip()
 
     # --- Step 1: Resolve user → uid ----------------------------------------
@@ -834,7 +838,7 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
         # Fast path: direct email search
         search_url = (
             f"https://developer.api.autodesk.com/hq/v1/regions/eu"
-            f"/accounts/{account_id}/users/search?email={query.lower()}"
+            f"/accounts/{clean_account_id}/users/search?email={query.lower()}"
         )
         candidates: list = _make_request("GET", search_url).json()
     else:
@@ -846,7 +850,7 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
         for _ in range(20):  # safety cap: 2 000 users max
             list_url = (
                 f"https://developer.api.autodesk.com/hq/v1/regions/eu"
-                f"/accounts/{account_id}/users?limit={limit}&offset={offset}"
+                f"/accounts/{clean_account_id}/users?limit={limit}&offset={offset}"
             )
             page: list = _make_request("GET", list_url).json()
             for u in page:
@@ -882,7 +886,7 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
     # --- Step 2: Fetch projects assigned to this user -----------------------
     proj_url = (
         f"https://developer.api.autodesk.com/hq/v1/regions/eu"
-        f"/accounts/{account_id}/users/{uid}/projects"
+        f"/accounts/{clean_account_id}/users/{uid}/projects"
     )
     raw = _make_request("GET", proj_url).json()
     raw_projects = raw if isinstance(raw, list) else raw.get("data", [])
