@@ -674,11 +674,27 @@ def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
             roles_raw = raw.get("roles") or []
             access_levels = raw.get("accessLevels") or []
 
+            # Build a clean display name.
+            # ACC sometimes appends autodeskId directly onto the name field
+            # (e.g. "Maxine Bruil0c1e0b3b-..."). Prefer the separate
+            # firstName/lastName fields; fall back to name; strip any
+            # embedded hex-ID substring from whatever we end up with.
+            _first = (raw.get("firstName") or "").strip()
+            _last = (raw.get("lastName") or "").strip()
+            _raw_name = (
+                f"{_first} {_last}".strip()
+                if (_first or _last)
+                else (raw.get("name") or "").strip()
+            )
+            display_name = re.sub(
+                r"[0-9a-f]{8,}(?:-[0-9a-f]{4,})*", "", _raw_name, flags=re.IGNORECASE
+            ).strip() or "-"
+
             all_users.append({
-                "name": raw.get("name", ""),
+                "name": display_name,
                 "email": (raw.get("email") or "").lower(),
                 "companyId": company.get("id", ""),
-                "companyName": company.get("name", ""),
+                "companyName": company.get("name", "") or "-",
                 "roleIds": [r.get("id", "") for r in roles_raw],
                 "roleNames": [r.get("name", "") for r in roles_raw],
                 "products": [
