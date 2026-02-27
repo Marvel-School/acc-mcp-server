@@ -858,7 +858,16 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
                     u.get("name")
                     or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
                 )
-                if target in full.lower():
+                api_name = full.lower()
+                api_email = (u.get("email") or "").lower()
+                # Normalize search term: strip commas so "Last, First" matches
+                # "First Last", then require every token to appear in the name.
+                search_clean = target.replace(",", "").split()
+                name_match = bool(search_clean) and all(
+                    part in api_name for part in search_clean
+                )
+                email_match = target.replace(",", "").strip() in api_email
+                if name_match or email_match:
                     candidates.append(u)
             if len(page) < limit:
                 break
