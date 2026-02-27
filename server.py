@@ -448,43 +448,43 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
                 f"(or insufficient admin permissions)."
             )
 
-        # Partition by access level for readability
+        # Determine a human-readable role label per user.
+        # Priority: explicit role names > accessLevels label > fallback.
+        _LEVEL_LABEL = {
+            "projectAdmin": "Project Admin",
+            "projectMember": "Project Member",
+            "executive": "Executive",
+            "projectController": "Project Controller",
+        }
+
+        def _role_label(u: dict) -> str:
+            names = [n for n in u.get("roleNames", []) if n]
+            if names:
+                return names[0]
+            levels = u.get("accessLevels", [])
+            for lvl in levels:
+                if lvl in _LEVEL_LABEL:
+                    return _LEVEL_LABEL[lvl]
+            return "Member"
+
+        def _fmt_user(u: dict) -> str:
+            name = u.get("name") or "Unknown"
+            company = u.get("companyName") or "—"
+            role = _role_label(u)
+            return f"* **Name**: {name} | **Company**: {company} | **Role**: {role}"
+
         admins = [u for u in users if "projectAdmin" in u.get("accessLevels", [])]
         members = [u for u in users if u not in admins]
 
-        def _fmt_user(u: dict) -> str:
-            name = u.get("name") or u.get("email") or "Unknown"
-            email = u.get("email", "")
-            company = u.get("companyName", "") or u.get("companyId", "")
-            roles = ", ".join(filter(None, u.get("roleNames", []))) or "—"
-            products = ", ".join(
-                f"{p['key']}:{p['access']}" for p in u.get("products", []) if p.get("key")
-            ) or "—"
-            parts = [f"  - {name}"]
-            if email:
-                parts.append(f"    Email:    {email}")
-            if company:
-                parts.append(f"    Company:  {company}")
-            parts.append(f"    Roles:    {roles}")
-            parts.append(f"    Products: {products}")
-            return "\n".join(parts)
-
         lines = [
-            f"## Project Permissions — {resolved_name}",
-            f"Live fetch from ACC (uncached) · {len(users)} members total\n",
+            f"## Project Members: {resolved_name}",
+            f"Total: {len(users)} ({len(admins)} admins, {len(members)} members)",
+            "",
+            "**Admins:**",
         ]
-
-        lines.append(f"### Admins ({len(admins)})")
-        if admins:
-            lines.extend(_fmt_user(u) for u in admins)
-        else:
-            lines.append("  (none)")
-
-        lines.append(f"\n### Members ({len(members)})")
-        if members:
-            lines.extend(_fmt_user(u) for u in members)
-        else:
-            lines.append("  (none)")
+        lines += [_fmt_user(u) for u in admins] or ["* (none)"]
+        lines += ["", "**Members:**"]
+        lines += [_fmt_user(u) for u in members] or ["* (none)"]
 
         return "\n".join(lines)
 
