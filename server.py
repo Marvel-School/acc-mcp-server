@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import hashlib
@@ -22,6 +23,7 @@ from api import (
     replicate_folders,
     get_project_users,
     get_project_user_permissions,
+    get_user_projects,
     add_project_user,
     get_all_hub_users,
     soft_delete_folder,
@@ -90,8 +92,7 @@ async def list_hubs() -> str:
         report = "Found Hubs:\n"
         for hub in hubs:
             name = hub.get("attributes", {}).get("name", "Unknown")
-            hub_id = hub.get("id")
-            report += f"- {name} (ID: {hub_id})\n"
+            report += f"- {name}\n"
         return report
     except Exception as e:
         logger.error(f"list_hubs failed: {e}")
@@ -120,8 +121,7 @@ async def list_projects(hub_id: str, fields: str = "") -> str:
         for p in projects:
             attrs = p.get("attributes", {})
             name = attrs.get("name", "Unknown")
-            pid = p.get("id")
-            report += f"- {name} (ID: {pid})\n"
+            report += f"- {name}\n"
 
             for key in (field_list or []):
                 val = attrs.get(key)
@@ -153,8 +153,9 @@ async def list_top_folders(hub_id: str, project_id: str) -> str:
         report = "Top Folders:\n"
         for f in folders:
             name = f.get("name") or f.get("attributes", {}).get("displayName", "Unknown")
-            fid = f.get("id")
-            report += f"- {name} (ID: {fid})\n"
+            fid = f.get("id") or ""
+            fid_display = f"...{fid[-12:]}" if len(fid) > 12 else fid
+            report += f"- {name} (ID: {fid_display})\n"
         return report
     except Exception as e:
         logger.error(f"list_top_folders failed: {e}")
@@ -179,13 +180,11 @@ async def list_folder_contents(project_id: str, folder_id: str) -> str:
         report = f"Folder Contents ({len(items)} items):\n"
         for item in items:
             name = item.get("name") or item.get("attributes", {}).get("displayName", "Unknown")
-            iid = item.get("id")
+            iid = item.get("id") or ""
+            iid_display = f"...{iid[-12:]}" if len(iid) > 12 else iid
             item_type = item.get("itemType") or item.get("type", "unknown")
             icon = "[folder]" if item_type in ("folder", "folders") else "[file]"
-            report += f"  {icon} {name} (ID: {iid})\n"
-            tip = item.get("tipVersionUrn")
-            if tip:
-                report += f"         Version URN: {tip}\n"
+            report += f"  {icon} {name} (ID: {iid_display})\n"
         return report
     except Exception as e:
         logger.error(f"list_folder_contents failed: {e}")
@@ -236,6 +235,15 @@ async def reprocess_file(project_id: str, file_id: str) -> str:
             return f"Error: Could not resolve lineage URN to a version URN."
 
         result = await asyncio.to_thread(trigger_translation, version_urn)
+        errors = result.get("errors") or []
+        if errors:
+            error_detail = "; ".join(
+                e.get("detail", str(e)) if isinstance(e, dict) else str(e)
+                for e in errors
+            )
+            logger.error(f"reprocess_file: Autodesk returned errors: {error_detail}")
+            return f"Translation request was rejected by Autodesk: {error_detail}"
+
         status = result.get("result", "unknown")
         return (
             f"Translation job started for '{file_id}' (status: {status}).\n"
@@ -314,7 +322,7 @@ async def create_project(hub_id_or_name: str, name: str, project_type: str = "AC
         if new_id:
             return f"Project '{name}' successfully created! Project ID: {new_id}"
         else:
-            return f"API succeeded, but couldn't parse ID. Raw response: {result}"
+            return "API succeeded, but couldn't parse the new Project ID from the response."
     except Exception as e:
         logger.error(f"create_project failed: {e}")
         return f"Failed to create project: {e}"
@@ -330,7 +338,7 @@ async def list_project_users(hub_id: str, project_id: str) -> str:
         project_id: The Project ID.
     """
     try:
-        users = await asyncio.to_thread(get_project_users, hub_id, project_id)
+        users = await asyncio.to_thread(get_project_users, project_id)
         if not users:
             return f"No users found in project {project_id} (or insufficient permissions)."
 
@@ -359,9 +367,8 @@ async def add_user(hub_id: str, project_id: str, email: str) -> str:
         email:      The user's email address.
     """
     try:
-        result = await asyncio.to_thread(add_project_user, hub_id, project_id, email, ["docs"])
-        user_id = result.get("id", "unknown")
-        return f"User '{email}' added to project. User ID: {user_id}"
+        await asyncio.to_thread(add_project_user, hub_id, project_id, email, ["docs"])
+        return f"User '{email}' successfully added to the project."
     except Exception as e:
         logger.error(f"add_user failed: {e}")
         return f"Failed to add user: {e}"
@@ -377,14 +384,27 @@ async def audit_hub_users(hub_id: str) -> str:
         hub_id: The Hub ID (starts with 'b.'). Use list_hubs to find this.
     """
     try:
-        users = await asyncio.to_thread(get_all_hub_users, hub_id)
-        if not users:
+        users, skipped = await asyncio.to_thread(get_all_hub_users, hub_id)
+        if not users and not skipped:
             return f"No users found across projects in hub {hub_id}."
 
+        MAX_USERS = 100
+        truncated = len(users) > MAX_USERS
+        display_users = users[:MAX_USERS]
+
         report = f"Hub User Audit ({len(users)} unique users):\n\n"
-        for u in users:
+        for u in display_users:
             products = ", ".join(u["products"]) if u["products"] else "none"
             report += f"- {u['name']} ({u['email']})\n    Products: {products}\n"
+
+        if truncated:
+            report += f"\n\u26a0\ufe0f Showing first {MAX_USERS} of {len(users)} users. Use a more specific query to narrow results."
+
+        if skipped:
+            report += (
+                f"\n\n\u26a0\ufe0f NOTE: {len(skipped)} project(s) were skipped due to permission errors: "
+                + ", ".join(skipped)
+            )
 
         return report
     except Exception as e:
@@ -448,49 +468,133 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
                 f"(or insufficient admin permissions)."
             )
 
-        # Partition by access level for readability
-        admins = [u for u in users if "projectAdmin" in u.get("accessLevels", [])]
-        members = [u for u in users if u not in admins]
+        # UUID pattern — any value matching this is an internal system ID, not human text.
+        _UUID = re.compile(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            re.IGNORECASE,
+        )
 
-        def _fmt_user(u: dict) -> str:
-            name = u.get("name") or u.get("email") or "Unknown"
-            email = u.get("email", "")
-            company = u.get("companyName", "") or u.get("companyId", "")
-            roles = ", ".join(filter(None, u.get("roleNames", []))) or "—"
-            products = ", ".join(
-                f"{p['key']}:{p['access']}" for p in u.get("products", []) if p.get("key")
-            ) or "—"
-            parts = [f"  - {name}"]
-            if email:
-                parts.append(f"    Email:    {email}")
-            if company:
-                parts.append(f"    Company:  {company}")
-            parts.append(f"    Roles:    {roles}")
-            parts.append(f"    Products: {products}")
-            return "\n".join(parts)
+        def _safe(s: str) -> bool:
+            """True when s is a non-empty, non-UUID display string."""
+            return bool(s) and not _UUID.match(s.strip())
+
+        # Deduplicate by email (falls back to name).
+        # If ACC returns multiple rows per user (one per product/role), merge them.
+        _LEVEL_LABEL = {
+            "projectAdmin": "Project Admin",
+            "projectMember": "Project Member",
+            "executive": "Executive",
+            "projectController": "Project Controller",
+        }
+
+        user_map: dict = {}
+        for u in users:
+            key = u.get("email") or u.get("name") or "unknown"
+            if key not in user_map:
+                user_map[key] = {
+                    "name": u.get("name") or "Unknown",
+                    "company": u.get("companyName") or "—",
+                    "roles": set(),
+                    "levels": set(),
+                }
+            for rn in u.get("roleNames", []):
+                if _safe(rn):
+                    user_map[key]["roles"].add(rn)
+            user_map[key]["levels"].update(u.get("accessLevels", []))
+
+        def _role_label(entry: dict) -> str:
+            names = sorted(entry["roles"])
+            if names:
+                return ", ".join(names)
+            for lvl in entry["levels"]:
+                if lvl in _LEVEL_LABEL:
+                    return _LEVEL_LABEL[lvl]
+            return "Member"
+
+        def _fmt_entry(entry: dict) -> str:
+            return (
+                f"* **Name**: {entry['name']} | "
+                f"**Company**: {entry['company']} | "
+                f"**Role**: {_role_label(entry)}"
+            )
+
+        deduped = list(user_map.values())
+        admins = [e for e in deduped if "projectAdmin" in e["levels"]]
+        members = [e for e in deduped if e not in admins]
 
         lines = [
-            f"## Project Permissions — {resolved_name}",
-            f"Live fetch from ACC (uncached) · {len(users)} members total\n",
+            f"## Project Members: {resolved_name}",
+            f"Total: {len(deduped)} ({len(admins)} admins, {len(members)} members)",
+            "",
+            "**Admins:**",
         ]
-
-        lines.append(f"### Admins ({len(admins)})")
-        if admins:
-            lines.extend(_fmt_user(u) for u in admins)
-        else:
-            lines.append("  (none)")
-
-        lines.append(f"\n### Members ({len(members)})")
-        if members:
-            lines.extend(_fmt_user(u) for u in members)
-        else:
-            lines.append("  (none)")
+        lines += [_fmt_entry(e) for e in admins] or ["* (none)"]
+        lines += ["", "**Members:**"]
+        lines += [_fmt_entry(e) for e in members] or ["* (none)"]
 
         return "\n".join(lines)
 
     except Exception as e:
         logger.error(f"check_project_permissions failed: {e}")
         return f"Failed to fetch permissions: {e}"
+
+
+@mcp.tool()
+async def find_user_projects(hub_name: str, user_name: str) -> str:
+    """
+    Lists every ACC project a specific user has access to within a hub.
+
+    Resolves the user by display name (substring, case-insensitive) or exact
+    email address, then returns their project assignments in real-time.
+    No results are cached — each call reflects the live state in ACC.
+
+    Args:
+        hub_name:  Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
+        user_name: User's full name (or part of it) or their email address.
+    """
+    try:
+        # Resolve hub name → raw account_id (strip 'b.' prefix)
+        hubs = await asyncio.to_thread(get_hubs)
+        hub_target = hub_name.lower().strip()
+        hub_id = None
+        for h in hubs:
+            if h.get("attributes", {}).get("name", "").lower() == hub_target:
+                hub_id = h.get("id")
+                break
+        if not hub_id:
+            return (
+                f"Hub '{hub_name}' not found. "
+                f"Run list_hubs to see valid names."
+            )
+
+        account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
+
+        # Fetch live user-project assignments — no caching
+        result = await asyncio.to_thread(get_user_projects, account_id, user_name)
+
+        display_name = result["user_name"]
+        email = result["user_email"]
+        projects = result["projects"]
+
+        header = f"**User**: {display_name} | **Hub**: {hub_name}"
+        if email:
+            header += f"\n**Email**: {email}"
+        header += f"\n**Total projects**: {len(projects)}\n"
+
+        if not projects:
+            return header + "\nNo project assignments found (or insufficient admin permissions)."
+
+        lines = [header]
+        for p in projects:
+            lines.append(f"* {p['name']} (Role: {p['role']})")
+
+        return "\n".join(lines)
+
+    except ValueError as ve:
+        return str(ve)
+    except Exception as e:
+        logger.error(f"find_user_projects failed: {e}")
+        return f"Failed to fetch user projects: {e}"
 
 
 @mcp.tool()
