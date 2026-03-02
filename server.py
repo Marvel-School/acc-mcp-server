@@ -658,6 +658,11 @@ async def find_user_projects(hub_name: str, user_name: str) -> str:
         # Fetch live user-project assignments — no caching
         result = await asyncio.to_thread(get_user_projects, account_id, user_name)
 
+        # api.py returns a plain string when the projects endpoint errors out
+        # (e.g. 404 after resolving to internal hub UUID).
+        if isinstance(result, str):
+            return result
+
         display_name = result["user_name"]
         email = result["user_email"]
         projects = result["projects"]
