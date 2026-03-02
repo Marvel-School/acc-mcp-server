@@ -613,7 +613,12 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
 
 
 def get_project_users(hub_id: str, project_id: str) -> list:
-    """List users in a project (requires Admin). Paginates up to 5 pages."""
+    """List users in a project (requires Admin). Paginates up to 5 pages.
+
+    Names are sanitized — ACC sometimes appends autodeskId directly onto the
+    name field (e.g. "Maxine Bruil0c1e0b3b-..."). Both standard UUID and
+    non-standard hex-run suffixes are stripped before the data is returned.
+    """
     clean_project_id = _strip_b_prefix(project_id)
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
 
@@ -623,7 +628,25 @@ def get_project_users(hub_id: str, project_id: str) -> list:
     for _ in range(5):  # safety cap
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
-        all_users.extend(data.get("results", []))
+
+        for raw in data.get("results", []):
+            _first = (raw.get("firstName") or "").strip()
+            _last = (raw.get("lastName") or "").strip()
+            _raw_name = (
+                f"{_first} {_last}".strip()
+                if (_first or _last)
+                else (raw.get("name") or "").strip()
+            )
+            # Strip standard 36-char UUIDs (8-4-4-4-12)
+            clean_name = re.sub(
+                r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
+                "",
+                _raw_name,
+            )
+            # Strip any remaining long hex-only run at end of string
+            clean_name = re.sub(r"[a-fA-F0-9]{10,}$", "", clean_name).strip() or "-"
+            raw["name"] = clean_name
+            all_users.append(raw)
 
         next_url = data.get("pagination", {}).get("nextUrl")
         if next_url:

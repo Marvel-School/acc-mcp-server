@@ -92,8 +92,7 @@ async def list_hubs() -> str:
         report = "Found Hubs:\n"
         for hub in hubs:
             name = hub.get("attributes", {}).get("name", "Unknown")
-            hub_id = hub.get("id")
-            report += f"- {name} (ID: {hub_id})\n"
+            report += f"- {name}\n"
         return report
     except Exception as e:
         logger.error(f"list_hubs failed: {e}")
@@ -122,8 +121,7 @@ async def list_projects(hub_id: str, fields: str = "") -> str:
         for p in projects:
             attrs = p.get("attributes", {})
             name = attrs.get("name", "Unknown")
-            pid = p.get("id")
-            report += f"- {name} (ID: {pid})\n"
+            report += f"- {name}\n"
 
             for key in (field_list or []):
                 val = attrs.get(key)
@@ -155,8 +153,9 @@ async def list_top_folders(hub_id: str, project_id: str) -> str:
         report = "Top Folders:\n"
         for f in folders:
             name = f.get("name") or f.get("attributes", {}).get("displayName", "Unknown")
-            fid = f.get("id")
-            report += f"- {name} (ID: {fid})\n"
+            fid = f.get("id") or ""
+            fid_display = f"...{fid[-12:]}" if len(fid) > 12 else fid
+            report += f"- {name} (ID: {fid_display})\n"
         return report
     except Exception as e:
         logger.error(f"list_top_folders failed: {e}")
@@ -181,13 +180,11 @@ async def list_folder_contents(project_id: str, folder_id: str) -> str:
         report = f"Folder Contents ({len(items)} items):\n"
         for item in items:
             name = item.get("name") or item.get("attributes", {}).get("displayName", "Unknown")
-            iid = item.get("id")
+            iid = item.get("id") or ""
+            iid_display = f"...{iid[-12:]}" if len(iid) > 12 else iid
             item_type = item.get("itemType") or item.get("type", "unknown")
             icon = "[folder]" if item_type in ("folder", "folders") else "[file]"
-            report += f"  {icon} {name} (ID: {iid})\n"
-            tip = item.get("tipVersionUrn")
-            if tip:
-                report += f"         Version URN: {tip}\n"
+            report += f"  {icon} {name} (ID: {iid_display})\n"
         return report
     except Exception as e:
         logger.error(f"list_folder_contents failed: {e}")
@@ -316,7 +313,7 @@ async def create_project(hub_id_or_name: str, name: str, project_type: str = "AC
         if new_id:
             return f"Project '{name}' successfully created! Project ID: {new_id}"
         else:
-            return f"API succeeded, but couldn't parse ID. Raw response: {result}"
+            return "API succeeded, but couldn't parse the new Project ID from the response."
     except Exception as e:
         logger.error(f"create_project failed: {e}")
         return f"Failed to create project: {e}"
@@ -361,9 +358,8 @@ async def add_user(hub_id: str, project_id: str, email: str) -> str:
         email:      The user's email address.
     """
     try:
-        result = await asyncio.to_thread(add_project_user, hub_id, project_id, email, ["docs"])
-        user_id = result.get("id", "unknown")
-        return f"User '{email}' added to project. User ID: {user_id}"
+        await asyncio.to_thread(add_project_user, hub_id, project_id, email, ["docs"])
+        return f"User '{email}' successfully added to the project."
     except Exception as e:
         logger.error(f"add_user failed: {e}")
         return f"Failed to add user: {e}"
@@ -383,10 +379,17 @@ async def audit_hub_users(hub_id: str) -> str:
         if not users:
             return f"No users found across projects in hub {hub_id}."
 
+        MAX_USERS = 100
+        truncated = len(users) > MAX_USERS
+        display_users = users[:MAX_USERS]
+
         report = f"Hub User Audit ({len(users)} unique users):\n\n"
-        for u in users:
+        for u in display_users:
             products = ", ".join(u["products"]) if u["products"] else "none"
             report += f"- {u['name']} ({u['email']})\n    Products: {products}\n"
+
+        if truncated:
+            report += f"\n⚠️ Showing first {MAX_USERS} of {len(users)} users. Use a more specific query to narrow results."
 
         return report
     except Exception as e:
