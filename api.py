@@ -146,17 +146,28 @@ def get_user_id_by_email(account_id: str, email: str) -> str:
 
 
 
-_hub_cache: Dict[str, Optional[str]] = {"id": None}
+# TTL-based hub ID cache — expires after 5 minutes so it never gets permanently
+# stuck on None (e.g. after a transient 503 on the first call).
+_cached_hub_id: Optional[str] = None
+_hub_cache_time: float = 0.0
+_HUB_CACHE_TTL: float = 300.0  # seconds
 
 
 def _get_hub_id() -> Optional[str]:
-    """Returns the first accessible hub ID (cached after first call)."""
-    if _hub_cache["id"]:
-        return _hub_cache["id"]
+    """Returns the first accessible hub ID with a 5-minute TTL cache.
+
+    Re-fetches from the API when the cache is empty, expired, or was
+    populated with None on a previous failed call.
+    """
+    global _cached_hub_id, _hub_cache_time
+    now = time.monotonic()
+    if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
+        return _cached_hub_id
     hubs = get_hubs()
     if hubs:
-        _hub_cache["id"] = hubs[0].get("id")
-    return _hub_cache["id"]
+        _cached_hub_id = hubs[0].get("id")
+        _hub_cache_time = now
+    return _cached_hub_id
 
 
 def get_hubs() -> list:
@@ -612,20 +623,24 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     return resp.json()
 
 
-def get_project_users(hub_id: str, project_id: str) -> list:
-    """List users in a project (requires Admin). Paginates up to 5 pages.
+def get_project_users(project_id: str) -> list:
+    """List users in a project (requires Admin). Paginates up to 10 pages
+    (100 users/page = 1 000 users max), matching get_project_user_permissions.
 
     Names are sanitized — ACC sometimes appends autodeskId directly onto the
     name field (e.g. "Maxine Bruil0c1e0b3b-..."). Both standard UUID and
     non-standard hex-run suffixes are stripped before the data is returned.
     """
     clean_project_id = _strip_b_prefix(project_id)
-    endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
+    endpoint = (
+        f"https://developer.api.autodesk.com/construction/admin/v1"
+        f"/projects/{clean_project_id}/users?limit=100"
+    )
 
     all_users: list = []
     url: Optional[str] = endpoint
 
-    for _ in range(5):  # safety cap
+    for _ in range(10):  # safety cap — 10 pages × 100 = 1 000 users max
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
 
@@ -772,27 +787,32 @@ def add_project_user(hub_id: str, project_id: str, email: str, products: Optiona
     return resp.json()
 
 
-def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
+def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
     """Aggregate users and their product entitlements across all projects in a hub.
 
     Scans up to *max_projects* projects, collects every user encountered, and
     merges their product assignments into a single record per email.
 
     Returns:
-        List of dicts: [{"email": ..., "name": ..., "products": ["Build", ...]}]
+        Tuple of (users, skipped_projects) where:
+          - users: List of dicts [{"email", "name", "products": [...]}]
+          - skipped_projects: List of project names that failed (permission errors etc.)
     """
     projects = get_projects(hub_id)[:max_projects]
     logger.info(f"[Hub Audit] Scanning {len(projects)} projects in hub {hub_id}")
 
     user_map: Dict[str, Dict[str, Any]] = {}
 
+    skipped_projects: List[str] = []
+
     for p in projects:
         pid = p.get("id", "")
         p_name = p.get("attributes", {}).get("name", "Unknown")
         try:
-            members = get_project_users(hub_id, pid)
+            members = get_project_users(pid)
         except Exception as e:
             logger.warning(f"  Skipping project '{p_name}': {e}")
+            skipped_projects.append(p_name)
             continue
 
         for member in members:
@@ -818,7 +838,7 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
         result.append(entry)
 
     logger.info(f"[Hub Audit] Found {len(result)} unique users across {len(projects)} projects")
-    return sorted(result, key=lambda u: u["email"])
+    return sorted(result, key=lambda u: u["email"]), skipped_projects
 
 
 def get_user_projects(account_id: str, user_name_or_email: str) -> dict:

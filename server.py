@@ -235,6 +235,15 @@ async def reprocess_file(project_id: str, file_id: str) -> str:
             return f"Error: Could not resolve lineage URN to a version URN."
 
         result = await asyncio.to_thread(trigger_translation, version_urn)
+        errors = result.get("errors") or []
+        if errors:
+            error_detail = "; ".join(
+                e.get("detail", str(e)) if isinstance(e, dict) else str(e)
+                for e in errors
+            )
+            logger.error(f"reprocess_file: Autodesk returned errors: {error_detail}")
+            return f"Translation request was rejected by Autodesk: {error_detail}"
+
         status = result.get("result", "unknown")
         return (
             f"Translation job started for '{file_id}' (status: {status}).\n"
@@ -329,7 +338,7 @@ async def list_project_users(hub_id: str, project_id: str) -> str:
         project_id: The Project ID.
     """
     try:
-        users = await asyncio.to_thread(get_project_users, hub_id, project_id)
+        users = await asyncio.to_thread(get_project_users, project_id)
         if not users:
             return f"No users found in project {project_id} (or insufficient permissions)."
 
@@ -375,8 +384,8 @@ async def audit_hub_users(hub_id: str) -> str:
         hub_id: The Hub ID (starts with 'b.'). Use list_hubs to find this.
     """
     try:
-        users = await asyncio.to_thread(get_all_hub_users, hub_id)
-        if not users:
+        users, skipped = await asyncio.to_thread(get_all_hub_users, hub_id)
+        if not users and not skipped:
             return f"No users found across projects in hub {hub_id}."
 
         MAX_USERS = 100
@@ -389,7 +398,13 @@ async def audit_hub_users(hub_id: str) -> str:
             report += f"- {u['name']} ({u['email']})\n    Products: {products}\n"
 
         if truncated:
-            report += f"\n⚠️ Showing first {MAX_USERS} of {len(users)} users. Use a more specific query to narrow results."
+            report += f"\n\u26a0\ufe0f Showing first {MAX_USERS} of {len(users)} users. Use a more specific query to narrow results."
+
+        if skipped:
+            report += (
+                f"\n\n\u26a0\ufe0f NOTE: {len(skipped)} project(s) were skipped due to permission errors: "
+                + ", ".join(skipped)
+            )
 
         return report
     except Exception as e:
