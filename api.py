@@ -920,6 +920,9 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
         raise ValueError(f"No ACC user found matching '{user_name_or_email}'")
 
     match = candidates[0]
+    # Prefer 'uid' (the internal BIM 360 hub user ID required by the projects
+    # endpoint) over 'id' (which may be the Autodesk-wide autodeskId and will
+    # cause a 404 on /users/{id}/projects if used instead of the hub uid).
     uid = match.get("uid") or match.get("id")
     display_name = (
         match.get("name")
@@ -933,28 +936,53 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
             f"Resolved user '{display_name}' but could not determine their user ID"
         )
 
-    logger.info(f"[UserProjects] Resolved '{display_name}' → uid={uid}")
+    logger.info(
+        f"[UserProjects] Resolved '{display_name}' → uid={uid} "
+        f"(uid_field={'uid' if match.get('uid') else 'id'})"
+    )
 
     # --- Step 2: Fetch projects assigned to this user -----------------------
     proj_url = (
         f"https://developer.api.autodesk.com/hq/v1/regions/eu"
         f"/accounts/{clean_account_id}/users/{uid}/projects"
     )
-    raw = _make_request("GET", proj_url).json()
-    raw_projects = raw if isinstance(raw, list) else raw.get("data", [])
+    try:
+        raw = _make_request("GET", proj_url).json()
+        raw_projects = raw if isinstance(raw, list) else raw.get("data", [])
 
-    projects = []
-    for p in raw_projects:
-        role = (
-            "Project Admin"
-            if p.get("access_level") == "project_admin"
-            else "Member"
+        projects = []
+        for p in raw_projects:
+            role = (
+                "Project Admin"
+                if p.get("access_level") == "project_admin"
+                else "Member"
+            )
+            projects.append({"name": p.get("name", "—"), "role": role})
+
+        logger.info(
+            f"[UserProjects] Found {len(projects)} projects for '{display_name}' (live, uncached)"
         )
-        projects.append({"name": p.get("name", "—"), "role": role})
+    except ValueError as api_err:
+        # The /users/{uid}/projects endpoint returns 404 when the user has no
+        # project assignments or when the resolved uid is the autodeskId rather
+        # than the hub-internal uid.  Return a graceful entry instead of
+        # propagating the raw Autodesk error string to the LLM.
+        logger.warning(
+            f"[UserProjects] Could not fetch projects for uid={uid}: {api_err}"
+        )
+        projects = [
+            {
+                "name": (
+                    f"User found, but could not retrieve projects "
+                    f"(API error: {api_err}). "
+                    f"This usually means no projects are assigned, or the "
+                    f"user ID resolved to an autodeskId instead of a hub uid. "
+                    f"User ID used: {uid}"
+                ),
+                "role": "N/A",
+            }
+        ]
 
-    logger.info(
-        f"[UserProjects] Found {len(projects)} projects for '{display_name}' (live, uncached)"
-    )
     return {"user_name": display_name, "user_email": email, "projects": projects}
 
 
