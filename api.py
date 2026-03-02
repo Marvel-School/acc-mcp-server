@@ -853,8 +853,9 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
       Email  → GET /hq/v1/regions/eu/accounts/{id}/users/search?email={email}
       Name   → GET /hq/v1/regions/eu/accounts/{id}/users (paginated, local filter)
 
-    Step 2 — Project fetch:
-      GET /hq/v1/regions/eu/accounts/{id}/users/{uid}/projects
+    Step 2 — Project fetch (unified ACC endpoint, supports ACC + BIM 360):
+      GET /construction/admin/v1/accounts/{id}/users/{id}/projects?limit=100
+      Header: Region: EMEA  (replaces the legacy /regions/eu/ URL path segment)
 
     Args:
         account_id:          Raw ACC account ID (no 'b.' prefix).
@@ -939,13 +940,20 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
     logger.info(f"[UserProjects] Resolved '{display_name}' → id={target_uid}")
 
     # --- Step 2: Fetch projects assigned to this user -----------------------
+    # Unified ACC construction/admin/v1 endpoint — supports both ACC and BIM 360.
+    # Region is passed as a header instead of being embedded in the URL path.
     proj_url = (
-        f"https://developer.api.autodesk.com/hq/v1/regions/eu"
-        f"/accounts/{clean_account_id}/users/{target_uid}/projects"
+        f"https://developer.api.autodesk.com/construction/admin/v1"
+        f"/accounts/{clean_account_id}/users/{target_uid}/projects?limit=100"
     )
     try:
-        raw = _make_request("GET", proj_url).json()
-        raw_projects = raw if isinstance(raw, list) else raw.get("data", [])
+        raw = _make_request(
+            "GET",
+            proj_url,
+            extra_headers={"Region": "EMEA"},
+        ).json()
+        # Unified endpoint returns projects inside a 'results' array.
+        raw_projects = raw.get("results", [])
 
         projects = []
         for p in raw_projects:
