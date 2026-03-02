@@ -841,7 +841,7 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
     return sorted(result, key=lambda u: u["email"]), skipped_projects
 
 
-def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
+def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
     """
     Resolves a user by display name or email and returns every project they
     have access to within the account.

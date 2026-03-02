@@ -924,6 +924,7 @@ _inject_csp_into_resource()
 if __name__ == "__main__":
     logger.info(f"Starting MCP Server on port {PORT}...")
     import uvicorn
+    from typing import cast, Any
 
     app = getattr(mcp, "http_app", None)
     if callable(app):
@@ -931,4 +932,4 @@ if __name__ == "__main__":
     elif app is None:
         app = getattr(mcp, "_fastapi_app", mcp)
 
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(cast(Any, app), host="0.0.0.0", port=PORT)
