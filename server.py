@@ -82,6 +82,21 @@ async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str | Non
     return None, None
 
 
+async def _resolve_folder_id(hub_id: str, project_id: str, folder_name: str) -> str | None:
+    """Resolve a top-level folder display name to its folder ID.
+
+    Performs a case-insensitive substring match against the project's top-level
+    folders.  Returns the folder ID on success, or None when not found.
+    """
+    folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
+    target = folder_name.lower().strip()
+    for f in folders:
+        name = (f.get("name") or "").lower()
+        if target in name or name in target:
+            return f.get("id")
+    return None
+
+
 @mcp.tool()
 async def find_project(name_query: str) -> str:
     """
@@ -135,7 +150,7 @@ async def list_hubs() -> str:
 
 
 @mcp.tool()
-async def list_projects(hub_id: str, fields: str = "") -> str:
+async def list_projects(hub_name: str, fields: str = "") -> str:
     """
     Lists all projects in a hub.
 
@@ -143,14 +158,18 @@ async def list_projects(hub_id: str, fields: str = "") -> str:
     (e.g. "status,projectValue,postalCode,city,constructionType").
 
     Args:
-        hub_id: The Hub ID (starts with 'b.'). Use list_hubs to find this.
-        fields: Comma-separated extra fields (optional). Leave empty for default view.
+        hub_name: The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
+        fields:   Comma-separated extra fields (optional). Leave empty for default view.
     """
     try:
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
         field_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
         projects = await asyncio.to_thread(get_projects, hub_id, 50, field_list)
         if not projects:
-            return f"No projects found in hub {hub_id}."
+            return f"No projects found in hub '{hub_name}'."
 
         report = f"Found {len(projects)} Projects:\n"
         for p in projects:
@@ -171,16 +190,24 @@ async def list_projects(hub_id: str, fields: str = "") -> str:
 
 
 @mcp.tool()
-async def list_top_folders(hub_id: str, project_id: str) -> str:
+async def list_top_folders(hub_name: str, project_name: str) -> str:
     """
     Lists top-level folders in a project (e.g. 'Project Files', 'Plans').
     This is the starting point for navigating a project's file structure.
 
     Args:
-        hub_id:     The Hub ID (starts with 'b.').
-        project_id: The Project ID (from find_project or list_projects).
+        hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
+        project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
     """
     try:
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
+        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        if not project_id:
+            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
+
         folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
         if not folders:
             return "No top-level folders found."
@@ -198,16 +225,29 @@ async def list_top_folders(hub_id: str, project_id: str) -> str:
 
 
 @mcp.tool()
-async def list_folder_contents(project_id: str, folder_id: str) -> str:
+async def list_folder_contents(hub_name: str, project_name: str, folder_name: str = "Project Files") -> str:
     """
-    Lists files and subfolders inside a folder.
-    Use list_top_folders first, then drill down with this tool.
+    Lists files and subfolders inside a top-level folder.
+    Use list_top_folders first to discover available folder names.
 
     Args:
-        project_id: The Project ID.
-        folder_id:  The Folder ID (from list_top_folders or a previous list_folder_contents call).
+        hub_name:     The Hub name (e.g. "TBI Holding").
+        project_name: The Project name (e.g. "Grasbaan").
+        folder_name:  The top-level folder name (e.g. "Project Files"). Defaults to "Project Files".
     """
     try:
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
+        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        if not project_id:
+            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
+
+        folder_id = await _resolve_folder_id(hub_id, project_id, folder_name)
+        if not folder_id:
+            return f"Folder '{folder_name}' not found in project '{resolved_name}'. Use list_top_folders to see available folders."
+
         items = await asyncio.to_thread(get_folder_contents, project_id, folder_id)
         if not items:
             return "Folder is empty."
@@ -227,19 +267,27 @@ async def list_folder_contents(project_id: str, folder_id: str) -> str:
 
 
 @mcp.tool()
-async def inspect_file(project_id: str, file_id: str) -> str:
+async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
     """
     Inspect a file's translation/processing status in the Model Derivative service.
 
-    Accepts a filename OR a URN — no need to look up the URN manually.
     Returns translation status (Ready / Processing / Failed / Not Translated).
 
     Args:
-        project_id: The project ID (from find_project).
-        file_id:    Filename (e.g. "MyFile.rvt"), lineage URN, or version URN.
+        hub_name:     The Hub name (e.g. "TBI Holding").
+        project_name: The Project name (e.g. "Grasbaan").
+        file_name:    Filename (e.g. "MyFile.rvt").
     """
     try:
-        return await asyncio.to_thread(inspect_generic_file, project_id, file_id)
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
+        project_id, _ = await _resolve_project_id(hub_id, project_name)
+        if not project_id:
+            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
+
+        return await asyncio.to_thread(inspect_generic_file, project_id, file_name)
     except Exception as e:
         logger.error(f"inspect_file failed: {e}")
         return f"Error inspecting file: {e}"
@@ -247,7 +295,7 @@ async def inspect_file(project_id: str, file_id: str) -> str:
 
 
 @mcp.tool()
-async def reprocess_file(project_id: str, file_id: str) -> str:
+async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> str:
     """
     Trigger a fresh Model Derivative translation job for a file.
 
@@ -255,15 +303,24 @@ async def reprocess_file(project_id: str, file_id: str) -> str:
     or when count_elements returns 0 unexpectedly.
 
     Args:
-        project_id: The project ID (from find_project).
-        file_id:    Filename (e.g. "MyFile.rvt"), lineage URN, or version URN.
+        hub_name:     The Hub name (e.g. "TBI Holding").
+        project_name: The Project name (e.g. "Grasbaan").
+        file_name:    Filename (e.g. "MyFile.rvt").
 
     Note: Translation typically takes 5-10 minutes. Use inspect_file to check progress.
     """
     try:
-        lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_id)
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
+        project_id, _ = await _resolve_project_id(hub_id, project_name)
+        if not project_id:
+            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
+
+        lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
         if not lineage_urn or not lineage_urn.startswith("urn:"):
-            return f"Error: Could not resolve '{file_id}' to a valid lineage URN."
+            return f"Error: Could not resolve '{file_name}' to a valid lineage URN."
 
         version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
         if not version_urn or not version_urn.startswith("urn:"):
@@ -281,7 +338,7 @@ async def reprocess_file(project_id: str, file_id: str) -> str:
 
         status = result.get("result", "unknown")
         return (
-            f"Translation job started for '{file_id}' (status: {status}).\n"
+            f"Translation job started for '{file_name}' (status: {status}).\n"
             f"Please wait 5-10 minutes, then use inspect_file or count_elements to verify."
         )
     except Exception as e:
@@ -290,7 +347,7 @@ async def reprocess_file(project_id: str, file_id: str) -> str:
 
 
 @mcp.tool()
-async def count_elements(project_id: str, file_id: str, category_name: str) -> str:
+async def count_elements(hub_name: str, project_name: str, file_name: str, category_name: str) -> str:
     """
     Count elements in a Revit/IFC model that match a category name.
 
@@ -299,14 +356,23 @@ async def count_elements(project_id: str, file_id: str, category_name: str) -> s
     automatically tries singular forms (e.g. "Walls" also matches "Wall").
 
     Args:
-        project_id:    The project ID (from find_project).
-        file_id:       Filename (e.g. "MyFile.rvt"), lineage URN, or version URN.
+        hub_name:      The Hub name (e.g. "TBI Holding").
+        project_name:  The Project name (e.g. "Grasbaan").
+        file_name:     Filename (e.g. "MyFile.rvt").
         category_name: Category to count (e.g. "Walls", "Doors", "Windows", "Floors").
     """
     try:
-        lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_id)
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
+        project_id, _ = await _resolve_project_id(hub_id, project_name)
+        if not project_id:
+            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
+
+        lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
         if not lineage_urn or not lineage_urn.startswith("urn:"):
-            return f"Error: Could not resolve '{file_id}' to a valid URN."
+            return f"Error: Could not resolve '{file_name}' to a valid URN."
 
         version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
         if not version_urn or not version_urn.startswith("urn:"):
@@ -356,18 +422,26 @@ async def create_project(hub_id_or_name: str, name: str, project_type: str = "AC
 
 
 @mcp.tool()
-async def list_project_users(hub_id: str, project_id: str) -> str:
+async def list_project_users(hub_name: str, project_name: str) -> str:
     """
     Lists users assigned to a project (requires Admin permissions).
 
     Args:
-        hub_id:     The Hub ID (starts with 'b.').
-        project_id: The Project ID.
+        hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
+        project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
     """
     try:
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
+        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        if not project_id:
+            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
+
         users = await asyncio.to_thread(get_project_users, project_id)
         if not users:
-            return f"No users found in project {project_id} (or insufficient permissions)."
+            return f"No users found in project '{resolved_name}' (or insufficient permissions)."
 
         report = f"Project Members ({len(users)}):\n"
         for u in users[:30]:
@@ -384,36 +458,48 @@ async def list_project_users(hub_id: str, project_id: str) -> str:
 
 
 @mcp.tool()
-async def add_user(hub_id: str, project_id: str, email: str) -> str:
+async def add_user(hub_name: str, project_name: str, email: str) -> str:
     """
     Adds a user to a project by email.
 
     Args:
-        hub_id:     The Hub ID (starts with 'b.'). Needed for admin auth.
-        project_id: The Project ID.
-        email:      The user's email address.
+        hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
+        project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
+        email:        The user's email address.
     """
     try:
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
+        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        if not project_id:
+            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
+
         await asyncio.to_thread(add_project_user, hub_id, project_id, email, ["docs"])
-        return f"User '{email}' successfully added to the project."
+        return f"User '{email}' successfully added to project '{resolved_name}'."
     except Exception as e:
         logger.error(f"add_user failed: {e}")
         return f"Failed to add user: {e}"
 
 
 @mcp.tool()
-async def audit_hub_users(hub_id: str) -> str:
+async def audit_hub_users(hub_name: str) -> str:
     """
     Scans the entire hub to list all users and the products they are assigned
     (e.g. Build, Docs, Takeoff). Aggregates across up to 20 projects.
 
     Args:
-        hub_id: The Hub ID (starts with 'b.'). Use list_hubs to find this.
+        hub_name: The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
     """
     try:
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
         users, skipped = await asyncio.to_thread(get_all_hub_users, hub_id)
         if not users and not skipped:
-            return f"No users found across projects in hub {hub_id}."
+            return f"No users found across projects in hub '{hub_name}'."
 
         MAX_USERS = 100
         truncated = len(users) > MAX_USERS
@@ -598,24 +684,28 @@ async def find_user_projects(hub_name: str, user_name: str) -> str:
 
 
 @mcp.tool()
-async def apply_folder_template(hub_id: str, source_project_name: str, dest_project_name: str) -> str:
+async def apply_folder_template(hub_name: str, source_project_name: str, dest_project_name: str) -> str:
     """
     Copies the folder structure from a Source Project to a Destination Project.
     Useful for setting up new projects from a template. Only folders are copied, not files.
 
     Args:
-        hub_id:               The Hub ID (starts with 'b.').
+        hub_name:             The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         source_project_name:  Name of the template project to copy FROM.
         dest_project_name:    Name of the target project to copy TO.
     """
     try:
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
         src_id, src_name = await _resolve_project_id(hub_id, source_project_name)
         if not src_id:
-            return f"Source project '{source_project_name}' not found. Run list_projects to see valid names."
+            return f"Source project '{source_project_name}' not found. Use list_projects to see valid names."
 
         dst_id, dst_name = await _resolve_project_id(hub_id, dest_project_name)
         if not dst_id:
-            return f"Destination project '{dest_project_name}' not found. Run list_projects to see valid names."
+            return f"Destination project '{dest_project_name}' not found. Use list_projects to see valid names."
 
         summary = await asyncio.to_thread(replicate_folders, hub_id, src_id, dst_id)
         return f"Template applied from '{src_name}' to '{dst_name}': {summary}"
@@ -625,20 +715,24 @@ async def apply_folder_template(hub_id: str, source_project_name: str, dest_proj
 
 
 @mcp.tool()
-async def delete_folder(hub_id: str, project_name: str, folder_name: str) -> str:
+async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> str:
     """
     Deletes (hides) a specific top-level folder within a project.
     Useful for cleaning up mistakes or removing unwanted template folders.
 
     Args:
-        hub_id:        The Hub ID (starts with 'b.').
+        hub_name:      The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         project_name:  The name of the project containing the folder.
         folder_name:   The name of the folder to delete (e.g. '01_WIP').
     """
     try:
+        hub_id = await _resolve_hub_id(hub_name)
+        if not hub_id:
+            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
+
         found_id, _ = await _resolve_project_id(hub_id, project_name)
         if not found_id:
-            return f"Could not find a project named '{project_name}'. Run list_projects to see valid names."
+            return f"Could not find a project named '{project_name}'. Use list_projects to see valid names."
 
         return await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
     except Exception as e:
