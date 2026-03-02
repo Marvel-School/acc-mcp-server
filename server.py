@@ -1,6 +1,6 @@
 import os
 import re
-import json
+import json  # Used specifically for the get_highlights resource endpoint, not for tool outputs.
 import asyncio
 import hashlib
 import logging
@@ -45,6 +45,41 @@ _COLOR_MAP: dict[str, list[float]] = {
     "orange": [1, 0.5, 0, 1],
     "clear": [0, 0, 0, 0],
 }
+
+
+# ---------------------------------------------------------------------------
+# Shared resolution helpers — DRY replacements for repeated inline loops.
+# ---------------------------------------------------------------------------
+
+async def _resolve_hub_id(hub_name: str) -> str | None:
+    """Resolve a hub display name to its Autodesk Hub ID.
+
+    Performs a case-insensitive exact match against every hub accessible to
+    the service account.  Returns the hub ID string (e.g. 'b.xxxxxxxx-...')
+    on success, or None when no hub matches the given name.
+    """
+    hubs = await asyncio.to_thread(get_hubs)
+    target = hub_name.lower().strip()
+    for h in hubs:
+        if h.get("attributes", {}).get("name", "").lower() == target:
+            return h.get("id")
+    return None
+
+
+async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str | None, str | None]:
+    """Resolve a project display name to its (project_id, resolved_name) tuple.
+
+    Performs a case-insensitive *substring* match so that partial names still
+    resolve correctly (e.g. "Grasbaan" matches "Grasbaan - Fase 2").
+    Returns (None, None) when no project matches.
+    """
+    projects = await asyncio.to_thread(get_projects, hub_id)
+    target = project_name.lower().strip()
+    for p in projects:
+        p_name = p.get("attributes", {}).get("name", "")
+        if target in p_name.lower():
+            return p.get("id"), p_name
+    return None, None
 
 
 @mcp.tool()
@@ -304,16 +339,8 @@ async def create_project(hub_id_or_name: str, name: str, project_type: str = "AC
         real_hub_id = hub_id_or_name
 
         if not real_hub_id.startswith("b."):
-            hubs = await asyncio.to_thread(get_hubs)
-            found = None
-            for h in hubs:
-                h_name = h.get("attributes", {}).get("name", "")
-                if h_name.lower() == hub_id_or_name.lower():
-                    found = h.get("id")
-                    break
-            if found:
-                real_hub_id = found
-            else:
+            real_hub_id = await _resolve_hub_id(hub_id_or_name)
+            if not real_hub_id:
                 return f"Could not find a hub named '{hub_id_or_name}'. Run list_hubs to see valid names."
 
         result = await asyncio.to_thread(create_acc_project, real_hub_id, name, project_type)
@@ -430,30 +457,12 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
     """
     try:
         # Resolve hub name → hub_id
-        hubs = await asyncio.to_thread(get_hubs)
-        hub_target = hub_name.lower().strip()
-        hub_id = None
-        for h in hubs:
-            if h.get("attributes", {}).get("name", "").lower() == hub_target:
-                hub_id = h.get("id")
-                break
+        hub_id = await _resolve_hub_id(hub_name)
         if not hub_id:
-            return (
-                f"Hub '{hub_name}' not found. "
-                f"Run list_hubs to see valid names."
-            )
+            return f"Hub '{hub_name}' not found. Run list_hubs to see valid names."
 
         # Resolve project name → project_id
-        projects = await asyncio.to_thread(get_projects, hub_id)
-        proj_target = project_name.lower().strip()
-        project_id = None
-        resolved_name = None
-        for p in projects:
-            p_name = p.get("attributes", {}).get("name", "")
-            if proj_target in p_name.lower():
-                project_id = p.get("id")
-                resolved_name = p_name
-                break
+        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
         if not project_id:
             return (
                 f"Project '{project_name}' not found in hub '{hub_name}'. "
@@ -554,18 +563,9 @@ async def find_user_projects(hub_name: str, user_name: str) -> str:
     """
     try:
         # Resolve hub name → raw account_id (strip 'b.' prefix)
-        hubs = await asyncio.to_thread(get_hubs)
-        hub_target = hub_name.lower().strip()
-        hub_id = None
-        for h in hubs:
-            if h.get("attributes", {}).get("name", "").lower() == hub_target:
-                hub_id = h.get("id")
-                break
+        hub_id = await _resolve_hub_id(hub_name)
         if not hub_id:
-            return (
-                f"Hub '{hub_name}' not found. "
-                f"Run list_hubs to see valid names."
-            )
+            return f"Hub '{hub_name}' not found. Run list_hubs to see valid names."
 
         account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
 
@@ -609,21 +609,11 @@ async def apply_folder_template(hub_id: str, source_project_name: str, dest_proj
         dest_project_name:    Name of the target project to copy TO.
     """
     try:
-        projects = await asyncio.to_thread(get_projects, hub_id)
-
-        def _resolve(name: str) -> tuple:
-            target = name.lower().strip()
-            for p in projects:
-                p_name = p.get("attributes", {}).get("name", "")
-                if p_name.lower() == target:
-                    return p.get("id"), p_name
-            return None, None
-
-        src_id, src_name = _resolve(source_project_name)
+        src_id, src_name = await _resolve_project_id(hub_id, source_project_name)
         if not src_id:
             return f"Source project '{source_project_name}' not found. Run list_projects to see valid names."
 
-        dst_id, dst_name = _resolve(dest_project_name)
+        dst_id, dst_name = await _resolve_project_id(hub_id, dest_project_name)
         if not dst_id:
             return f"Destination project '{dest_project_name}' not found. Run list_projects to see valid names."
 
@@ -646,15 +636,7 @@ async def delete_folder(hub_id: str, project_name: str, folder_name: str) -> str
         folder_name:   The name of the folder to delete (e.g. '01_WIP').
     """
     try:
-        projects = await asyncio.to_thread(get_projects, hub_id)
-        target = project_name.lower().strip()
-        found_id = None
-        for p in projects:
-            p_name = p.get("attributes", {}).get("name", "")
-            if p_name.lower() == target:
-                found_id = p.get("id")
-                break
-
+        found_id, _ = await _resolve_project_id(hub_id, project_name)
         if not found_id:
             return f"Could not find a project named '{project_name}'. Run list_projects to see valid names."
 
