@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import logging
 import pathlib
+from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
 from auth import get_token
@@ -934,7 +935,15 @@ if __name__ == "__main__":
     nav_asgi = nav_mcp.http_app(path="/", transport="streamable-http")
     bim_asgi = bim_mcp.http_app(path="/", transport="streamable-http")
 
+    @asynccontextmanager
+    async def master_lifespan(app):
+        async with admin_asgi.lifespan(app):
+            async with nav_asgi.lifespan(app):
+                async with bim_asgi.lifespan(app):
+                    yield
+
     master_app = Starlette(
+        lifespan=master_lifespan,
         routes=[
             Mount("/mcp/admin", app=admin_asgi),
             Mount("/mcp/nav", app=nav_asgi),
