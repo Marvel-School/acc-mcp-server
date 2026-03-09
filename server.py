@@ -33,7 +33,9 @@ from api import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("Autodesk ACC Agent")
+admin_mcp = FastMCP("ACC_Admin")
+nav_mcp = FastMCP("ACC_Navigator")
+bim_mcp = FastMCP("ACC_BIM")
 PORT = int(os.environ.get("PORT", 8000))
 
 _HIGHLIGHT_STATE: dict[str, dict] = {}
@@ -97,7 +99,7 @@ async def _resolve_folder_id(hub_id: str, project_id: str, folder_name: str) -> 
     return None
 
 
-@mcp.tool()
+@nav_mcp.tool()
 async def find_project(name_query: str) -> str:
     """
     Search for an ACC/BIM 360 project by name across ALL accessible hubs.
@@ -128,7 +130,7 @@ async def find_project(name_query: str) -> str:
         return f"Error searching for project: {e}"
 
 
-@mcp.tool()
+@nav_mcp.tool()
 async def list_hubs() -> str:
     """
     Lists all Autodesk Hubs (BIM 360 / ACC) accessible to the service account.
@@ -149,7 +151,7 @@ async def list_hubs() -> str:
         return f"Failed to list hubs: {e}"
 
 
-@mcp.tool()
+@nav_mcp.tool()
 async def list_projects(hub_name: str, fields: str = "") -> str:
     """
     Lists all projects in a hub.
@@ -189,7 +191,7 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
 
 
 
-@mcp.tool()
+@nav_mcp.tool()
 async def list_top_folders(hub_name: str, project_name: str) -> str:
     """
     Lists top-level folders in a project (e.g. 'Project Files', 'Plans').
@@ -224,7 +226,7 @@ async def list_top_folders(hub_name: str, project_name: str) -> str:
         return f"Failed to list folders: {e}"
 
 
-@mcp.tool()
+@nav_mcp.tool()
 async def list_folder_contents(hub_name: str, project_name: str, folder_name: str = "Project Files") -> str:
     """
     Lists files and subfolders inside a top-level folder.
@@ -266,7 +268,7 @@ async def list_folder_contents(hub_name: str, project_name: str, folder_name: st
         return f"Failed to list folder contents: {e}"
 
 
-@mcp.tool()
+@bim_mcp.tool()
 async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
     """
     Inspect a file's translation/processing status in the Model Derivative service.
@@ -294,7 +296,7 @@ async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
 
 
 
-@mcp.tool()
+@bim_mcp.tool()
 async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> str:
     """
     Trigger a fresh Model Derivative translation job for a file.
@@ -346,7 +348,7 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
         return f"Error triggering reprocess: {e}"
 
 
-@mcp.tool()
+@bim_mcp.tool()
 async def count_elements(hub_name: str, project_name: str, file_name: str, category_name: str) -> str:
     """
     Count elements in a Revit/IFC model that match a category name.
@@ -388,7 +390,7 @@ async def count_elements(hub_name: str, project_name: str, file_name: str, categ
 
 
 
-@mcp.tool()
+@admin_mcp.tool()
 async def create_project(hub_id_or_name: str, name: str, project_type: str = "ACC") -> str:
     """
     Creates a new project in the specified Hub.
@@ -421,7 +423,7 @@ async def create_project(hub_id_or_name: str, name: str, project_type: str = "AC
         return f"Failed to create project: {e}"
 
 
-@mcp.tool()
+@admin_mcp.tool()
 async def list_project_users(hub_name: str, project_name: str) -> str:
     """
     Lists users assigned to a project (requires Admin permissions).
@@ -457,7 +459,7 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
         return f"Failed to list project users: {e}"
 
 
-@mcp.tool()
+@admin_mcp.tool()
 async def add_user(hub_name: str, project_name: str, email: str) -> str:
     """
     Adds a user to a project by email.
@@ -483,7 +485,7 @@ async def add_user(hub_name: str, project_name: str, email: str) -> str:
         return f"Failed to add user: {e}"
 
 
-@mcp.tool()
+@admin_mcp.tool()
 async def audit_hub_users(hub_name: str) -> str:
     """
     Scans the entire hub to list all users and the products they are assigned
@@ -525,7 +527,7 @@ async def audit_hub_users(hub_name: str) -> str:
         return f"Failed to audit hub users: {e}"
 
 
-@mcp.tool()
+@admin_mcp.tool()
 async def check_project_permissions(hub_name: str, project_name: str) -> str:
     """
     Audit the real-time permissions, roles, and company affiliations for every
@@ -634,7 +636,7 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
         return f"Failed to fetch permissions: {e}"
 
 
-@mcp.tool()
+@admin_mcp.tool()
 async def find_user_projects(hub_name: str, user_name: str) -> str:
     """
     Lists every ACC project a specific user has access to within a hub.
@@ -688,7 +690,7 @@ async def find_user_projects(hub_name: str, user_name: str) -> str:
         return f"Failed to fetch user projects: {e}"
 
 
-@mcp.tool()
+@admin_mcp.tool()
 async def apply_folder_template(hub_name: str, source_project_name: str, dest_project_name: str) -> str:
     """
     Copies the folder structure from a Source Project to a Destination Project.
@@ -719,7 +721,7 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
         return f"Failed to replicate folder structure: {e}"
 
 
-@mcp.tool()
+@admin_mcp.tool()
 async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> str:
     """
     Deletes (hides) a specific top-level folder within a project.
@@ -770,7 +772,7 @@ _CSP_HEADER = (
 )
 
 
-@mcp.resource(
+@bim_mcp.resource(
     VIEWER_URI,
     mime_type="text/html;profile=mcp-app",
     meta={
@@ -784,7 +786,7 @@ def viewer_resource() -> str:
     return _VIEWER_HTML_CONTENT
 
 
-@mcp.tool()
+@bim_mcp.tool()
 async def preview_model(urn: str) -> ToolResult:
     """
     Opens a 3D preview of a translated model in the Autodesk Viewer.
@@ -815,7 +817,7 @@ async def preview_model(urn: str) -> ToolResult:
         return ToolResult(content=f"Failed to preview model: {e}")
 
 
-@mcp.tool()
+@bim_mcp.tool()
 async def highlight_elements(urn: str, ids: list[int], color: str = "red") -> str:
     """
     Highlight specific elements in the 3D viewer by coloring them.
@@ -837,7 +839,7 @@ async def highlight_elements(urn: str, ids: list[int], color: str = "red") -> st
     return f"Highlighted {len(ids)} element(s) in {color}."
 
 
-@mcp.resource("highlight://{urn}")
+@bim_mcp.resource("highlight://{urn}")
 async def get_highlights(urn: str) -> str:
     """Returns the current highlight state for a model URN."""
     return json.dumps(_HIGHLIGHT_STATE.get(urn, {"ids": [], "color": []}))
@@ -860,7 +862,7 @@ _CSP_META = {
 
 def _inject_meta_via_handler() -> None:
     """Inject UI _meta into preview_model on tools/list responses."""
-    low_level = mcp._mcp_server
+    low_level = bim_mcp._mcp_server
     original_handler = low_level.request_handlers.get(ListToolsRequest)
     if not original_handler:
         logger.warning("list_tools handler not found — _meta injection skipped")
@@ -880,7 +882,7 @@ def _inject_meta_via_handler() -> None:
 
 def _inject_ui_extension_capability() -> None:
     """Advertise io.modelcontextprotocol/ui in the initialize handshake."""
-    low_level = mcp._mcp_server
+    low_level = bim_mcp._mcp_server
     _orig_get_caps = low_level.get_capabilities  # bound method
 
     def _patched_get_caps(notification_options, experimental_capabilities):
@@ -898,7 +900,7 @@ def _inject_ui_extension_capability() -> None:
 
 def _inject_csp_into_resource() -> None:
     """Inject CSP _meta into the viewer resource on read."""
-    low_level = mcp._mcp_server
+    low_level = bim_mcp._mcp_server
     original_handler = low_level.request_handlers.get(ReadResourceRequest)
     if not original_handler:
         logger.warning("read_resource handler not found — CSP injection skipped")
@@ -922,14 +924,34 @@ _inject_csp_into_resource()
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting MCP Server on port {PORT}...")
     import uvicorn
-    from typing import cast, Any
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.routing import Mount
 
-    app = getattr(mcp, "http_app", None)
-    if callable(app):
-        app = app()
-    elif app is None:
-        app = getattr(mcp, "_fastapi_app", mcp)
+    admin_asgi = admin_mcp.http_app(path="/", transport="streamable-http")
+    nav_asgi = nav_mcp.http_app(path="/", transport="streamable-http")
+    bim_asgi = bim_mcp.http_app(path="/", transport="streamable-http")
 
-    uvicorn.run(cast(Any, app), host="0.0.0.0", port=PORT)
+    master_app = Starlette(
+        routes=[
+            Mount("/mcp/admin", app=admin_asgi),
+            Mount("/mcp/nav", app=nav_asgi),
+            Mount("/mcp/bim", app=bim_asgi),
+        ],
+        middleware=[
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+        ],
+    )
+
+    logger.info(f"Starting multi-endpoint MCP server on port {PORT}...")
+    logger.info(f"  Admin:     http://0.0.0.0:{PORT}/mcp/admin")
+    logger.info(f"  Navigator: http://0.0.0.0:{PORT}/mcp/nav")
+    logger.info(f"  BIM:       http://0.0.0.0:{PORT}/mcp/bim")
+    uvicorn.run(master_app, host="0.0.0.0", port=PORT)
