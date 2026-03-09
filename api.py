@@ -146,17 +146,28 @@ def get_user_id_by_email(account_id: str, email: str) -> str:
 
 
 
-_hub_cache: Dict[str, Optional[str]] = {"id": None}
+# TTL-based hub ID cache — expires after 5 minutes so it never gets permanently
+# stuck on None (e.g. after a transient 503 on the first call).
+_cached_hub_id: Optional[str] = None
+_hub_cache_time: float = 0.0
+_HUB_CACHE_TTL: float = 300.0  # seconds
 
 
 def _get_hub_id() -> Optional[str]:
-    """Returns the first accessible hub ID (cached after first call)."""
-    if _hub_cache["id"]:
-        return _hub_cache["id"]
+    """Returns the first accessible hub ID with a 5-minute TTL cache.
+
+    Re-fetches from the API when the cache is empty, expired, or was
+    populated with None on a previous failed call.
+    """
+    global _cached_hub_id, _hub_cache_time
+    now = time.monotonic()
+    if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
+        return _cached_hub_id
     hubs = get_hubs()
     if hubs:
-        _hub_cache["id"] = hubs[0].get("id")
-    return _hub_cache["id"]
+        _cached_hub_id = hubs[0].get("id")
+        _hub_cache_time = now
+    return _cached_hub_id
 
 
 def get_hubs() -> list:
@@ -612,18 +623,45 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     return resp.json()
 
 
-def get_project_users(hub_id: str, project_id: str) -> list:
-    """List users in a project (requires Admin). Paginates up to 5 pages."""
+def get_project_users(project_id: str) -> list:
+    """List users in a project (requires Admin). Paginates up to 10 pages
+    (100 users/page = 1 000 users max), matching get_project_user_permissions.
+
+    Names are sanitized — ACC sometimes appends autodeskId directly onto the
+    name field (e.g. "Maxine Bruil0c1e0b3b-..."). Both standard UUID and
+    non-standard hex-run suffixes are stripped before the data is returned.
+    """
     clean_project_id = _strip_b_prefix(project_id)
-    endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
+    endpoint = (
+        f"https://developer.api.autodesk.com/construction/admin/v1"
+        f"/projects/{clean_project_id}/users?limit=100"
+    )
 
     all_users: list = []
     url: Optional[str] = endpoint
 
-    for _ in range(5):  # safety cap
+    for _ in range(10):  # safety cap — 10 pages × 100 = 1 000 users max
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
-        all_users.extend(data.get("results", []))
+
+        for raw in data.get("results", []):
+            _first = (raw.get("firstName") or "").strip()
+            _last = (raw.get("lastName") or "").strip()
+            _raw_name = (
+                f"{_first} {_last}".strip()
+                if (_first or _last)
+                else (raw.get("name") or "").strip()
+            )
+            # Strip standard 36-char UUIDs (8-4-4-4-12)
+            clean_name = re.sub(
+                r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
+                "",
+                _raw_name,
+            )
+            # Strip any remaining long hex-only run at end of string
+            clean_name = re.sub(r"[a-fA-F0-9]{10,}$", "", clean_name).strip() or "-"
+            raw["name"] = clean_name
+            all_users.append(raw)
 
         next_url = data.get("pagination", {}).get("nextUrl")
         if next_url:
@@ -674,11 +712,33 @@ def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
             roles_raw = raw.get("roles") or []
             access_levels = raw.get("accessLevels") or []
 
+            # Build a clean display name.
+            # ACC sometimes appends autodeskId directly onto the name field
+            # (e.g. "Maxine Bruil0c1e0b3b-..."). Prefer the separate
+            # firstName/lastName fields; fall back to name; strip any
+            # embedded hex-ID substring from whatever we end up with.
+            _first = (raw.get("firstName") or "").strip()
+            _last = (raw.get("lastName") or "").strip()
+            _raw_name = (
+                f"{_first} {_last}".strip()
+                if (_first or _last)
+                else (raw.get("name") or "").strip()
+            )
+            # Pass 1 — strip standard 36-char UUIDs (8-4-4-4-12 with dashes)
+            display_name = re.sub(
+                r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
+                "",
+                _raw_name,
+            )
+            # Pass 2 — strip any remaining long hex-only run at end of string
+            # (catches non-standard IDs like "0c1e0b3b6b3a4" with no dashes)
+            display_name = re.sub(r"[a-fA-F0-9]{10,}$", "", display_name).strip() or "-"
+
             all_users.append({
-                "name": raw.get("name", ""),
+                "name": display_name,
                 "email": (raw.get("email") or "").lower(),
                 "companyId": company.get("id", ""),
-                "companyName": company.get("name", ""),
+                "companyName": company.get("name", "") or "-",
                 "roleIds": [r.get("id", "") for r in roles_raw],
                 "roleNames": [r.get("name", "") for r in roles_raw],
                 "products": [
@@ -727,27 +787,32 @@ def add_project_user(hub_id: str, project_id: str, email: str, products: Optiona
     return resp.json()
 
 
-def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
+def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
     """Aggregate users and their product entitlements across all projects in a hub.
 
     Scans up to *max_projects* projects, collects every user encountered, and
     merges their product assignments into a single record per email.
 
     Returns:
-        List of dicts: [{"email": ..., "name": ..., "products": ["Build", ...]}]
+        Tuple of (users, skipped_projects) where:
+          - users: List of dicts [{"email", "name", "products": [...]}]
+          - skipped_projects: List of project names that failed (permission errors etc.)
     """
     projects = get_projects(hub_id)[:max_projects]
     logger.info(f"[Hub Audit] Scanning {len(projects)} projects in hub {hub_id}")
 
     user_map: Dict[str, Dict[str, Any]] = {}
 
+    skipped_projects: List[str] = []
+
     for p in projects:
         pid = p.get("id", "")
         p_name = p.get("attributes", {}).get("name", "Unknown")
         try:
-            members = get_project_users(hub_id, pid)
+            members = get_project_users(pid)
         except Exception as e:
             logger.warning(f"  Skipping project '{p_name}': {e}")
+            skipped_projects.append(p_name)
             continue
 
         for member in members:
@@ -773,7 +838,146 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> list:
         result.append(entry)
 
     logger.info(f"[Hub Audit] Found {len(result)} unique users across {len(projects)} projects")
-    return sorted(result, key=lambda u: u["email"])
+    return sorted(result, key=lambda u: u["email"]), skipped_projects
+
+
+def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
+    """
+    Resolves a user by display name or email and returns every project they
+    have access to within the account.
+
+    NEVER cached — every call executes live HTTP requests so that permission
+    changes made in ACC are reflected immediately.
+
+    Step 1 — User resolution (two strategies, no caching):
+      Email  → GET /hq/v1/regions/eu/accounts/{id}/users/search?email={email}
+      Name   → GET /hq/v1/regions/eu/accounts/{id}/users (paginated, local filter)
+
+    Step 2 — Project fetch (unified ACC endpoint, supports ACC + BIM 360):
+      GET /construction/admin/v1/accounts/{id}/users/{id}/projects?limit=100
+      Header: Region: EMEA  (replaces the legacy /regions/eu/ URL path segment)
+
+    Args:
+        account_id:          Raw ACC account ID (no 'b.' prefix).
+        user_name_or_email:  Display name substring (case-insensitive) or exact email.
+
+    Returns:
+        {
+            "user_name":  str,
+            "user_email": str,
+            "projects":   [{"name": str, "role": str}],
+        }
+
+    Raises:
+        ValueError: If no matching user is found or an API call fails.
+    """
+    # Strip 'b.' prefix — hq/v1 Account Admin endpoints require the raw UUID.
+    # Applied here so the function is self-defensive regardless of the caller.
+    clean_account_id = _strip_b_prefix(account_id)
+
+    query = user_name_or_email.strip()
+
+    # --- Step 1: Resolve user → uid ----------------------------------------
+    if "@" in query:
+        # Fast path: direct email search
+        search_url = (
+            f"https://developer.api.autodesk.com/hq/v1/regions/eu"
+            f"/accounts/{clean_account_id}/users/search?email={query.lower()}"
+        )
+        candidates: list = _make_request("GET", search_url).json()
+    else:
+        # Slow path: paginate through all account users, filter by name
+        candidates = []
+        target = query.lower()
+        limit = 100
+        offset = 0
+        for _ in range(20):  # safety cap: 2 000 users max
+            list_url = (
+                f"https://developer.api.autodesk.com/hq/v1/regions/eu"
+                f"/accounts/{clean_account_id}/users?limit={limit}&offset={offset}"
+            )
+            page: list = _make_request("GET", list_url).json()
+            for u in page:
+                full = (
+                    u.get("name")
+                    or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+                )
+                api_name = full.lower()
+                api_email = (u.get("email") or "").lower()
+                # Normalize search term: strip commas so "Last, First" matches
+                # "First Last", then require every token to appear in the name.
+                search_clean = target.replace(",", "").split()
+                name_match = bool(search_clean) and all(
+                    part in api_name for part in search_clean
+                )
+                email_match = target.replace(",", "").strip() in api_email
+                if name_match or email_match:
+                    candidates.append(u)
+            if len(page) < limit:
+                break
+            offset += limit
+
+    if not candidates:
+        raise ValueError(f"No ACC user found matching '{user_name_or_email}'")
+
+    match = candidates[0]
+    # Use 'id' — the internal hub User UUID required by the
+    # /users/{id}/projects endpoint.  The 'uid' / 'autodeskId' fields are the
+    # Autodesk-global identifier and will cause a 404 on that endpoint.
+    target_uid = match.get("id")
+    display_name = (
+        match.get("name")
+        or f"{match.get('first_name', '')} {match.get('last_name', '')}".strip()
+        or user_name_or_email
+    )
+    email = (match.get("email") or "").lower()
+
+    if not target_uid:
+        raise ValueError(
+            f"Resolved user '{display_name}' but could not determine their internal hub UUID"
+        )
+
+    logger.info(f"[UserProjects] Resolved '{display_name}' → id={target_uid}")
+
+    # --- Step 2: Fetch projects assigned to this user -----------------------
+    # Unified ACC construction/admin/v1 endpoint — supports both ACC and BIM 360.
+    # Region is passed as a header instead of being embedded in the URL path.
+    proj_url = (
+        f"https://developer.api.autodesk.com/construction/admin/v1"
+        f"/accounts/{clean_account_id}/users/{target_uid}/projects?limit=100"
+    )
+    try:
+        raw = _make_request(
+            "GET",
+            proj_url,
+            extra_headers={"Region": "EMEA"},
+        ).json()
+        # Unified endpoint returns projects inside a 'results' array.
+        raw_projects = raw.get("results", [])
+
+        projects = []
+        for p in raw_projects:
+            role = (
+                "Project Admin"
+                if p.get("access_level") == "project_admin"
+                else "Member"
+            )
+            projects.append({"name": p.get("name", "—"), "role": role})
+
+        logger.info(
+            f"[UserProjects] Found {len(projects)} projects for '{display_name}' (live, uncached)"
+        )
+        return {"user_name": display_name, "user_email": email, "projects": projects}
+
+    except ValueError as api_err:
+        logger.warning(
+            f"[UserProjects] Could not fetch projects for id={target_uid}: {api_err}"
+        )
+        return (
+            f"User found (ID: {target_uid}), but Autodesk returned an error when "
+            f"fetching their projects. They may not have any assigned projects, "
+            f"or API access is restricted."
+        )
 
 
 def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> dict:
