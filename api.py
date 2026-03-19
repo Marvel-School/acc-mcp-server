@@ -23,6 +23,15 @@ from auth import get_token
 logger = logging.getLogger(__name__)
 
 
+class ResultList(list):
+    """List subclass that can carry an optional truncation warning.
+
+    Functions with hard pagination caps set ``truncation_warning`` when the
+    cap is hit so the LLM knows results may be incomplete.
+    """
+    truncation_warning: str = ""
+
+
 
 def _strip_b_prefix(id_str: str) -> str:
     """Safely removes the 'b.' prefix from Hub/Project IDs."""
@@ -140,20 +149,31 @@ _hub_cache_time: float = 0.0
 _HUB_CACHE_TTL: float = 300.0  # seconds
 
 
-def _get_hub_id() -> Optional[str]:
+def _get_hub_id() -> str:
     """Returns the first accessible hub ID with a 5-minute TTL cache.
 
     Re-fetches from the API when the cache is empty, expired, or was
-    populated with None on a previous failed call.
+    populated with None on a previous failed call.  Failures are never
+    cached so the next call will retry immediately.
     """
     global _cached_hub_id, _hub_cache_time
     now = time.monotonic()
     if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
         return _cached_hub_id
     hubs = get_hubs()
-    if hubs:
-        _cached_hub_id = hubs[0].get("id")
-        _hub_cache_time = now
+    if not hubs:
+        raise ValueError(
+            "Could not resolve hub ID \u2014 Autodesk API returned no hubs. "
+            "Check APS credentials and account access."
+        )
+    hub_id = hubs[0].get("id")
+    if not hub_id:
+        raise ValueError(
+            "Could not resolve hub ID \u2014 Autodesk API returned no hubs. "
+            "Check APS credentials and account access."
+        )
+    _cached_hub_id = hub_id
+    _hub_cache_time = now
     return _cached_hub_id
 
 
@@ -176,9 +196,11 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
     if fields:
         base += f"&fields[projects]={','.join(fields)}"
     url: Optional[str] = base
-    all_projects: list = []
+    all_projects: ResultList = ResultList()
+    max_pages = 50
 
-    for _ in range(50):  # safety cap
+    _hit_cap = True
+    for _ in range(max_pages):  # safety cap
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
         all_projects.extend(data.get("data", []))
@@ -192,7 +214,15 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
             url = None
 
         if not url:
+            _hit_cap = False
             break
+
+    if _hit_cap:
+        all_projects.truncation_warning = (
+            f"⚠️ Results truncated: retrieved {len(all_projects)} projects across "
+            f"{max_pages} pages (safety limit). There may be more projects in this hub."
+        )
+        logger.warning(all_projects.truncation_warning)
 
     return all_projects
 
@@ -313,7 +343,7 @@ def find_design_files(
         raise ValueError("No folders found in project")
 
     queue = [{"id": root_id, "name": "Project Files", "depth": 0}]
-    matching = []
+    matching: ResultList = ResultList()
     ext_list = [e.strip().lower() for e in extensions.split(",")]
     max_folders = 50
     max_depth = 3
@@ -351,6 +381,15 @@ def find_design_files(
                 })
 
     logger.info(f"Search complete: {scanned} folders, {len(matching)} files")
+
+    if scanned >= max_folders and queue:
+        matching.truncation_warning = (
+            f"⚠️ Results truncated: only scanned {max_folders} of "
+            f"{max_folders + len(queue)} reachable folders (depth limit: {max_depth}). "
+            f"There may be more design files. Narrow your search to get complete results."
+        )
+        logger.warning(matching.truncation_warning)
+
     return matching
 
 
@@ -629,10 +668,12 @@ def get_project_users(project_id: str) -> list:
         f"/projects/{clean_project_id}/users?limit=100"
     )
 
-    all_users: list = []
+    all_users: ResultList = ResultList()
     url: Optional[str] = endpoint
+    max_pages = 10
 
-    for _ in range(10):  # safety cap — 10 pages × 100 = 1 000 users max
+    _hit_cap = True
+    for _ in range(max_pages):  # safety cap — 10 pages × 100 = 1 000 users max
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
 
@@ -659,7 +700,15 @@ def get_project_users(project_id: str) -> list:
         if next_url:
             url = next_url
         else:
+            _hit_cap = False
             break
+
+    if _hit_cap:
+        all_users.truncation_warning = (
+            f"⚠️ Results truncated: retrieved {len(all_users)} users across "
+            f"{max_pages} pages (safety limit). There may be more users in this project."
+        )
+        logger.warning(all_users.truncation_warning)
 
     return all_users
 
@@ -691,10 +740,12 @@ def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
         f"/projects/{clean_id}/users?limit=100"
     )
 
-    all_users: List[Dict[str, Any]] = []
+    all_users: ResultList = ResultList()
     url: Optional[str] = base_url
+    max_pages = 10
 
-    for _ in range(10):  # safety cap — 10 pages × 100 = 1 000 users max
+    _hit_cap = True
+    for _ in range(max_pages):  # safety cap — 10 pages × 100 = 1 000 users max
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
 
@@ -744,11 +795,20 @@ def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
         if next_url:
             url = next_url
         else:
+            _hit_cap = False
             break
 
     logger.info(
         f"[Permissions] Fetched {len(all_users)} users for project {clean_id} (live, uncached)"
     )
+
+    if _hit_cap:
+        all_users.truncation_warning = (
+            f"⚠️ Results truncated: retrieved {len(all_users)} users across "
+            f"{max_pages} pages (safety limit). There may be more users in this project."
+        )
+        logger.warning(all_users.truncation_warning)
+
     return all_users
 
 
@@ -788,12 +848,29 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
           - users: List of dicts [{"email", "name", "products": [...]}]
           - skipped_projects: List of project names that failed (permission errors etc.)
     """
-    projects = get_projects(hub_id)[:max_projects]
+    all_hub_projects = get_projects(hub_id)
+    truncated_projects = len(all_hub_projects) > max_projects
+    projects = all_hub_projects[:max_projects]
     logger.info(f"[Hub Audit] Scanning {len(projects)} projects in hub {hub_id}")
 
     user_map: Dict[str, Dict[str, Any]] = {}
 
     skipped_projects: List[str] = []
+    warnings: List[str] = []
+
+    # Propagate project-list truncation warning
+    _proj_warn = getattr(all_hub_projects, "truncation_warning", "")
+    if _proj_warn:
+        warnings.append(_proj_warn)
+
+    if truncated_projects:
+        w = (
+            f"⚠️ Results truncated: only scanned {max_projects} of "
+            f"{len(all_hub_projects)} projects in this hub. "
+            f"Some users may not be included."
+        )
+        logger.warning(w)
+        warnings.append(w)
 
     for p in projects:
         pid = p.get("id", "")
@@ -822,13 +899,17 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
                 if key:
                     user_map[email]["products"].add(key)
 
-    result = []
+    result: ResultList = ResultList()
     for entry in user_map.values():
         entry["products"] = sorted(entry["products"])
         result.append(entry)
+    result.sort(key=lambda u: u["email"])
+
+    if warnings:
+        result.truncation_warning = "\n".join(warnings)
 
     logger.info(f"[Hub Audit] Found {len(result)} unique users across {len(projects)} projects")
-    return sorted(result, key=lambda u: u["email"]), skipped_projects
+    return result, skipped_projects
 
 
 def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
@@ -868,6 +949,7 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
     query = user_name_or_email.strip()
 
     # --- Step 1: Resolve user → uid ----------------------------------------
+    _name_search_warning = ""
     if "@" in query:
         # Fast path: direct email search
         search_url = (
@@ -881,7 +963,9 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
         target = query.lower()
         limit = 100
         offset = 0
-        for _ in range(20):  # safety cap: 2 000 users max
+        max_pages = 20
+        _hit_name_cap = True
+        for _ in range(max_pages):  # safety cap: 2 000 users max
             list_url = (
                 f"https://developer.api.autodesk.com/hq/v1/regions/eu"
                 f"/accounts/{clean_account_id}/users?limit={limit}&offset={offset}"
@@ -904,8 +988,17 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
                 if name_match or email_match:
                     candidates.append(u)
             if len(page) < limit:
+                _hit_name_cap = False
                 break
             offset += limit
+
+        if _hit_name_cap:
+            _name_search_warning = (
+                f"⚠️ User search truncated: scanned {max_pages * limit:,} users "
+                f"({max_pages}-page safety limit). The matching user may exist beyond "
+                f"this range. Try searching by exact email instead."
+            )
+            logger.warning(_name_search_warning)
 
     if not candidates:
         raise ValueError(f"No ACC user found matching '{user_name_or_email}'")
@@ -957,7 +1050,10 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
         logger.info(
             f"[UserProjects] Found {len(projects)} projects for '{display_name}' (live, uncached)"
         )
-        return {"user_name": display_name, "user_email": email, "projects": projects}
+        result_dict: dict = {"user_name": display_name, "user_email": email, "projects": projects}
+        if _name_search_warning:
+            result_dict["warning"] = _name_search_warning
+        return result_dict
 
     except ValueError as api_err:
         logger.warning(

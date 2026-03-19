@@ -74,50 +74,106 @@ _COLOR_MAP: dict[str, list[float]] = {
 # Shared resolution helpers — DRY replacements for repeated inline loops.
 # ---------------------------------------------------------------------------
 
-async def _resolve_hub_id(hub_name: str) -> str | None:
+async def _resolve_hub_id(hub_name: str) -> str:
     """Resolve a hub display name to its Autodesk Hub ID.
 
     Performs a case-insensitive exact match against every hub accessible to
-    the service account.  Returns the hub ID string (e.g. 'b.xxxxxxxx-...')
-    on success, or None when no hub matches the given name.
+    the service account.  Returns the hub ID string (e.g. 'b.xxxxxxxx-...').
+
+    Raises:
+        ValueError: If zero or multiple hubs match the given name.
     """
     hubs = await asyncio.to_thread(get_hubs)
     target = hub_name.lower().strip()
-    for h in hubs:
-        if h.get("attributes", {}).get("name", "").lower() == target:
-            return h.get("id")
-    return None
+    matches = [
+        h for h in hubs
+        if h.get("attributes", {}).get("name", "").lower() == target
+    ]
+
+    if len(matches) == 1:
+        return matches[0].get("id")
+
+    all_names = [h.get("attributes", {}).get("name", "?") for h in hubs]
+    if not matches:
+        raise ValueError(
+            f"No hub found matching '{hub_name}'. "
+            f"Available hubs: {', '.join(all_names)}"
+        )
+    matched_names = [m.get("attributes", {}).get("name", "?") for m in matches]
+    raise ValueError(
+        f"Ambiguous hub name '{hub_name}' — found {len(matches)} matches: "
+        + ", ".join(matched_names)
+        + ". Please provide a more specific name."
+    )
 
 
-async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str | None, str | None]:
+async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str, str]:
     """Resolve a project display name to its (project_id, resolved_name) tuple.
 
     Performs a case-insensitive *substring* match so that partial names still
     resolve correctly (e.g. "Grasbaan" matches "Grasbaan - Fase 2").
-    Returns (None, None) when no project matches.
+
+    Raises:
+        ValueError: If zero or multiple projects match the given name.
     """
     projects = await asyncio.to_thread(get_projects, hub_id)
     target = project_name.lower().strip()
+    matches = []
     for p in projects:
         p_name = p.get("attributes", {}).get("name", "")
         if target in p_name.lower():
-            return p.get("id"), p_name
-    return None, None
+            matches.append((p.get("id"), p_name))
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if not matches:
+        all_names = [p.get("attributes", {}).get("name", "?") for p in projects[:30]]
+        suffix = f" (showing 30 of {len(projects)})" if len(projects) > 30 else ""
+        raise ValueError(
+            f"No project found matching '{project_name}'. "
+            f"Available projects{suffix}: {', '.join(all_names)}"
+        )
+    listing = "\n".join(f"  - {name} (id: {pid})" for pid, name in matches)
+    raise ValueError(
+        f"Ambiguous project name '{project_name}' — found {len(matches)} matches:\n"
+        + listing
+        + "\nPlease provide a more specific name."
+    )
 
 
-async def _resolve_folder_id(hub_id: str, project_id: str, folder_name: str) -> str | None:
+async def _resolve_folder_id(hub_id: str, project_id: str, folder_name: str) -> str:
     """Resolve a top-level folder display name to its folder ID.
 
     Performs a case-insensitive substring match against the project's top-level
-    folders.  Returns the folder ID on success, or None when not found.
+    folders.  Returns the folder ID on success.
+
+    Raises:
+        ValueError: If zero or multiple folders match the given name.
     """
     folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
     target = folder_name.lower().strip()
+    matches = []
     for f in folders:
         name = (f.get("name") or "").lower()
         if target in name or name in target:
-            return f.get("id")
-    return None
+            matches.append(f)
+
+    if len(matches) == 1:
+        return matches[0].get("id")
+
+    all_names = [f.get("name") or "?" for f in folders]
+    if not matches:
+        raise ValueError(
+            f"No folder found matching '{folder_name}'. "
+            f"Available folders: {', '.join(all_names)}"
+        )
+    matched_names = [f.get("name") or "?" for f in matches]
+    raise ValueError(
+        f"Ambiguous folder name '{folder_name}' — found {len(matches)} matches: "
+        + ", ".join(matched_names)
+        + ". Please provide a more specific name."
+    )
 
 
 @nav_mcp.tool()
@@ -186,8 +242,6 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
 
         field_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
         projects = await asyncio.to_thread(get_projects, hub_id, 50, field_list)
@@ -204,6 +258,10 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
                 val = attrs.get(key)
                 if val is not None:
                     report += f"    {key}: {val}\n"
+
+        _tw = getattr(projects, "truncation_warning", "")
+        if _tw:
+            report += f"\n{_tw}"
 
         return report
     except Exception as e:
@@ -224,12 +282,7 @@ async def list_top_folders(hub_name: str, project_name: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
-        if not project_id:
-            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
 
         folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
         if not folders:
@@ -260,16 +313,8 @@ async def list_folder_contents(hub_name: str, project_name: str, folder_name: st
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
-        if not project_id:
-            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
-
         folder_id = await _resolve_folder_id(hub_id, project_id, folder_name)
-        if not folder_id:
-            return f"Folder '{folder_name}' not found in project '{resolved_name}'. Use list_top_folders to see available folders."
 
         items = await asyncio.to_thread(get_folder_contents, project_id, folder_id)
         if not items:
@@ -303,12 +348,7 @@ async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         project_id, _ = await _resolve_project_id(hub_id, project_name)
-        if not project_id:
-            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
 
         return await asyncio.to_thread(inspect_generic_file, project_id, file_name)
     except Exception as e:
@@ -334,12 +374,7 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         project_id, _ = await _resolve_project_id(hub_id, project_name)
-        if not project_id:
-            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
 
         lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
         if not lineage_urn or not lineage_urn.startswith("urn:"):
@@ -386,12 +421,7 @@ async def count_elements(hub_name: str, project_name: str, file_name: str, categ
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         project_id, _ = await _resolve_project_id(hub_id, project_name)
-        if not project_id:
-            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
 
         lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
         if not lineage_urn or not lineage_urn.startswith("urn:"):
@@ -429,8 +459,6 @@ async def create_project(hub_id_or_name: str, name: str, project_type: str = "AC
 
         if not real_hub_id.startswith("b."):
             real_hub_id = await _resolve_hub_id(hub_id_or_name)
-            if not real_hub_id:
-                return f"Could not find a hub named '{hub_id_or_name}'. Run list_hubs to see valid names."
 
         result = await asyncio.to_thread(create_acc_project, real_hub_id, name, project_type)
         new_id = result.get("id") or result.get("projectId")
@@ -455,12 +483,7 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
-        if not project_id:
-            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
 
         users = await asyncio.to_thread(get_project_users, project_id)
         if not users:
@@ -474,6 +497,11 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
 
         if len(users) > 30:
             report += f"\n(Showing 30 of {len(users)} users)"
+
+        _tw = getattr(users, "truncation_warning", "")
+        if _tw:
+            report += f"\n{_tw}"
+
         return report
     except Exception as e:
         logger.error(f"list_project_users failed: {e}")
@@ -492,12 +520,7 @@ async def add_user(hub_name: str, project_name: str, email: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
-        if not project_id:
-            return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
 
         await asyncio.to_thread(add_project_user, project_id, email, ["docs"])
         return f"User '{email}' successfully added to project '{resolved_name}'."
@@ -517,8 +540,6 @@ async def audit_hub_users(hub_name: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
 
         users, skipped = await asyncio.to_thread(get_all_hub_users, hub_id)
         if not users and not skipped:
@@ -541,6 +562,10 @@ async def audit_hub_users(hub_name: str) -> str:
                 f"\n\n\u26a0\ufe0f NOTE: {len(skipped)} project(s) were skipped due to permission errors: "
                 + ", ".join(skipped)
             )
+
+        _tw = getattr(users, "truncation_warning", "")
+        if _tw:
+            report += f"\n\n{_tw}"
 
         return report
     except Exception as e:
@@ -565,18 +590,8 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
         project_name: Project name (exact or close match, case-insensitive).
     """
     try:
-        # Resolve hub name → hub_id
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Run list_hubs to see valid names."
-
-        # Resolve project name → project_id
         project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
-        if not project_id:
-            return (
-                f"Project '{project_name}' not found in hub '{hub_name}'. "
-                f"Run list_projects to see valid names."
-            )
 
         # Fetch live permissions — explicitly uncached
         users = await asyncio.to_thread(get_project_user_permissions, project_id)
@@ -650,6 +665,10 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
         lines += ["", "**Members:**"]
         lines += [_fmt_entry(e) for e in members] or ["* (none)"]
 
+        _tw = getattr(users, "truncation_warning", "")
+        if _tw:
+            lines += ["", _tw]
+
         return "\n".join(lines)
 
     except Exception as e:
@@ -671,11 +690,7 @@ async def find_user_projects(hub_name: str, user_name: str) -> str:
         user_name: User's full name (or part of it) or their email address.
     """
     try:
-        # Resolve hub name → raw account_id (strip 'b.' prefix)
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Run list_hubs to see valid names."
-
         account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
 
         # Fetch live user-project assignments — no caching
@@ -702,6 +717,10 @@ async def find_user_projects(hub_name: str, user_name: str) -> str:
         for p in projects:
             lines.append(f"* {p['name']} (Role: {p['role']})")
 
+        _tw = result.get("warning", "")
+        if _tw:
+            lines.append(f"\n{_tw}")
+
         return "\n".join(lines)
 
     except ValueError as ve:
@@ -724,16 +743,8 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         src_id, src_name = await _resolve_project_id(hub_id, source_project_name)
-        if not src_id:
-            return f"Source project '{source_project_name}' not found. Use list_projects to see valid names."
-
         dst_id, dst_name = await _resolve_project_id(hub_id, dest_project_name)
-        if not dst_id:
-            return f"Destination project '{dest_project_name}' not found. Use list_projects to see valid names."
 
         summary = await asyncio.to_thread(replicate_folders, hub_id, src_id, dst_id)
         return f"Template applied from '{src_name}' to '{dst_name}': {summary}"
@@ -755,12 +766,7 @@ async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> s
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        if not hub_id:
-            return f"Hub '{hub_name}' not found. Use list_hubs to see valid names."
-
         found_id, _ = await _resolve_project_id(hub_id, project_name)
-        if not found_id:
-            return f"Could not find a project named '{project_name}'. Use list_projects to see valid names."
 
         return await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
     except Exception as e:
@@ -939,9 +945,57 @@ def _inject_csp_into_resource() -> None:
     logger.info("Patch applied: CSP on viewer resource")
 
 
-_inject_meta_via_handler()
-_inject_ui_extension_capability()
-_inject_csp_into_resource()
+_viewer_patches_applied = 0
+
+# Patch 1/3: Inject _meta UI hints into the preview_model tool definition
+# so MCP clients know to render the tool result in an embedded viewer panel.
+# Without this patch: the viewer still works but clients won't auto-open the
+# viewer UI — users would need to manually open the structured content.
+try:
+    _inject_meta_via_handler()
+    _viewer_patches_applied += 1
+except Exception as e:
+    logger.warning(
+        "_inject_meta_via_handler failed — preview_model tool will not "
+        "carry _meta UI hints, so the viewer may not open automatically. "
+        "Error: %s", e,
+    )
+
+# Patch 2/3: Advertise the io.modelcontextprotocol/ui extension capability
+# in the MCP initialize handshake so clients know this server supports UI.
+# Without this patch: clients that gate UI features on this capability flag
+# will not offer the embedded viewer at all.
+try:
+    _inject_ui_extension_capability()
+    _viewer_patches_applied += 1
+except Exception as e:
+    logger.warning(
+        "_inject_ui_extension_capability failed — MCP UI capability will "
+        "not be advertised to clients. The viewer may not open "
+        "automatically. Error: %s", e,
+    )
+
+# Patch 3/3: Inject Content-Security-Policy _meta into the viewer HTML
+# resource so the browser allows loading the Autodesk Forge Viewer scripts.
+# Without this patch: the viewer HTML loads but the browser blocks external
+# scripts, resulting in a blank viewer panel.
+try:
+    _inject_csp_into_resource()
+    _viewer_patches_applied += 1
+except Exception as e:
+    logger.warning(
+        "_inject_csp_into_resource failed — viewer HTML resource will not "
+        "carry CSP _meta, so the Forge Viewer scripts may be blocked by "
+        "the browser. Error: %s", e,
+    )
+
+if _viewer_patches_applied == 3:
+    logger.info("Viewer UI patches applied successfully (3/3)")
+else:
+    logger.warning(
+        "Viewer UI patches: %d/3 applied — see warnings above",
+        _viewer_patches_applied,
+    )
 
 
 if __name__ == "__main__":
