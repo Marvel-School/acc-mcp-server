@@ -8,7 +8,7 @@ import pathlib
 from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
-from auth import get_token
+from auth import get_token, get_viewer_token
 from api import (
     find_project_globally,
     inspect_generic_file,
@@ -37,7 +37,27 @@ logger = logging.getLogger(__name__)
 admin_mcp = FastMCP("ACC_Admin")
 nav_mcp = FastMCP("ACC_Navigator")
 bim_mcp = FastMCP("ACC_BIM")
-PORT = int(os.environ.get("PORT", 8000))
+PORT = int(os.environ.get("WEBSITES_PORT") or os.environ.get("PORT") or 8000)
+
+MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip()
+if not MCP_API_KEY:
+    raise SystemExit(
+        "FATAL: MCP_API_KEY environment variable is required. "
+        "Set it to a long random string and pass the same value as the X-API-Key header in client requests."
+    )
+
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
+if _raw_origins == "*":
+    ALLOWED_ORIGINS: list[str] = ["*"]
+    logger.warning("ALLOWED_ORIGINS=* is insecure, do not use in production.")
+elif _raw_origins:
+    ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+else:
+    ALLOWED_ORIGINS = []
+    logger.warning(
+        "ALLOWED_ORIGINS not set — CORS is fully restricted. "
+        "Set this env var to allow MCP clients to connect."
+    )
 
 _HIGHLIGHT_STATE: dict[str, dict] = {}
 _COLOR_MAP: dict[str, list[float]] = {
@@ -479,7 +499,7 @@ async def add_user(hub_name: str, project_name: str, email: str) -> str:
         if not project_id:
             return f"Project '{project_name}' not found in hub '{hub_name}'. Use list_projects to see valid names."
 
-        await asyncio.to_thread(add_project_user, hub_id, project_id, email, ["docs"])
+        await asyncio.to_thread(add_project_user, project_id, email, ["docs"])
         return f"User '{email}' successfully added to project '{resolved_name}'."
     except Exception as e:
         logger.error(f"add_user failed: {e}")
@@ -798,7 +818,7 @@ async def preview_model(urn: str) -> ToolResult:
     """
     try:
         encoded_urn = safe_b64encode(urn) if urn.startswith("urn:") else urn
-        access_token = await asyncio.to_thread(get_token)
+        access_token = await asyncio.to_thread(get_viewer_token)
 
         structured = {
             "urn": encoded_urn,
@@ -929,7 +949,29 @@ if __name__ == "__main__":
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
+    from starlette.requests import Request
+    from starlette.responses import PlainTextResponse
     from starlette.routing import Mount
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
+    class APIKeyMiddleware:
+        """Rejects requests without a valid X-API-Key header.
+
+        GET /health is exempt so Azure health probes pass without credentials.
+        """
+
+        def __init__(self, app: ASGIApp) -> None:
+            self.app = app
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope["type"] == "http":
+                request = Request(scope)
+                if not (request.method == "GET" and request.url.path == "/health"):
+                    if request.headers.get("x-api-key") != MCP_API_KEY:
+                        response = PlainTextResponse("Unauthorized", status_code=401)
+                        await response(scope, receive, send)
+                        return
+            await self.app(scope, receive, send)
 
     admin_asgi = admin_mcp.http_app(path="/", transport="streamable-http")
     nav_asgi = nav_mcp.http_app(path="/", transport="streamable-http")
@@ -952,10 +994,11 @@ if __name__ == "__main__":
         middleware=[
             Middleware(
                 CORSMiddleware,
-                allow_origins=["*"],
+                allow_origins=ALLOWED_ORIGINS,
                 allow_methods=["*"],
                 allow_headers=["*"],
-            )
+            ),
+            Middleware(APIKeyMiddleware),
         ],
     )
 

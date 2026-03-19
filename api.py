@@ -124,25 +124,12 @@ def _make_request(
 
 
 
-def _get_admin_user_id(account_id: str) -> str:
-    """Fetches the Autodesk User ID for the Account Admin."""
-    admin_email = os.environ.get("ACC_ADMIN_EMAIL")
-    if not admin_email:
-        raise ValueError("ACC_ADMIN_EMAIL environment variable is required.")
-    return get_user_id_by_email(account_id, admin_email)
-
-
-def get_user_id_by_email(account_id: str, email: str) -> str:
-    """Fetches the internal Autodesk User ID for an email address."""
-    endpoint = f"https://developer.api.autodesk.com/hq/v1/regions/eu/accounts/{account_id}/users/search?email={email}"
-    resp = _make_request("GET", endpoint)
-    users = resp.json()
-    if not users:
-        raise ValueError(f"Could not find an Autodesk user with email: {email}")
-    user_id = users[0].get("id")
-    if not user_id:
-        raise ValueError(f"Autodesk returned a user for {email}, but the 'id' field is missing.")
-    return user_id
+def _get_admin_user_id() -> str:
+    """Returns the Autodesk User ID for the Account Admin from env."""
+    admin_id = os.environ.get("ACC_ADMIN_ID", "").strip()
+    if not admin_id:
+        raise ValueError("ACC_ADMIN_ID environment variable is required for admin operations")
+    return admin_id
 
 
 
@@ -608,13 +595,18 @@ def trigger_translation(version_urn: str) -> Dict[str, Any]:
 def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
     """Creates a project using the ACC Account Admin API."""
     account_id = _strip_b_prefix(hub_id)
-    user_id = _get_admin_user_id(account_id)
+    user_id = _get_admin_user_id()
 
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
     payload = {
         "name": project_name,
         "type": "Office",
         "platform": "acc" if project_type.upper() == "ACC" else "bim360",
+        "timezone": os.environ.get("DEFAULT_PROJECT_TIMEZONE", "Europe/Amsterdam"),
+        "addressLine1": os.environ.get("DEFAULT_PROJECT_ADDRESS_LINE1", ""),
+        "city": os.environ.get("DEFAULT_PROJECT_CITY", ""),
+        "country": os.environ.get("DEFAULT_PROJECT_COUNTRY", "NL"),
+        "postalCode": os.environ.get("DEFAULT_PROJECT_POSTAL_CODE", ""),
     }
 
     logger.info(f"POSTing to {endpoint} with User-Id: {user_id}")
@@ -760,23 +752,21 @@ def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
     return all_users
 
 
-def add_project_user(hub_id: str, project_id: str, email: str, products: Optional[list] = None) -> dict:
+def add_project_user(project_id: str, email: str, products: Optional[list] = None) -> dict:
     """
     Add a user to a project.
 
     Args:
-        hub_id: The Hub ID (needed to resolve admin User-Id).
         project_id: The project ID.
         email: User's email address.
         products: Product keys (e.g. ["docs"]). Defaults to ["docs"].
     """
-    account_id = _strip_b_prefix(hub_id)
     clean_project_id = _strip_b_prefix(project_id)
 
     if products is None:
         products = ["docs"]
 
-    user_id = _get_admin_user_id(account_id)
+    user_id = _get_admin_user_id()
 
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
     payload = {
