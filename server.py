@@ -222,17 +222,34 @@ async def find_project(name_query: str) -> str:
         Project name, project_id, and hub_id on success; error message otherwise.
     """
     try:
-        result = await asyncio.to_thread(find_project_globally, name_query)
-        if result is None:
-            return f"Project '{name_query}' not found in any accessible hub. Please check the name and try again."
-        hub_id, project_id, project_name = result
-        return (
-            f"Found Project:\n"
-            f"  Name:       {project_name}\n"
-            f"  Project ID: {project_id}\n"
-            f"  Hub ID:     {hub_id}\n\n"
-            f"You can now use this project_id with other tools."
-        )
+        matches = await asyncio.to_thread(find_project_globally, name_query)
+
+        if not matches:
+            hubs = await asyncio.to_thread(get_hubs)
+            hub_names = [h.get("attributes", {}).get("name", "?") for h in hubs]
+            return (
+                f"No project found matching '{name_query}' in any accessible hub.\n"
+                f"Searched hubs: {', '.join(hub_names) if hub_names else '(none)'}"
+            )
+
+        if len(matches) == 1:
+            hub_id, hub_name, project_id, project_name = matches[0]
+            return (
+                f"Found Project:\n"
+                f"  Name:       {project_name}\n"
+                f"  Project ID: {project_id}\n"
+                f"  Hub:        {hub_name} ({hub_id})\n\n"
+                f"You can now use this project name with other tools."
+            )
+
+        # Multiple matches — list them all so the user can pick.
+        lines = [f"Found {len(matches)} projects matching '{name_query}':\n"]
+        for hub_id, hub_name, project_id, project_name in matches:
+            lines.append(
+                f"  - {project_name} (id: {project_id}) — hub: {hub_name}"
+            )
+        lines.append("\nPlease provide a more specific name to narrow down.")
+        return "\n".join(lines)
     except Exception as e:
         logger.error(f"find_project failed: {e}")
         return f"Error searching for project: {e}"
@@ -708,51 +725,85 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
 
 
 @admin_mcp.tool()
-async def find_user_projects(hub_name: str, user_name: str) -> str:
+async def find_user_projects(user_name: str) -> str:
     """
-    Lists every ACC project a specific user has access to within a hub.
+    Lists every ACC project a specific user has access to, across ALL hubs.
 
     Resolves the user by display name (substring, case-insensitive) or exact
     email address, then returns their project assignments in real-time.
     No results are cached — each call reflects the live state in ACC.
 
     Args:
-        hub_name:  Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         user_name: User's full name (or part of it) or their email address.
     """
     try:
-        hub_id = await _resolve_hub_id(hub_name)
-        account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
+        hubs = await asyncio.to_thread(get_hubs)
+        if not hubs:
+            return "No hubs found. Check your Autodesk account permissions."
 
-        # Fetch live user-project assignments — no caching
-        result = await asyncio.to_thread(get_user_projects, account_id, user_name)
+        lines: list[str] = []
+        total_projects = 0
+        display_name = None
+        email = None
+        hub_errors: list[str] = []
 
-        # api.py returns a plain string when the projects endpoint errors out
-        # (e.g. 404 after resolving to internal hub UUID).
-        if isinstance(result, str):
-            return result
+        for hub in hubs:
+            hub_id = hub.get("id")
+            hub_display = hub.get("attributes", {}).get("name", "Unknown")
+            if not hub_id:
+                continue
 
-        display_name = result["user_name"]
-        email = result["user_email"]
-        projects = result["projects"]
+            account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
 
-        header = f"**User**: {display_name} | **Hub**: {hub_name}"
+            try:
+                result = await asyncio.to_thread(get_user_projects, account_id, user_name)
+            except Exception as e:
+                logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, e)
+                hub_errors.append(hub_display)
+                continue
+
+            # api.py returns a plain string on endpoint errors (e.g. 404)
+            if isinstance(result, str):
+                logger.warning("find_user_projects: hub '%s' returned error: %s", hub_display, result)
+                hub_errors.append(hub_display)
+                continue
+
+            # Capture user identity from the first successful result
+            if display_name is None:
+                display_name = result["user_name"]
+                email = result["user_email"]
+
+            projects = result["projects"]
+            if not projects:
+                continue
+
+            total_projects += len(projects)
+            lines.append(f"\n**Hub: {hub_display}** ({len(projects)} projects)")
+            for p in projects:
+                lines.append(f"* {p['name']} (Role: {p['role']})")
+
+            _tw = result.get("warning", "")
+            if _tw:
+                lines.append(_tw)
+
+        if display_name is None:
+            return f"User '{user_name}' not found in any accessible hub."
+
+        header = f"**User**: {display_name}"
         if email:
             header += f"\n**Email**: {email}"
-        header += f"\n**Total projects**: {len(projects)}\n"
+        header += f"\n**Total projects across all hubs**: {total_projects}"
 
-        if not projects:
-            return header + "\nNo project assignments found (or insufficient admin permissions)."
+        if hub_errors:
+            header += (
+                f"\n\n\u26a0\ufe0f Could not search {len(hub_errors)} hub(s): "
+                + ", ".join(hub_errors)
+            )
 
-        lines = [header]
-        for p in projects:
-            lines.append(f"* {p['name']} (Role: {p['role']})")
+        if total_projects == 0:
+            return header + "\n\nNo project assignments found (or insufficient admin permissions)."
 
-        _tw = result.get("warning", "")
-        if _tw:
-            lines.append(f"\n{_tw}")
-
-        return "\n".join(lines)
+        return header + "\n" + "\n".join(lines)
 
     except ValueError as ve:
         return str(ve)
