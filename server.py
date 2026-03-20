@@ -77,133 +77,199 @@ _COLOR_MAP: dict[str, list[float]] = {
 async def _resolve_hub_id(hub_name: str) -> str:
     """Resolve a hub display name to its Autodesk Hub ID.
 
-    Performs a case-insensitive exact match against every hub accessible to
-    the service account.  Returns the hub ID string (e.g. 'b.xxxxxxxx-...').
+    Uses a two-phase match: exact first, then substring fallback.
+    Returns the hub ID string (e.g. 'b.xxxxxxxx-...').
 
     Raises:
         ValueError: If zero or multiple hubs match the given name.
     """
     hubs = await asyncio.to_thread(get_hubs)
     target = hub_name.lower().strip()
-    matches = [
-        h for h in hubs
-        if h.get("attributes", {}).get("name", "").lower() == target
-    ]
 
-    if len(matches) == 1:
-        return matches[0].get("id")
+    # Phase 1: exact match (case-insensitive)
+    exact = [
+        h for h in hubs
+        if h.get("attributes", {}).get("name", "").lower().strip() == target
+    ]
+    if len(exact) == 1:
+        return exact[0].get("id")
+    if len(exact) > 1:
+        names = [h.get("attributes", {}).get("name", "?") for h in exact]
+        raise ValueError(
+            f"Ambiguous hub name '{hub_name}' — found {len(exact)} exact matches: "
+            + ", ".join(names)
+            + ". Please provide a more specific name."
+        )
+
+    # Phase 2: substring match (only when zero exact matches)
+    substring = [
+        h for h in hubs
+        if target in h.get("attributes", {}).get("name", "").lower()
+    ]
+    if len(substring) == 1:
+        return substring[0].get("id")
 
     all_names = [h.get("attributes", {}).get("name", "?") for h in hubs]
-    if not matches:
+    if not substring:
         raise ValueError(
             f"No hub found matching '{hub_name}'. "
             f"Available hubs: {', '.join(all_names)}"
         )
-    matched_names = [m.get("attributes", {}).get("name", "?") for m in matches]
+    matched_names = [h.get("attributes", {}).get("name", "?") for h in substring]
     raise ValueError(
-        f"Ambiguous hub name '{hub_name}' — found {len(matches)} matches: "
+        f"Multiple hubs contain '{hub_name}': "
         + ", ".join(matched_names)
-        + ". Please provide a more specific name."
+        + ". Please use the exact hub name."
     )
 
 
 async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str, str, str]:
     """Resolve a project display name to (hub_id, project_id, resolved_name).
 
-    First searches within *hub_id*.  If nothing is found there, falls back to
-    a global search across all accessible hubs so that cross-hub projects are
-    discovered automatically.  The returned hub_id may differ from the input
-    when the project lives in a different hub.
+    Uses a two-phase match (exact then substring) within *hub_id* first.
+    If nothing is found there, falls back to a global search across all
+    accessible hubs with the same two-phase logic.  The returned hub_id may
+    differ from the input when the project lives in a different hub.
 
     Raises:
         ValueError: If zero or multiple projects match the given name.
     """
-    # --- 1. Search in the specified hub first ---
     projects = await asyncio.to_thread(get_projects, hub_id)
     target = project_name.lower().strip()
-    matches = []
+
+    # --- 1. Search in the specified hub (exact → substring) ---
+    exact = []
+    substring = []
     for p in projects:
         p_name = p.get("attributes", {}).get("name", "")
-        if target in p_name.lower():
-            matches.append((hub_id, p.get("id"), p_name))
+        p_lower = p_name.lower().strip()
+        if p_lower == target:
+            exact.append((hub_id, p.get("id"), p_name))
+        elif target in p_lower:
+            substring.append((hub_id, p.get("id"), p_name))
 
-    if len(matches) == 1:
-        return matches[0]
-
-    if len(matches) > 1:
-        listing = "\n".join(f"  - {name} (id: {pid})" for _, pid, name in matches)
+    # Exact matches take priority
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        listing = "\n".join(f"  - {name} (id: {pid})" for _, pid, name in exact)
         raise ValueError(
-            f"Ambiguous project name '{project_name}' — found {len(matches)} matches:\n"
+            f"Ambiguous project name '{project_name}' — found {len(exact)} exact matches:\n"
             + listing
-            + "\nPlease provide a more specific name."
+            + "\nPlease provide the project ID to disambiguate."
         )
 
-    # --- 2. Not found in specified hub — search all hubs ---
+    # Substring fallback (only when zero exact matches in this hub)
+    if len(substring) == 1:
+        return substring[0]
+    if len(substring) > 1:
+        listing = "\n".join(f"  - {name} (id: {pid})" for _, pid, name in substring)
+        raise ValueError(
+            f"Multiple projects contain '{project_name}':\n"
+            + listing
+            + "\nPlease use the exact project name."
+        )
+
+    # --- 2. Not found in specified hub — search all hubs (exact → substring) ---
     logger.info(
         "Project '%s' not found in hub %s — searching all hubs…",
         project_name, hub_id,
     )
     global_matches = await asyncio.to_thread(find_project_globally, project_name)
 
-    if len(global_matches) == 1:
-        g_hub_id, g_hub_name, g_proj_id, g_proj_name = global_matches[0]
+    # find_project_globally returns (exact_matches, substring_matches)
+    global_exact, global_sub = global_matches
+
+    if len(global_exact) == 1:
+        g_hub_id, g_hub_name, g_proj_id, g_proj_name = global_exact[0]
         logger.info(
-            "Found project '%s' in hub '%s' (cross-hub fallback)",
+            "Found project '%s' in hub '%s' (cross-hub exact match)",
             g_proj_name, g_hub_name,
         )
         return (g_hub_id, g_proj_id, g_proj_name)
-
-    if not global_matches:
-        all_names = [p.get("attributes", {}).get("name", "?") for p in projects[:30]]
-        suffix = f" (showing 30 of {len(projects)})" if len(projects) > 30 else ""
+    if len(global_exact) > 1:
+        listing = "\n".join(
+            f"  - {name} in hub '{hname}' (id: {pid})"
+            for _, hname, pid, name in global_exact
+        )
         raise ValueError(
-            f"No project found matching '{project_name}' in any hub. "
-            f"Projects in specified hub{suffix}: {', '.join(all_names)}"
+            f"Ambiguous project name '{project_name}' — found {len(global_exact)} "
+            f"exact matches across hubs:\n"
+            + listing
+            + "\nPlease provide a more specific name."
         )
 
-    listing = "\n".join(
-        f"  - {name} in hub '{hname}' (id: {pid})"
-        for _, hname, pid, name in global_matches
-    )
+    # Substring fallback across all hubs
+    if len(global_sub) == 1:
+        g_hub_id, g_hub_name, g_proj_id, g_proj_name = global_sub[0]
+        logger.info(
+            "Found project '%s' in hub '%s' (cross-hub substring match)",
+            g_proj_name, g_hub_name,
+        )
+        return (g_hub_id, g_proj_id, g_proj_name)
+    if len(global_sub) > 1:
+        listing = "\n".join(
+            f"  - {name} in hub '{hname}' (id: {pid})"
+            for _, hname, pid, name in global_sub
+        )
+        raise ValueError(
+            f"Multiple projects contain '{project_name}' across hubs:\n"
+            + listing
+            + "\nPlease use the exact project name."
+        )
+
+    # Nothing found anywhere
+    all_names = [p.get("attributes", {}).get("name", "?") for p in projects[:30]]
+    suffix = f" (showing 30 of {len(projects)})" if len(projects) > 30 else ""
     raise ValueError(
-        f"Ambiguous project name '{project_name}' — found {len(global_matches)} "
-        f"matches across hubs:\n"
-        + listing
-        + "\nPlease provide a more specific name."
+        f"No project found matching '{project_name}' in any hub. "
+        f"Projects in specified hub{suffix}: {', '.join(all_names)}"
     )
 
 
 async def _resolve_folder_id(hub_id: str, project_id: str, folder_name: str) -> str:
     """Resolve a top-level folder display name to its folder ID.
 
-    Performs a case-insensitive substring match against the project's top-level
-    folders.  Returns the folder ID on success.
+    Uses a two-phase match: exact first, then substring fallback.
+    Returns the folder ID on success.
 
     Raises:
         ValueError: If zero or multiple folders match the given name.
     """
     folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
     target = folder_name.lower().strip()
-    matches = []
-    for f in folders:
-        name = (f.get("name") or "").lower()
-        if target in name or name in target:
-            matches.append(f)
 
-    if len(matches) == 1:
-        return matches[0].get("id")
+    # Phase 1: exact match (case-insensitive)
+    exact = [f for f in folders if (f.get("name") or "").lower().strip() == target]
+    if len(exact) == 1:
+        return exact[0].get("id")
+    if len(exact) > 1:
+        names = [f.get("name") or "?" for f in exact]
+        raise ValueError(
+            f"Ambiguous folder name '{folder_name}' — found {len(exact)} exact matches: "
+            + ", ".join(names)
+            + ". Please provide the folder ID to disambiguate."
+        )
+
+    # Phase 2: substring match (bidirectional, only when zero exact matches)
+    substring = [
+        f for f in folders
+        if target in (f.get("name") or "").lower() or (f.get("name") or "").lower() in target
+    ]
+    if len(substring) == 1:
+        return substring[0].get("id")
 
     all_names = [f.get("name") or "?" for f in folders]
-    if not matches:
+    if not substring:
         raise ValueError(
             f"No folder found matching '{folder_name}'. "
             f"Available folders: {', '.join(all_names)}"
         )
-    matched_names = [f.get("name") or "?" for f in matches]
+    matched_names = [f.get("name") or "?" for f in substring]
     raise ValueError(
-        f"Ambiguous folder name '{folder_name}' — found {len(matches)} matches: "
+        f"Multiple folders contain '{folder_name}': "
         + ", ".join(matched_names)
-        + ". Please provide a more specific name."
+        + ". Please use the exact folder name."
     )
 
 
@@ -222,9 +288,13 @@ async def find_project(name_query: str) -> str:
         Project name, project_id, and hub_id on success; error message otherwise.
     """
     try:
-        matches = await asyncio.to_thread(find_project_globally, name_query)
+        exact, substring = await asyncio.to_thread(find_project_globally, name_query)
 
-        if not matches:
+        # Prefer exact matches; fall back to substring only when no exact match
+        effective = exact or substring
+        match_type = "exact" if exact else "substring"
+
+        if not effective:
             hubs = await asyncio.to_thread(get_hubs)
             hub_names = [h.get("attributes", {}).get("name", "?") for h in hubs]
             return (
@@ -232,10 +302,10 @@ async def find_project(name_query: str) -> str:
                 f"Searched hubs: {', '.join(hub_names) if hub_names else '(none)'}"
             )
 
-        if len(matches) == 1:
-            hub_id, hub_name, project_id, project_name = matches[0]
+        if len(effective) == 1:
+            hub_id, hub_name, project_id, project_name = effective[0]
             return (
-                f"Found Project:\n"
+                f"Found Project ({match_type} match):\n"
                 f"  Name:       {project_name}\n"
                 f"  Project ID: {project_id}\n"
                 f"  Hub:        {hub_name} ({hub_id})\n\n"
@@ -243,12 +313,12 @@ async def find_project(name_query: str) -> str:
             )
 
         # Multiple matches — list them all so the user can pick.
-        lines = [f"Found {len(matches)} projects matching '{name_query}':\n"]
-        for hub_id, hub_name, project_id, project_name in matches:
+        lines = [f"Found {len(effective)} projects matching '{name_query}' ({match_type}):\n"]
+        for hub_id, hub_name, project_id, project_name in effective:
             lines.append(
                 f"  - {project_name} (id: {project_id}) — hub: {hub_name}"
             )
-        lines.append("\nPlease provide a more specific name to narrow down.")
+        lines.append("\nPlease use the exact project name to narrow down.")
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"find_project failed: {e}")

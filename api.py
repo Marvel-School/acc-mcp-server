@@ -261,23 +261,27 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
     return all_projects
 
 
-def find_project_globally(name_query: str) -> list[tuple[str, str, str, str]]:
+_GlobalMatches = tuple[list[tuple[str, str, str, str]], list[tuple[str, str, str, str]]]
+
+
+def find_project_globally(name_query: str) -> _GlobalMatches:
     """
     Search for a project by name across ALL accessible hubs.
-    Case-insensitive substring match.
+    Uses two-phase matching: exact first, then substring.
 
     Returns:
-        List of (hub_id, hub_name, project_id, project_name) tuples for
-        every match found.  An empty list means no matches.
+        (exact_matches, substring_matches) — each a list of
+        (hub_id, hub_name, project_id, project_name) tuples.
     """
     logger.info(f"Searching globally for project: {name_query}")
     hubs = get_hubs()
     if not hubs:
         logger.error("No hubs found.")
-        return []
+        return ([], [])
 
     search_term = name_query.lower().strip()
-    matches: list[tuple[str, str, str, str]] = []
+    exact: list[tuple[str, str, str, str]] = []
+    substring: list[tuple[str, str, str, str]] = []
 
     for hub in hubs:
         hub_id = hub.get("id")
@@ -290,13 +294,18 @@ def find_project_globally(name_query: str) -> list[tuple[str, str, str, str]]:
 
         for p in projects:
             p_name = p.get("attributes", {}).get("name", "")
-            if search_term in p_name.lower():
-                logger.info(f"  Found: {p_name} in hub {hub_name}")
-                matches.append((hub_id, hub_name, p.get("id"), p_name))
+            p_lower = p_name.lower().strip()
+            entry = (hub_id, hub_name, p.get("id"), p_name)
+            if p_lower == search_term:
+                logger.info(f"  Exact match: {p_name} in hub {hub_name}")
+                exact.append(entry)
+            elif search_term in p_lower:
+                logger.info(f"  Substring match: {p_name} in hub {hub_name}")
+                substring.append(entry)
 
-    if not matches:
+    if not exact and not substring:
         logger.warning(f"Project '{name_query}' not found in any hub")
-    return matches
+    return (exact, substring)
 
 
 
