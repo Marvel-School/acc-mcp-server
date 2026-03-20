@@ -17,7 +17,7 @@ import base64
 import threading
 import requests
 from collections import deque
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from urllib.parse import quote
 
 from auth import get_token
@@ -37,6 +37,7 @@ _DEFAULT_TIMEOUT = 15
 _STREAM_TIMEOUT = 120
 _CHUNK_SIZE = 65536
 _BUFFER_OVERLAP = 512
+_PROJECT_CACHE_TTL = 300  # seconds
 
 
 class ResultList(list):
@@ -202,6 +203,10 @@ _hub_cache_time: float = 0.0
 _HUB_CACHE_TTL: float = 300.0  # seconds
 _hub_cache_lock = threading.Lock()
 
+# Project-list cache — keyed by hub_id, stores (project_list, cached_at).
+_project_cache: dict[str, tuple[ResultList, float]] = {}
+_project_cache_lock = threading.Lock()
+
 
 def _get_hub_id() -> str:
     """Returns the first accessible hub ID with a 5-minute TTL cache.
@@ -235,21 +240,45 @@ def _get_hub_id() -> str:
         return _cached_hub_id
 
 
-def get_hubs() -> list:
+def get_hubs() -> list[Dict[str, Any]]:
     """Fetches all accessible Hubs (BIM 360 / ACC)."""
     resp = _make_request("GET", "https://developer.api.autodesk.com/project/v1/hubs")
     return resp.json().get("data", [])
 
 
-def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) -> list:
+def get_projects(
+    hub_id: str,
+    limit: int = 50,
+    fields: Optional[list] = None,
+    cache_bust: bool = False,
+) -> ResultList:
     """List all projects in a hub (follows pagination automatically).
 
+    Results are cached for 5 minutes per hub to avoid redundant API calls
+    (e.g. when ``find_project_globally`` iterates over multiple hubs).
+    Pass ``cache_bust=True`` to force a fresh fetch (e.g. after creating
+    a project).
+
     Args:
-        hub_id: Hub ID (starts with 'b.').
-        limit:  Max projects per page (default 50, max 100 per Autodesk API).
-        fields: Optional list of extra fields to include (e.g. ["status", "projectValue"]).
+        hub_id:     Hub ID (starts with 'b.').
+        limit:      Max projects per page (default 50, max 100 per Autodesk API).
+        fields:     Optional list of extra fields to include (e.g. ["status", "projectValue"]).
+        cache_bust: If True, bypass the cache and fetch fresh data.
     """
     hub_id = ensure_b_prefix(hub_id)
+
+    # --- Check cache (only when no custom fields are requested) ---
+    use_cache = fields is None or fields == []
+    if use_cache and not cache_bust:
+        with _project_cache_lock:
+            cached = _project_cache.get(hub_id)
+            if cached is not None:
+                cached_list, cached_at = cached
+                if (time.monotonic() - cached_at) < _PROJECT_CACHE_TTL:
+                    logger.debug("Project cache hit for hub %s (%d projects)", hub_id, len(cached_list))
+                    return cached_list
+
+    # --- Fetch from API ---
     base = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects?page[limit]={limit}"
     if fields:
         base += f"&fields[projects]={','.join(fields)}"
@@ -280,6 +309,11 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
             f"{_MAX_PROJECT_PAGES} pages (safety limit). There may be more projects in this hub."
         )
         logger.warning(all_projects.truncation_warning)
+
+    # --- Store in cache (only default-field responses) ---
+    if use_cache:
+        with _project_cache_lock:
+            _project_cache[hub_id] = (all_projects, time.monotonic())
 
     return all_projects
 
@@ -332,7 +366,7 @@ def find_project_globally(name_query: str) -> _GlobalMatches:
 
 
 
-def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
+def get_top_folders(hub_id: str, project_id: str) -> list[Dict[str, Any]]:
     """Fetches top-level folders for a project."""
     hub_clean = ensure_b_prefix(hub_id)
     proj_clean = ensure_b_prefix(project_id)
@@ -358,7 +392,7 @@ def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
     return filtered
 
 
-def get_folder_contents(project_id: str, folder_id: str) -> List[Dict[str, Any]]:
+def get_folder_contents(project_id: str, folder_id: str) -> list[Dict[str, Any]]:
     """Fetches contents of a folder with tip-version URN extraction for files."""
     proj_clean = ensure_b_prefix(project_id)
     folder_encoded = encode_urn(folder_id)
@@ -408,7 +442,7 @@ def get_folder_contents(project_id: str, folder_id: str) -> List[Dict[str, Any]]
 
 def find_design_files(
     hub_id: str, project_id: str, extensions: str = "rvt"
-) -> List[Dict[str, Any]]:
+) -> ResultList:
     """
     BFS file search through 'Project Files' folder.
     Depth-limited to 3 levels, max 50 folders scanned.
@@ -495,8 +529,6 @@ def resolve_file_to_urn(project_id: str, identifier: str) -> str:
         logger.info(f"  Searching for filename: {identifier}")
 
         hub_id = _get_hub_id()
-        if not hub_id:
-            raise ValueError("Could not determine hub_id for file search")
 
         extensions = ["rvt", "dwg", "nwc", "rcp", "ifc", "nwd"]
         if "." in identifier:
@@ -686,7 +718,7 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     return count
 
 
-def trigger_translation(version_urn: str) -> Dict[str, Any]:
+def trigger_translation(version_urn: str) -> dict[str, Any]:
     """
     Triggers a fresh Model Derivative translation job (SVF Classic).
     Uses x-ads-force to overwrite existing partial derivatives.
@@ -717,8 +749,12 @@ def trigger_translation(version_urn: str) -> Dict[str, Any]:
 
 
 
-def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
-    """Creates a project using the ACC Account Admin API."""
+def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict[str, Any]:
+    """Creates a project using the ACC Account Admin API.
+
+    After a successful creation the project-list cache for this hub is
+    invalidated so subsequent ``get_projects`` calls see the new project.
+    """
     account_id = _strip_b_prefix(hub_id)
     user_id = _get_admin_user_id()
 
@@ -737,6 +773,10 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     logger.info(f"POSTing to {endpoint} with User-Id: {user_id}")
     resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
     logger.info("Project creation API responded successfully.")
+
+    # Invalidate the project-list cache so the new project appears immediately.
+    get_projects(hub_id, cache_bust=True)
+
     return resp.json()
 
 
@@ -834,7 +874,7 @@ def _paginate_project_users(
     return all_users
 
 
-def get_project_users(project_id: str, max_pages: int = _MAX_USER_PAGES) -> list:
+def get_project_users(project_id: str, max_pages: int = _MAX_USER_PAGES) -> ResultList:
     """List users in a project (requires Admin).
 
     Thin wrapper around _paginate_project_users — returns simplified records
@@ -843,7 +883,7 @@ def get_project_users(project_id: str, max_pages: int = _MAX_USER_PAGES) -> list
     return _paginate_project_users(project_id, max_pages, include_permissions=False)
 
 
-def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
+def get_project_user_permissions(project_id: str) -> ResultList:
     """Fetches all project members with full permission and role details.
 
     NEVER cached — every call executes a live HTTP request to ACC to return
@@ -861,7 +901,7 @@ def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
     return result
 
 
-def add_project_user(project_id: str, email: str, products: Optional[list] = None) -> dict:
+def add_project_user(project_id: str, email: str, products: list[str] | None = None) -> dict[str, Any]:
     """
     Add a user to a project.
 
@@ -886,7 +926,7 @@ def add_project_user(project_id: str, email: str, products: Optional[list] = Non
     return resp.json()
 
 
-def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -> tuple:
+def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -> tuple[ResultList, list[str]]:
     """Aggregate users and their product entitlements across all projects in a hub.
 
     Scans up to *max_projects* projects, collects every user encountered, and
@@ -904,8 +944,8 @@ def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -
 
     user_map: Dict[str, Dict[str, Any]] = {}
 
-    skipped_projects: List[str] = []
-    warnings: List[str] = []
+    skipped_projects: list[str] = []
+    warnings: list[str] = []
 
     # Propagate project-list truncation warning
     _proj_warn = getattr(all_hub_projects, "truncation_warning", "")
@@ -1157,18 +1197,22 @@ def replicate_folders(
     hub_id: str,
     source_project_id: str,
     dest_project_id: str,
-    _MAX_FOLDER_DEPTH: int = 5,
+    max_depth: int = 5,
 ) -> str:
     """Recursively copies the folder structure from a source project to a destination project.
+
+    Source and destination projects may be in different hubs.  The caller
+    should pass the actual hub ID where the source project lives (obtained
+    from ``_resolve_project_id``).
 
     Only replicates folders (not files). Starts from the 'Project Files' root.
     Returns a short summary string (not the full folder list) to avoid content-filter issues.
 
     Args:
-        hub_id:             Hub ID (both projects must be in the same hub).
+        hub_id:             Hub ID of the source project.
         source_project_id:  Source project ID.
         dest_project_id:    Destination project ID.
-        _MAX_FOLDER_DEPTH:          Maximum folder nesting depth (default 5).
+        max_depth:          Maximum folder nesting depth (default 5).
 
     Returns:
         Summary string with the count of created folders.
@@ -1189,7 +1233,7 @@ def replicate_folders(
 
     def _recurse(src_folder_id: str, dst_parent_id: str, path: str, depth: int) -> None:
         nonlocal count
-        if depth > _MAX_FOLDER_DEPTH:
+        if depth > max_depth:
             return
 
         try:

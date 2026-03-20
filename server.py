@@ -1,6 +1,6 @@
 import os
 import re
-import json  # Used specifically for the get_highlights resource endpoint, not for tool outputs.
+import json
 import hmac
 import asyncio
 import hashlib
@@ -72,10 +72,6 @@ _COLOR_MAP: dict[str, list[float]] = {
     "clear": [0, 0, 0, 0],
 }
 
-
-# ---------------------------------------------------------------------------
-# Shared resolution helpers — DRY replacements for repeated inline loops.
-# ---------------------------------------------------------------------------
 
 async def _resolve_hub_id(hub_name: str) -> str:
     """Resolve a hub display name to its Autodesk Hub ID.
@@ -323,9 +319,11 @@ async def find_project(name_query: str) -> str:
             )
         lines.append("\nPlease use the exact project name to narrow down.")
         return "\n".join(lines)
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"find_project failed: {e}")
-        return f"Error searching for project: {e}"
+        return f"Failed to search for project: {e}"
 
 
 @nav_mcp.tool()
@@ -344,6 +342,8 @@ async def list_hubs() -> str:
             name = hub.get("attributes", {}).get("name", "Unknown")
             report += f"- {name}\n"
         return report
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"list_hubs failed: {e}")
         return f"Failed to list hubs: {e}"
@@ -385,6 +385,8 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
             report += f"\n{_tw}"
 
         return report
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"list_projects failed: {e}")
         return f"Failed to list projects: {e}"
@@ -416,6 +418,8 @@ async def list_top_folders(hub_name: str, project_name: str) -> str:
             fid_display = f"...{fid[-12:]}" if len(fid) > 12 else fid
             report += f"- {name} (ID: {fid_display})\n"
         return report
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"list_top_folders failed: {e}")
         return f"Failed to list folders: {e}"
@@ -450,6 +454,8 @@ async def list_folder_contents(hub_name: str, project_name: str, folder_name: st
             icon = "[folder]" if item_type in ("folder", "folders") else "[file]"
             report += f"  {icon} {name} (ID: {iid_display})\n"
         return report
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"list_folder_contents failed: {e}")
         return f"Failed to list folder contents: {e}"
@@ -472,9 +478,11 @@ async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
         hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
         return await asyncio.to_thread(inspect_generic_file, project_id, file_name)
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"inspect_file failed: {e}")
-        return f"Error inspecting file: {e}"
+        return f"Failed to inspect file: {e}"
 
 
 
@@ -515,12 +523,14 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
 
         status = result.get("result", "unknown")
         return (
-            f"Translation job started for '{file_name}' (status: {status}).\n"
+            f"\u2705 Translation job started for '{file_name}' (status: {status}).\n"
             f"Please wait 5-10 minutes, then use inspect_file or count_elements to verify."
         )
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"reprocess_file failed: {e}")
-        return f"Error triggering reprocess: {e}"
+        return f"Failed to trigger reprocessing: {e}"
 
 
 @bim_mcp.tool()
@@ -550,40 +560,36 @@ async def count_elements(hub_name: str, project_name: str, file_name: str, categ
 
         count = await asyncio.to_thread(stream_count_elements, version_urn, category_name)
         return f"Found {count} elements matching '{category_name}' (including singular variations)."
-    except ValueError as ve:
-        return str(ve)
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"count_elements failed: {e}")
-        return f"Error scanning model: {e}"
+        return f"Failed to count elements: {e}"
 
 
 
 @admin_mcp.tool()
-async def create_project(hub_id_or_name: str, name: str, project_type: str = "ACC") -> str:
+async def create_project(hub_name: str, name: str, project_type: str = "ACC") -> str:
     """
     Creates a new project in the specified Hub.
 
-    Smart feature: accepts a Hub ID ('b.xxx') OR a Hub Name.
-    If a name is provided, it automatically resolves it to the correct hub_id.
-
     Args:
-        hub_id_or_name: Hub ID (starts with 'b.') OR Hub name (e.g. "TBI Holding").
-        name:           The name of the new project.
-        project_type:   'ACC' or 'BIM360' (Default: ACC).
+        hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
+        name:         The name of the new project.
+        project_type: 'ACC' or 'BIM360' (Default: ACC).
     """
     try:
-        real_hub_id = hub_id_or_name
-
-        if not real_hub_id.startswith("b."):
-            real_hub_id = await _resolve_hub_id(hub_id_or_name)
+        real_hub_id = await _resolve_hub_id(hub_name)
 
         result = await asyncio.to_thread(create_acc_project, real_hub_id, name, project_type)
         new_id = result.get("id") or result.get("projectId")
 
         if new_id:
-            return f"Project '{name}' successfully created! Project ID: {new_id}"
+            return f"\u2705 Project '{name}' created successfully. Project ID: {new_id}"
         else:
             return "API succeeded, but couldn't parse the new Project ID from the response."
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"create_project failed: {e}")
         return f"Failed to create project: {e}"
@@ -620,6 +626,8 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
             )
 
         return report
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"list_project_users failed: {e}")
         return f"Failed to list project users: {e}"
@@ -640,7 +648,9 @@ async def add_user(hub_name: str, project_name: str, email: str) -> str:
         hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
         await asyncio.to_thread(add_project_user, project_id, email, ["docs"])
-        return f"User '{email}' successfully added to project '{resolved_name}'."
+        return f"\u2705 User '{email}' added to project '{resolved_name}'."
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"add_user failed: {e}")
         return f"Failed to add user: {e}"
@@ -685,6 +695,8 @@ async def audit_hub_users(hub_name: str) -> str:
             report += f"\n\n{_tw}"
 
         return report
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"audit_hub_users failed: {e}")
         return f"Failed to audit hub users: {e}"
@@ -794,19 +806,22 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
 
         return _format_permissions_report(users, resolved_name)
 
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"check_project_permissions failed: {e}")
-        return f"Failed to fetch permissions: {e}"
+        return f"Failed to check permissions: {e}"
 
 
 @admin_mcp.tool()
 async def find_user_projects(user_name: str) -> str:
     """
-    Lists every ACC project a specific user has access to, across ALL hubs.
+    Lists every ACC project a specific user has access to.
 
-    Resolves the user by display name (substring, case-insensitive) or exact
-    email address, then returns their project assignments in real-time.
-    No results are cached — each call reflects the live state in ACC.
+    Automatically searches ALL accessible hubs in parallel — no hub
+    parameter is needed. Resolves the user by display name (substring,
+    case-insensitive) or exact email address. Results are fetched live
+    from ACC on every call (never cached).
 
     Args:
         user_name: User's full name (or part of it) or their email address.
@@ -816,28 +831,32 @@ async def find_user_projects(user_name: str) -> str:
         if not hubs:
             return "No hubs found. Check your Autodesk account permissions."
 
+        # Build (account_id, hub_display) pairs for valid hubs.
+        hub_pairs: list[tuple[str, str]] = []
+        for hub in hubs:
+            hub_id = hub.get("id")
+            hub_display = hub.get("attributes", {}).get("name", "Unknown")
+            if not hub_id:
+                continue
+            account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
+            hub_pairs.append((account_id, hub_display))
+
+        # Query all hubs in parallel.
+        tasks = [
+            asyncio.to_thread(get_user_projects, account_id, user_name)
+            for account_id, _ in hub_pairs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
         lines: list[str] = []
         total_projects = 0
         display_name = None
         email = None
         hub_errors: list[str] = []
 
-        for hub in hubs:
-            hub_id = hub.get("id")
-            hub_display = hub.get("attributes", {}).get("name", "Unknown")
-            if not hub_id:
-                continue
-
-            account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
-
-            try:
-                result = await asyncio.to_thread(get_user_projects, account_id, user_name)
-            except ValueError as ve:
-                logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, ve)
-                hub_errors.append(hub_display)
-                continue
-            except Exception as e:
-                logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, e)
+        for (account_id, hub_display), result in zip(hub_pairs, results):
+            if isinstance(result, Exception):
+                logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, result)
                 hub_errors.append(hub_display)
                 continue
 
@@ -878,11 +897,11 @@ async def find_user_projects(user_name: str) -> str:
 
         return header + "\n" + "\n".join(lines)
 
-    except ValueError as ve:
-        return str(ve)
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"find_user_projects failed: {e}")
-        return f"Failed to fetch user projects: {e}"
+        return f"Failed to find user projects: {e}"
 
 
 @admin_mcp.tool()
@@ -890,7 +909,10 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
     """
     Copies the folder structure from a Source Project to a Destination Project.
     Executes immediately — no preview or confirmation step.
-    Only folders are copied, not files. Folders that already exist are skipped.
+
+    Source and destination may live in different hubs; cross-hub resolution
+    is automatic. Only folders are copied, not files. Folders that already
+    exist in the destination are skipped (no duplicates).
 
     Args:
         hub_name:             The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
@@ -924,11 +946,11 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
             f"Folders created: {count}\n\n"
             f"If some folders already existed they were skipped."
         )
-    except ValueError as ve:
-        return f"Folder template failed: {ve}"
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"apply_folder_template failed: {e}")
-        return f"Failed to replicate folder structure: {e}"
+        return f"Failed to apply folder template: {e}"
 
 
 @admin_mcp.tool()
@@ -946,7 +968,12 @@ async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> s
         hub_id = await _resolve_hub_id(hub_name)
         hub_id, found_id, _ = await _resolve_project_id(hub_id, project_name)
 
-        return await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
+        result = await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
+        if result.startswith("Successfully"):
+            return f"\u2705 {result}"
+        return result
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"delete_folder failed: {e}")
         return f"Failed to delete folder: {e}"
@@ -1017,6 +1044,8 @@ async def preview_model(urn: str) -> ToolResult:
             content=f"Loading 3D preview for model URN: {urn[:60]}...",
             structured_content=structured,
         )
+    except ValueError as e:
+        return ToolResult(content=str(e))
     except Exception as e:
         logger.error(f"preview_model failed: {e}")
         return ToolResult(content=f"Failed to preview model: {e}")
@@ -1035,15 +1064,21 @@ async def highlight_elements(urn: str, ids: list[int], color: str = "red") -> st
         ids:   List of dbId integers to highlight (from selection context or count_elements).
         color: Color name: "red", "green", "blue", "yellow", "orange", or "clear" to reset.
     """
-    if color == "clear" or not ids:
-        _HIGHLIGHT_STATE[urn] = {"ids": [], "color": []}
-        return f"Cleared all highlights for model."
+    try:
+        if color == "clear" or not ids:
+            _HIGHLIGHT_STATE[urn] = {"ids": [], "color": []}
+            return f"Cleared all highlights for model."
 
-    rgba = _COLOR_MAP.get(color, _COLOR_MAP["red"])
-    if urn not in _HIGHLIGHT_STATE and len(_HIGHLIGHT_STATE) >= _HIGHLIGHT_MAX_ENTRIES:
-        _HIGHLIGHT_STATE.popitem(last=False)  # evict oldest entry (FIFO)
-    _HIGHLIGHT_STATE[urn] = {"ids": ids, "color": rgba}
-    return f"Highlighted {len(ids)} element(s) in {color}."
+        rgba = _COLOR_MAP.get(color, _COLOR_MAP["red"])
+        if urn not in _HIGHLIGHT_STATE and len(_HIGHLIGHT_STATE) >= _HIGHLIGHT_MAX_ENTRIES:
+            _HIGHLIGHT_STATE.popitem(last=False)  # evict oldest entry (FIFO)
+        _HIGHLIGHT_STATE[urn] = {"ids": ids, "color": rgba}
+        return f"Highlighted {len(ids)} element(s) in {color}."
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        logger.error(f"highlight_elements failed: {e}")
+        return f"Failed to highlight elements: {e}"
 
 
 @bim_mcp.resource("highlight://{urn}")
