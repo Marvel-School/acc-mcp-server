@@ -50,6 +50,40 @@ def encode_urn(urn: Optional[str]) -> str:
     return quote(urn, safe="") if urn else ""
 
 
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+_SYSTEM_FOLDER_PREFIXES = (
+    "quantification_",
+    "correspondence-project-",
+    "issue_",
+    "submittals-",
+    "COST Root Folder",
+    "VIRTUAL_ROOT_FOLDER",
+)
+
+
+def _is_system_folder(folder_name: str) -> bool:
+    """Return True if *folder_name* is an Autodesk internal system folder.
+
+    Matches:
+    - Known system prefixes (quantification_, issue_, COST Root Folder, …)
+    - Names that are purely a UUID
+    - Names that contain a UUID suffix after an underscore or hyphen
+    """
+    if not folder_name:
+        return False
+    if folder_name.startswith(_SYSTEM_FOLDER_PREFIXES):
+        return True
+    if _UUID_RE.fullmatch(folder_name):
+        return True
+    if _UUID_RE.search(folder_name):
+        return True
+    return False
+
+
 def safe_b64encode(value: Optional[str]) -> str:
     """Base64url-encode a URN (no padding) for Model Derivative API."""
     if not value:
@@ -227,43 +261,42 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
     return all_projects
 
 
-def find_project_globally(name_query: str) -> Optional[tuple]:
+def find_project_globally(name_query: str) -> list[tuple[str, str, str, str]]:
     """
     Search for a project by name across ALL accessible hubs.
     Case-insensitive substring match.
 
     Returns:
-        (hub_id, project_id, project_name) or None.
+        List of (hub_id, hub_name, project_id, project_name) tuples for
+        every match found.  An empty list means no matches.
     """
-    try:
-        logger.info(f"Searching globally for project: {name_query}")
-        hubs = get_hubs()
-        if not hubs:
-            logger.error("No hubs found.")
-            return None
+    logger.info(f"Searching globally for project: {name_query}")
+    hubs = get_hubs()
+    if not hubs:
+        logger.error("No hubs found.")
+        return []
 
-        search_term = name_query.lower().strip()
+    search_term = name_query.lower().strip()
+    matches: list[tuple[str, str, str, str]] = []
 
-        for hub in hubs:
-            hub_id = hub.get("id")
-            hub_name = hub.get("attributes", {}).get("name", "Unknown")
-            if not hub_id:
-                continue
+    for hub in hubs:
+        hub_id = hub.get("id")
+        hub_name = hub.get("attributes", {}).get("name", "Unknown")
+        if not hub_id:
+            continue
 
-            logger.info(f"  Searching hub: {hub_name}")
-            projects = get_projects(hub_id)
+        logger.info(f"  Searching hub: {hub_name}")
+        projects = get_projects(hub_id)
 
-            for p in projects:
-                p_name = p.get("attributes", {}).get("name", "")
-                if search_term in p_name.lower():
-                    logger.info(f"  Found: {p_name}")
-                    return (hub_id, p.get("id"), p_name)
+        for p in projects:
+            p_name = p.get("attributes", {}).get("name", "")
+            if search_term in p_name.lower():
+                logger.info(f"  Found: {p_name} in hub {hub_name}")
+                matches.append((hub_id, hub_name, p.get("id"), p_name))
 
-        logger.warning(f"Project '{name_query}' not found")
-        return None
-    except Exception as e:
-        logger.error(f"Project search error: {e}")
-        return None
+    if not matches:
+        logger.warning(f"Project '{name_query}' not found in any hub")
+    return matches
 
 
 
@@ -275,7 +308,7 @@ def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
     url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_clean}/projects/{proj_clean}/topFolders"
     resp = _make_request("GET", url)
 
-    return [
+    all_folders = [
         {
             "id": f.get("id"),
             "name": f.get("attributes", {}).get("displayName"),
@@ -283,6 +316,14 @@ def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
         }
         for f in resp.json().get("data", [])
     ]
+    filtered = [f for f in all_folders if not _is_system_folder(f.get("name") or "")]
+    removed = len(all_folders) - len(filtered)
+    if removed:
+        logger.debug(
+            "Filtered %d system folders from top-level folder list for project %s",
+            removed, project_id,
+        )
+    return filtered
 
 
 def get_folder_contents(project_id: str, folder_id: str) -> List[Dict[str, Any]]:
@@ -319,6 +360,17 @@ def get_folder_contents(project_id: str, folder_id: str) -> List[Dict[str, Any]]
 
         result.append(parsed)
 
+    before = len(result)
+    result = [
+        item for item in result
+        if item.get("itemType") != "folder" or not _is_system_folder(item.get("name") or "")
+    ]
+    removed = before - len(result)
+    if removed:
+        logger.debug(
+            "Filtered %d system folders from folder contents of %s",
+            removed, folder_id,
+        )
     return result
 
 
@@ -374,6 +426,9 @@ def find_design_files(
 
             elif item.get("itemType") == "folder" and current["depth"] < max_depth:
                 sub_name = item.get("name", "Unknown")
+                if _is_system_folder(sub_name):
+                    logger.debug("Skipping system folder during BFS: %s", sub_name)
+                    continue
                 queue.append({
                     "id": item.get("id"),
                     "name": f"{current['name']}/{sub_name}",
@@ -1155,6 +1210,9 @@ def replicate_folders(
                 continue
 
             name = item.get("name", "Unnamed")
+            if _is_system_folder(name):
+                logger.debug("Skipping system folder during replication: %s", name)
+                continue
             full_path = f"{path}/{name}"
 
             try:

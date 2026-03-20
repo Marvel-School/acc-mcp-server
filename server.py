@@ -107,36 +107,67 @@ async def _resolve_hub_id(hub_name: str) -> str:
     )
 
 
-async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str, str]:
-    """Resolve a project display name to its (project_id, resolved_name) tuple.
+async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str, str, str]:
+    """Resolve a project display name to (hub_id, project_id, resolved_name).
 
-    Performs a case-insensitive *substring* match so that partial names still
-    resolve correctly (e.g. "Grasbaan" matches "Grasbaan - Fase 2").
+    First searches within *hub_id*.  If nothing is found there, falls back to
+    a global search across all accessible hubs so that cross-hub projects are
+    discovered automatically.  The returned hub_id may differ from the input
+    when the project lives in a different hub.
 
     Raises:
         ValueError: If zero or multiple projects match the given name.
     """
+    # --- 1. Search in the specified hub first ---
     projects = await asyncio.to_thread(get_projects, hub_id)
     target = project_name.lower().strip()
     matches = []
     for p in projects:
         p_name = p.get("attributes", {}).get("name", "")
         if target in p_name.lower():
-            matches.append((p.get("id"), p_name))
+            matches.append((hub_id, p.get("id"), p_name))
 
     if len(matches) == 1:
         return matches[0]
 
-    if not matches:
+    if len(matches) > 1:
+        listing = "\n".join(f"  - {name} (id: {pid})" for _, pid, name in matches)
+        raise ValueError(
+            f"Ambiguous project name '{project_name}' — found {len(matches)} matches:\n"
+            + listing
+            + "\nPlease provide a more specific name."
+        )
+
+    # --- 2. Not found in specified hub — search all hubs ---
+    logger.info(
+        "Project '%s' not found in hub %s — searching all hubs…",
+        project_name, hub_id,
+    )
+    global_matches = await asyncio.to_thread(find_project_globally, project_name)
+
+    if len(global_matches) == 1:
+        g_hub_id, g_hub_name, g_proj_id, g_proj_name = global_matches[0]
+        logger.info(
+            "Found project '%s' in hub '%s' (cross-hub fallback)",
+            g_proj_name, g_hub_name,
+        )
+        return (g_hub_id, g_proj_id, g_proj_name)
+
+    if not global_matches:
         all_names = [p.get("attributes", {}).get("name", "?") for p in projects[:30]]
         suffix = f" (showing 30 of {len(projects)})" if len(projects) > 30 else ""
         raise ValueError(
-            f"No project found matching '{project_name}'. "
-            f"Available projects{suffix}: {', '.join(all_names)}"
+            f"No project found matching '{project_name}' in any hub. "
+            f"Projects in specified hub{suffix}: {', '.join(all_names)}"
         )
-    listing = "\n".join(f"  - {name} (id: {pid})" for pid, name in matches)
+
+    listing = "\n".join(
+        f"  - {name} in hub '{hname}' (id: {pid})"
+        for _, hname, pid, name in global_matches
+    )
     raise ValueError(
-        f"Ambiguous project name '{project_name}' — found {len(matches)} matches:\n"
+        f"Ambiguous project name '{project_name}' — found {len(global_matches)} "
+        f"matches across hubs:\n"
         + listing
         + "\nPlease provide a more specific name."
     )
@@ -282,7 +313,7 @@ async def list_top_folders(hub_name: str, project_name: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
         folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
         if not folders:
@@ -313,7 +344,7 @@ async def list_folder_contents(hub_name: str, project_name: str, folder_name: st
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
         folder_id = await _resolve_folder_id(hub_id, project_id, folder_name)
 
         items = await asyncio.to_thread(get_folder_contents, project_id, folder_id)
@@ -348,7 +379,7 @@ async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        project_id, _ = await _resolve_project_id(hub_id, project_name)
+        hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
         return await asyncio.to_thread(inspect_generic_file, project_id, file_name)
     except Exception as e:
@@ -374,7 +405,7 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        project_id, _ = await _resolve_project_id(hub_id, project_name)
+        hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
         lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
         if not lineage_urn or not lineage_urn.startswith("urn:"):
@@ -421,7 +452,7 @@ async def count_elements(hub_name: str, project_name: str, file_name: str, categ
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        project_id, _ = await _resolve_project_id(hub_id, project_name)
+        hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
         lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
         if not lineage_urn or not lineage_urn.startswith("urn:"):
@@ -483,7 +514,7 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
         users = await asyncio.to_thread(get_project_users, project_id)
         if not users:
@@ -520,7 +551,7 @@ async def add_user(hub_name: str, project_name: str, email: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
         await asyncio.to_thread(add_project_user, project_id, email, ["docs"])
         return f"User '{email}' successfully added to project '{resolved_name}'."
@@ -591,7 +622,7 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
         # Fetch live permissions — explicitly uncached
         users = await asyncio.to_thread(get_project_user_permissions, project_id)
@@ -734,7 +765,8 @@ async def find_user_projects(hub_name: str, user_name: str) -> str:
 async def apply_folder_template(hub_name: str, source_project_name: str, dest_project_name: str) -> str:
     """
     Copies the folder structure from a Source Project to a Destination Project.
-    Useful for setting up new projects from a template. Only folders are copied, not files.
+    Executes immediately — no preview or confirmation step.
+    Only folders are copied, not files. Folders that already exist are skipped.
 
     Args:
         hub_name:             The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
@@ -743,11 +775,33 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        src_id, src_name = await _resolve_project_id(hub_id, source_project_name)
-        dst_id, dst_name = await _resolve_project_id(hub_id, dest_project_name)
 
-        summary = await asyncio.to_thread(replicate_folders, hub_id, src_id, dst_id)
-        return f"Template applied from '{src_name}' to '{dst_name}': {summary}"
+        # Resolve both projects — cross-hub fallback is automatic.
+        src_hub_id, src_id, src_name = await _resolve_project_id(hub_id, source_project_name)
+        dst_hub_id, dst_id, dst_name = await _resolve_project_id(hub_id, dest_project_name)
+
+        # Look up hub display names for the completion message.
+        hubs = await asyncio.to_thread(get_hubs)
+        hub_names = {h.get("id"): h.get("attributes", {}).get("name", "?") for h in hubs}
+        src_hub_name = hub_names.get(src_hub_id, src_hub_id)
+        dst_hub_name = hub_names.get(dst_hub_id, dst_hub_id)
+
+        # Execute immediately — no preview.
+        summary = await asyncio.to_thread(replicate_folders, src_hub_id, src_id, dst_id)
+
+        # Extract folder count from summary string (e.g. "Successfully copied 12 folders …")
+        count_match = re.search(r"(\d+)\s+folders", summary)
+        count = count_match.group(1) if count_match else "unknown"
+
+        return (
+            f"\u2705 Folder structure copied successfully.\n"
+            f"Source: {src_name} ({src_hub_name})\n"
+            f"Destination: {dst_name} ({dst_hub_name})\n"
+            f"Folders created: {count}\n\n"
+            f"If some folders already existed they were skipped."
+        )
+    except ValueError as ve:
+        return f"Folder template failed: {ve}"
     except Exception as e:
         logger.error(f"apply_folder_template failed: {e}")
         return f"Failed to replicate folder structure: {e}"
@@ -766,7 +820,7 @@ async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> s
     """
     try:
         hub_id = await _resolve_hub_id(hub_name)
-        found_id, _ = await _resolve_project_id(hub_id, project_name)
+        hub_id, found_id, _ = await _resolve_project_id(hub_id, project_name)
 
         return await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
     except Exception as e:
