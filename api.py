@@ -24,6 +24,20 @@ from auth import get_token
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Shared numeric constants — replaces inline magic numbers throughout.
+# ---------------------------------------------------------------------------
+_MAX_PROJECT_PAGES = 50
+_MAX_USER_PAGES = 10
+_MAX_FOLDER_SCAN = 50
+_MAX_FOLDER_DEPTH = 3
+_MAX_HUB_SCAN_PROJECTS = 20
+_MAX_USER_SEARCH_PAGES = 20
+_DEFAULT_TIMEOUT = 15
+_STREAM_TIMEOUT = 120
+_CHUNK_SIZE = 65536
+_BUFFER_OVERLAP = 512
+
 
 class ResultList(list):
     """List subclass that can carry an optional truncation warning.
@@ -116,7 +130,7 @@ def _make_request(
     Raises:
         ValueError: On any 4xx/5xx response (with Autodesk error detail).
     """
-    kwargs.setdefault("timeout", 15)
+    kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
     max_attempts = 2 if retry_on_401 else 1
     last_resp: requests.Response = None  # type: ignore[assignment]
 
@@ -241,10 +255,9 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
         base += f"&fields[projects]={','.join(fields)}"
     url: Optional[str] = base
     all_projects: ResultList = ResultList()
-    max_pages = 50
 
     _hit_cap = True
-    for _ in range(max_pages):  # safety cap
+    for _ in range(_MAX_PROJECT_PAGES):  # safety cap
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
         all_projects.extend(data.get("data", []))
@@ -264,7 +277,7 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
     if _hit_cap:
         all_projects.truncation_warning = (
             f"⚠️ Results truncated: retrieved {len(all_projects)} projects across "
-            f"{max_pages} pages (safety limit). There may be more projects in this hub."
+            f"{_MAX_PROJECT_PAGES} pages (safety limit). There may be more projects in this hub."
         )
         logger.warning(all_projects.truncation_warning)
 
@@ -416,15 +429,13 @@ def find_design_files(
     queue = deque([{"id": root_id, "name": "Project Files", "depth": 0}])
     matching: ResultList = ResultList()
     ext_list = [e.strip().lower() for e in extensions.split(",")]
-    max_folders = 50
-    max_depth = 3
     scanned = 0
 
-    while queue and scanned < max_folders:
+    while queue and scanned < _MAX_FOLDER_SCAN:
         current = queue.popleft()
         scanned += 1
 
-        logger.info(f"  Scanning {scanned}/{max_folders} (depth {current['depth']}): {current['name']}")
+        logger.info(f"  Scanning {scanned}/{_MAX_FOLDER_SCAN} (depth {current['depth']}): {current['name']}")
         try:
             contents = get_folder_contents(project_id, current["id"])
         except Exception as e:
@@ -443,7 +454,7 @@ def find_design_files(
                     })
                     logger.info(f"    Found: {name}")
 
-            elif item.get("itemType") == "folder" and current["depth"] < max_depth:
+            elif item.get("itemType") == "folder" and current["depth"] < _MAX_FOLDER_DEPTH:
                 sub_name = item.get("name", "Unknown")
                 if _is_system_folder(sub_name):
                     logger.debug("Skipping system folder during BFS: %s", sub_name)
@@ -456,10 +467,10 @@ def find_design_files(
 
     logger.info(f"Search complete: {scanned} folders, {len(matching)} files")
 
-    if scanned >= max_folders and queue:
+    if scanned >= _MAX_FOLDER_SCAN and queue:
         matching.truncation_warning = (
-            f"⚠️ Results truncated: only scanned {max_folders} of "
-            f"{max_folders + len(queue)} reachable folders (depth limit: {max_depth}). "
+            f"⚠️ Results truncated: only scanned {_MAX_FOLDER_SCAN} of "
+            f"{_MAX_FOLDER_SCAN + len(queue)} reachable folders (depth limit: {_MAX_FOLDER_DEPTH}). "
             f"There may be more design files. Narrow your search to get complete results."
         )
         logger.warning(matching.truncation_warning)
@@ -647,11 +658,11 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     count = 0
     buffer = b""
 
-    resp = _make_request("GET", url, stream=True, timeout=120)
+    resp = _make_request("GET", url, stream=True, timeout=_STREAM_TIMEOUT)
     try:
         resp.raise_for_status()
 
-        for chunk in resp.iter_content(chunk_size=65536):
+        for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
             if not chunk:
                 continue
 
@@ -662,7 +673,7 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
             if matches:
                 buffer = buffer[matches[-1].end():]
             else:
-                buffer = buffer[-512:]
+                buffer = buffer[-_BUFFER_OVERLAP:]
 
     except requests.exceptions.HTTPError as e:
         raise ValueError(f"HTTP error streaming metadata: {e}")
@@ -729,46 +740,82 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     return resp.json()
 
 
-def get_project_users(project_id: str, max_pages: int = 10) -> list:
-    """List users in a project (requires Admin). Paginates up to *max_pages* pages
-    (100 users/page), matching get_project_user_permissions.
+def _sanitize_user_name(raw: dict) -> str:
+    """Build a clean display name from an ACC user record.
 
-    Names are sanitized — ACC sometimes appends autodeskId directly onto the
-    name field (e.g. "Maxine Bruil0c1e0b3b-..."). Both standard UUID and
-    non-standard hex-run suffixes are stripped before the data is returned.
+    ACC sometimes appends autodeskId directly onto the name field
+    (e.g. "Maxine Bruil0c1e0b3b-..."). Prefer firstName/lastName;
+    fall back to name; strip any embedded hex-ID substring.
     """
-    clean_project_id = _strip_b_prefix(project_id)
+    _first = (raw.get("firstName") or "").strip()
+    _last = (raw.get("lastName") or "").strip()
+    _raw_name = (
+        f"{_first} {_last}".strip()
+        if (_first or _last)
+        else (raw.get("name") or "").strip()
+    )
+    clean = re.sub(
+        r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
+        "",
+        _raw_name,
+    )
+    return re.sub(r"[a-fA-F0-9]{10,}$", "", clean).strip() or "-"
+
+
+def _paginate_project_users(
+    project_id: str,
+    max_pages: int,
+    include_permissions: bool,
+) -> ResultList:
+    """Shared pagination helper for project user endpoints.
+
+    Fetches users from the ACC Admin API with automatic pagination,
+    name sanitisation, and truncation warnings.
+
+    Args:
+        project_id:          Project ID (b. prefix stripped automatically).
+        max_pages:           Maximum pages to fetch (100 users/page).
+        include_permissions: If True, enrich each record with role/product/
+                             access-level details.  If False, return the raw
+                             API record with only the name sanitised.
+    """
+    clean_id = _strip_b_prefix(project_id)
     endpoint = (
         f"https://developer.api.autodesk.com/construction/admin/v1"
-        f"/projects/{clean_project_id}/users?limit=100"
+        f"/projects/{clean_id}/users?limit=100"
     )
 
     all_users: ResultList = ResultList()
     url: Optional[str] = endpoint
 
     _hit_cap = True
-    for _ in range(max_pages):  # safety cap
+    for _ in range(max_pages):
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
 
         for raw in data.get("results", []):
-            _first = (raw.get("firstName") or "").strip()
-            _last = (raw.get("lastName") or "").strip()
-            _raw_name = (
-                f"{_first} {_last}".strip()
-                if (_first or _last)
-                else (raw.get("name") or "").strip()
-            )
-            # Strip standard 36-char UUIDs (8-4-4-4-12)
-            clean_name = re.sub(
-                r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
-                "",
-                _raw_name,
-            )
-            # Strip any remaining long hex-only run at end of string
-            clean_name = re.sub(r"[a-fA-F0-9]{10,}$", "", clean_name).strip() or "-"
-            raw["name"] = clean_name
-            all_users.append(raw)
+            display_name = _sanitize_user_name(raw)
+
+            if include_permissions:
+                company = raw.get("company") or {}
+                products_raw = raw.get("products") or []
+                roles_raw = raw.get("roles") or []
+                all_users.append({
+                    "name": display_name,
+                    "email": (raw.get("email") or "").lower(),
+                    "companyId": company.get("id", ""),
+                    "companyName": company.get("name", "") or "-",
+                    "roleIds": [r.get("id", "") for r in roles_raw],
+                    "roleNames": [r.get("name", "") for r in roles_raw],
+                    "products": [
+                        {"key": p.get("key", ""), "access": p.get("access", "")}
+                        for p in products_raw
+                    ],
+                    "accessLevels": raw.get("accessLevels") or [],
+                })
+            else:
+                raw["name"] = display_name
+                all_users.append(raw)
 
         next_url = data.get("pagination", {}).get("nextUrl")
         if next_url:
@@ -785,105 +832,33 @@ def get_project_users(project_id: str, max_pages: int = 10) -> list:
         logger.warning(all_users.truncation_warning)
 
     return all_users
+
+
+def get_project_users(project_id: str, max_pages: int = _MAX_USER_PAGES) -> list:
+    """List users in a project (requires Admin).
+
+    Thin wrapper around _paginate_project_users — returns simplified records
+    with sanitised names.
+    """
+    return _paginate_project_users(project_id, max_pages, include_permissions=False)
 
 
 def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
-    """
-    Fetches all project members with full permission and role details.
+    """Fetches all project members with full permission and role details.
 
     NEVER cached — every call executes a live HTTP request to ACC to return
-    the absolute current truth. This prevents stale data from in-process caches
-    reflecting a state that has since changed in the platform.
-
-    Uses the ACC Admin API (construction/admin/v1) with automatic pagination
-    (up to 10 pages, 100 users/page = 1 000 users max).
-
-    Args:
-        project_id: Project ID (b. prefix is stripped automatically).
+    the absolute current truth.
 
     Returns:
         List of user dicts with keys: name, email, companyId, companyName,
-        roleIds, products, accessLevels.
-
-    Raises:
-        ValueError: On any API or HTTP error.
+        roleIds, roleNames, products, accessLevels.
     """
     clean_id = _strip_b_prefix(project_id)
-    base_url = (
-        f"https://developer.api.autodesk.com/construction/admin/v1"
-        f"/projects/{clean_id}/users?limit=100"
-    )
-
-    all_users: ResultList = ResultList()
-    url: Optional[str] = base_url
-    max_pages = 10
-
-    _hit_cap = True
-    for _ in range(max_pages):  # safety cap — 10 pages × 100 = 1 000 users max
-        resp = _make_request("GET", url)  # type: ignore[arg-type]
-        data = resp.json()
-
-        for raw in data.get("results", []):
-            company = raw.get("company") or {}
-            products_raw = raw.get("products") or []
-            roles_raw = raw.get("roles") or []
-            access_levels = raw.get("accessLevels") or []
-
-            # Build a clean display name.
-            # ACC sometimes appends autodeskId directly onto the name field
-            # (e.g. "Maxine Bruil0c1e0b3b-..."). Prefer the separate
-            # firstName/lastName fields; fall back to name; strip any
-            # embedded hex-ID substring from whatever we end up with.
-            _first = (raw.get("firstName") or "").strip()
-            _last = (raw.get("lastName") or "").strip()
-            _raw_name = (
-                f"{_first} {_last}".strip()
-                if (_first or _last)
-                else (raw.get("name") or "").strip()
-            )
-            # Pass 1 — strip standard 36-char UUIDs (8-4-4-4-12 with dashes)
-            display_name = re.sub(
-                r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
-                "",
-                _raw_name,
-            )
-            # Pass 2 — strip any remaining long hex-only run at end of string
-            # (catches non-standard IDs like "0c1e0b3b6b3a4" with no dashes)
-            display_name = re.sub(r"[a-fA-F0-9]{10,}$", "", display_name).strip() or "-"
-
-            all_users.append({
-                "name": display_name,
-                "email": (raw.get("email") or "").lower(),
-                "companyId": company.get("id", ""),
-                "companyName": company.get("name", "") or "-",
-                "roleIds": [r.get("id", "") for r in roles_raw],
-                "roleNames": [r.get("name", "") for r in roles_raw],
-                "products": [
-                    {"key": p.get("key", ""), "access": p.get("access", "")}
-                    for p in products_raw
-                ],
-                "accessLevels": access_levels,
-            })
-
-        next_url = data.get("pagination", {}).get("nextUrl")
-        if next_url:
-            url = next_url
-        else:
-            _hit_cap = False
-            break
-
+    result = _paginate_project_users(project_id, _MAX_USER_PAGES, include_permissions=True)
     logger.info(
-        f"[Permissions] Fetched {len(all_users)} users for project {clean_id} (live, uncached)"
+        f"[Permissions] Fetched {len(result)} users for project {clean_id} (live, uncached)"
     )
-
-    if _hit_cap:
-        all_users.truncation_warning = (
-            f"⚠️ Results truncated: retrieved {len(all_users)} users across "
-            f"{max_pages} pages (safety limit). There may be more users in this project."
-        )
-        logger.warning(all_users.truncation_warning)
-
-    return all_users
+    return result
 
 
 def add_project_user(project_id: str, email: str, products: Optional[list] = None) -> dict:
@@ -911,7 +886,7 @@ def add_project_user(project_id: str, email: str, products: Optional[list] = Non
     return resp.json()
 
 
-def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
+def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -> tuple:
     """Aggregate users and their product entitlements across all projects in a hub.
 
     Scans up to *max_projects* projects, collects every user encountered, and
@@ -1037,9 +1012,8 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
         target = query.lower()
         limit = 100
         offset = 0
-        max_pages = 20
         _hit_name_cap = True
-        for _ in range(max_pages):  # safety cap: 2 000 users max
+        for _ in range(_MAX_USER_SEARCH_PAGES):  # safety cap: 2 000 users max
             list_url = (
                 f"https://developer.api.autodesk.com/hq/v1/regions/eu"
                 f"/accounts/{clean_account_id}/users?limit={limit}&offset={offset}"
@@ -1068,8 +1042,8 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
 
         if _hit_name_cap:
             _name_search_warning = (
-                f"⚠️ User search truncated: scanned {max_pages * limit:,} users "
-                f"({max_pages}-page safety limit). The matching user may exist beyond "
+                f"⚠️ User search truncated: scanned {_MAX_USER_SEARCH_PAGES * limit:,} users "
+                f"({_MAX_USER_SEARCH_PAGES}-page safety limit). The matching user may exist beyond "
                 f"this range. Try searching by exact email instead."
             )
             logger.warning(_name_search_warning)
@@ -1183,7 +1157,7 @@ def replicate_folders(
     hub_id: str,
     source_project_id: str,
     dest_project_id: str,
-    max_depth: int = 5,
+    _MAX_FOLDER_DEPTH: int = 5,
 ) -> str:
     """Recursively copies the folder structure from a source project to a destination project.
 
@@ -1194,7 +1168,7 @@ def replicate_folders(
         hub_id:             Hub ID (both projects must be in the same hub).
         source_project_id:  Source project ID.
         dest_project_id:    Destination project ID.
-        max_depth:          Maximum folder nesting depth (default 5).
+        _MAX_FOLDER_DEPTH:          Maximum folder nesting depth (default 5).
 
     Returns:
         Summary string with the count of created folders.
@@ -1215,7 +1189,7 @@ def replicate_folders(
 
     def _recurse(src_folder_id: str, dst_parent_id: str, path: str, depth: int) -> None:
         nonlocal count
-        if depth > max_depth:
+        if depth > _MAX_FOLDER_DEPTH:
             return
 
         try:

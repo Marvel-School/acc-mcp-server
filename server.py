@@ -690,6 +690,81 @@ async def audit_hub_users(hub_name: str) -> str:
         return f"Failed to audit hub users: {e}"
 
 
+_PERM_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+_LEVEL_LABEL = {
+    "projectAdmin": "Project Admin",
+    "projectMember": "Project Member",
+    "executive": "Executive",
+    "projectController": "Project Controller",
+}
+
+
+def _format_permissions_report(raw_users: list, project_name: str) -> str:
+    """Transform raw API user records into a formatted permissions report.
+
+    Deduplicates by email, merges roles/access-levels, and groups output
+    into admins vs members.
+    """
+
+    def _safe(s: str) -> bool:
+        return bool(s) and not _PERM_UUID_RE.match(s.strip())
+
+    def _role_label(entry: dict) -> str:
+        names = sorted(entry["roles"])
+        if names:
+            return ", ".join(names)
+        for lvl in entry["levels"]:
+            if lvl in _LEVEL_LABEL:
+                return _LEVEL_LABEL[lvl]
+        return "Member"
+
+    def _fmt_entry(entry: dict) -> str:
+        return (
+            f"* **Name**: {entry['name']} | "
+            f"**Company**: {entry['company']} | "
+            f"**Role**: {_role_label(entry)}"
+        )
+
+    user_map: dict = {}
+    for u in raw_users:
+        key = u.get("email") or u.get("name") or "unknown"
+        if key not in user_map:
+            user_map[key] = {
+                "name": u.get("name") or "Unknown",
+                "company": u.get("companyName") or "\u2014",
+                "roles": set(),
+                "levels": set(),
+            }
+        for rn in u.get("roleNames", []):
+            if _safe(rn):
+                user_map[key]["roles"].add(rn)
+        user_map[key]["levels"].update(u.get("accessLevels", []))
+
+    deduped = list(user_map.values())
+    admins = [e for e in deduped if "projectAdmin" in e["levels"]]
+    members = [e for e in deduped if e not in admins]
+
+    lines = [
+        f"## Project Members: {project_name}",
+        f"Total: {len(deduped)} ({len(admins)} admins, {len(members)} members)",
+        "",
+        "**Admins:**",
+    ]
+    lines += [_fmt_entry(e) for e in admins] or ["* (none)"]
+    lines += ["", "**Members:**"]
+    lines += [_fmt_entry(e) for e in members] or ["* (none)"]
+
+    _tw = getattr(raw_users, "truncation_warning", "")
+    if _tw:
+        lines += ["", _tw]
+
+    return "\n".join(lines)
+
+
 @admin_mcp.tool()
 async def check_project_permissions(hub_name: str, project_name: str) -> str:
     """
@@ -710,7 +785,6 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
         hub_id = await _resolve_hub_id(hub_name)
         hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
-        # Fetch live permissions — explicitly uncached
         users = await asyncio.to_thread(get_project_user_permissions, project_id)
         if not users:
             return (
@@ -718,75 +792,7 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
                 f"(or insufficient admin permissions)."
             )
 
-        # UUID pattern — any value matching this is an internal system ID, not human text.
-        _UUID = re.compile(
-            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-            re.IGNORECASE,
-        )
-
-        def _safe(s: str) -> bool:
-            """True when s is a non-empty, non-UUID display string."""
-            return bool(s) and not _UUID.match(s.strip())
-
-        # Deduplicate by email (falls back to name).
-        # If ACC returns multiple rows per user (one per product/role), merge them.
-        _LEVEL_LABEL = {
-            "projectAdmin": "Project Admin",
-            "projectMember": "Project Member",
-            "executive": "Executive",
-            "projectController": "Project Controller",
-        }
-
-        user_map: dict = {}
-        for u in users:
-            key = u.get("email") or u.get("name") or "unknown"
-            if key not in user_map:
-                user_map[key] = {
-                    "name": u.get("name") or "Unknown",
-                    "company": u.get("companyName") or "—",
-                    "roles": set(),
-                    "levels": set(),
-                }
-            for rn in u.get("roleNames", []):
-                if _safe(rn):
-                    user_map[key]["roles"].add(rn)
-            user_map[key]["levels"].update(u.get("accessLevels", []))
-
-        def _role_label(entry: dict) -> str:
-            names = sorted(entry["roles"])
-            if names:
-                return ", ".join(names)
-            for lvl in entry["levels"]:
-                if lvl in _LEVEL_LABEL:
-                    return _LEVEL_LABEL[lvl]
-            return "Member"
-
-        def _fmt_entry(entry: dict) -> str:
-            return (
-                f"* **Name**: {entry['name']} | "
-                f"**Company**: {entry['company']} | "
-                f"**Role**: {_role_label(entry)}"
-            )
-
-        deduped = list(user_map.values())
-        admins = [e for e in deduped if "projectAdmin" in e["levels"]]
-        members = [e for e in deduped if e not in admins]
-
-        lines = [
-            f"## Project Members: {resolved_name}",
-            f"Total: {len(deduped)} ({len(admins)} admins, {len(members)} members)",
-            "",
-            "**Admins:**",
-        ]
-        lines += [_fmt_entry(e) for e in admins] or ["* (none)"]
-        lines += ["", "**Members:**"]
-        lines += [_fmt_entry(e) for e in members] or ["* (none)"]
-
-        _tw = getattr(users, "truncation_warning", "")
-        if _tw:
-            lines += ["", _tw]
-
-        return "\n".join(lines)
+        return _format_permissions_report(users, resolved_name)
 
     except Exception as e:
         logger.error(f"check_project_permissions failed: {e}")

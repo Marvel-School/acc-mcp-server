@@ -1,4 +1,4 @@
-name: Build and Deploy Docker App
+name: "Build and Deploy — Production"
 
 on:
   push:
@@ -6,30 +6,32 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Log in to Azure Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ secrets.REGISTRY_LOGIN_SERVER }}
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      - name: Build and Push Docker image
+      - name: Build and push Docker image
         run: |
-          # Build image with 'latest' tag
-          docker build . -t ${{ secrets.REGISTRY_LOGIN_SERVER }}/autodesk-agent:latest
-          # Push to your private Azure Registry
-          docker push ${{ secrets.REGISTRY_LOGIN_SERVER }}/autodesk-agent:latest
+          docker build . -t ${{ secrets.REGISTRY_LOGIN_SERVER }}/acc-mcp-server:latest
+          docker push ${{ secrets.REGISTRY_LOGIN_SERVER }}/acc-mcp-server:latest
 
       - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
+        uses: azure/webapps-deploy@84a80cfe7e9889f35148ed88c307e6e93bf02578 # v3
         with:
-          app-name: 'autodesk-agent-prod'  # Ensure this matches your Web App name
+          app-name: 'autodesk-agent-prod'
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          images: '${{ secrets.REGISTRY_LOGIN_SERVER }}/autodesk-agent:latest'
+          images: '${{ secrets.REGISTRY_LOGIN_SERVER }}/acc-mcp-server:latest'
