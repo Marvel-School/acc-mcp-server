@@ -1,10 +1,12 @@
 import os
 import re
 import json  # Used specifically for the get_highlights resource endpoint, not for tool outputs.
+import hmac
 import asyncio
 import hashlib
 import logging
 import pathlib
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
@@ -59,7 +61,8 @@ else:
         "Set this env var to allow MCP clients to connect."
     )
 
-_HIGHLIGHT_STATE: dict[str, dict] = {}
+_HIGHLIGHT_STATE: OrderedDict[str, dict] = OrderedDict()
+_HIGHLIGHT_MAX_ENTRIES = 50
 _COLOR_MAP: dict[str, list[float]] = {
     "red": [1, 0, 0, 1],
     "green": [0, 1, 0, 1],
@@ -499,8 +502,6 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
             return f"Error: Could not resolve '{file_name}' to a valid lineage URN."
 
         version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
-        if not version_urn or not version_urn.startswith("urn:"):
-            return f"Error: Could not resolve lineage URN to a version URN."
 
         result = await asyncio.to_thread(trigger_translation, version_urn)
         errors = result.get("errors") or []
@@ -546,8 +547,6 @@ async def count_elements(hub_name: str, project_name: str, file_name: str, categ
             return f"Error: Could not resolve '{file_name}' to a valid URN."
 
         version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
-        if not version_urn or not version_urn.startswith("urn:"):
-            return f"Error: Could not resolve to a version URN."
 
         count = await asyncio.to_thread(stream_count_elements, version_urn, category_name)
         return f"Found {count} elements matching '{category_name}' (including singular variations)."
@@ -603,22 +602,22 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
         hub_id = await _resolve_hub_id(hub_name)
         hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
-        users = await asyncio.to_thread(get_project_users, project_id)
+        users = await asyncio.to_thread(get_project_users, project_id, 1)
         if not users:
             return f"No users found in project '{resolved_name}' (or insufficient permissions)."
 
         report = f"Project Members ({len(users)}):\n"
-        for u in users[:30]:
+        for u in users:
             name = u.get("name", u.get("email", "Unknown"))
             email = u.get("email", "")
             report += f"- {name} ({email})\n"
 
-        if len(users) > 30:
-            report += f"\n(Showing 30 of {len(users)} users)"
-
         _tw = getattr(users, "truncation_warning", "")
         if _tw:
-            report += f"\n{_tw}"
+            report += (
+                f"\nShowing first 100 users — use check_project_permissions "
+                f"for the full list."
+            )
 
         return report
     except Exception as e:
@@ -827,14 +826,12 @@ async def find_user_projects(user_name: str) -> str:
 
             try:
                 result = await asyncio.to_thread(get_user_projects, account_id, user_name)
-            except Exception as e:
-                logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, e)
+            except ValueError as ve:
+                logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, ve)
                 hub_errors.append(hub_display)
                 continue
-
-            # api.py returns a plain string on endpoint errors (e.g. 404)
-            if isinstance(result, str):
-                logger.warning("find_user_projects: hub '%s' returned error: %s", hub_display, result)
+            except Exception as e:
+                logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, e)
                 hub_errors.append(hub_display)
                 continue
 
@@ -1037,6 +1034,8 @@ async def highlight_elements(urn: str, ids: list[int], color: str = "red") -> st
         return f"Cleared all highlights for model."
 
     rgba = _COLOR_MAP.get(color, _COLOR_MAP["red"])
+    if urn not in _HIGHLIGHT_STATE and len(_HIGHLIGHT_STATE) >= _HIGHLIGHT_MAX_ENTRIES:
+        _HIGHLIGHT_STATE.popitem(last=False)  # evict oldest entry (FIFO)
     _HIGHLIGHT_STATE[urn] = {"ids": ids, "color": rgba}
     return f"Highlighted {len(ids)} element(s) in {color}."
 
@@ -1179,8 +1178,8 @@ if __name__ == "__main__":
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
     from starlette.requests import Request
-    from starlette.responses import PlainTextResponse
-    from starlette.routing import Mount
+    from starlette.responses import PlainTextResponse, JSONResponse
+    from starlette.routing import Mount, Route
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     class APIKeyMiddleware:
@@ -1196,7 +1195,10 @@ if __name__ == "__main__":
             if scope["type"] == "http":
                 request = Request(scope)
                 if not (request.method == "GET" and request.url.path == "/health"):
-                    if request.headers.get("x-api-key") != MCP_API_KEY:
+                    if not hmac.compare_digest(
+                        request.headers.get("x-api-key", "").encode(),
+                        MCP_API_KEY.encode(),
+                    ):
                         response = PlainTextResponse("Unauthorized", status_code=401)
                         await response(scope, receive, send)
                         return
@@ -1205,6 +1207,9 @@ if __name__ == "__main__":
     admin_asgi = admin_mcp.http_app(path="/", transport="streamable-http")
     nav_asgi = nav_mcp.http_app(path="/", transport="streamable-http")
     bim_asgi = bim_mcp.http_app(path="/", transport="streamable-http")
+
+    async def health_check(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "version": "1.0.0"})
 
     @asynccontextmanager
     async def master_lifespan(app):
@@ -1216,6 +1221,7 @@ if __name__ == "__main__":
     master_app = Starlette(
         lifespan=master_lifespan,
         routes=[
+            Route("/health", health_check),
             Mount("/mcp/admin", app=admin_asgi),
             Mount("/mcp/nav", app=nav_asgi),
             Mount("/mcp/bim", app=bim_asgi),

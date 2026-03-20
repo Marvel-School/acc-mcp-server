@@ -14,7 +14,9 @@ import re
 import logging
 import time
 import base64
+import threading
 import requests
+from collections import deque
 from typing import Optional, Dict, Any, List
 from urllib.parse import quote
 
@@ -29,7 +31,10 @@ class ResultList(list):
     Functions with hard pagination caps set ``truncation_warning`` when the
     cap is hit so the LLM knows results may be incomplete.
     """
-    truncation_warning: str = ""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.truncation_warning: str = ""
 
 
 
@@ -76,8 +81,6 @@ def _is_system_folder(folder_name: str) -> bool:
     if not folder_name:
         return False
     if folder_name.startswith(_SYSTEM_FOLDER_PREFIXES):
-        return True
-    if _UUID_RE.fullmatch(folder_name):
         return True
     if _UUID_RE.search(folder_name):
         return True
@@ -133,6 +136,8 @@ def _make_request(
                 wait = int(last_resp.headers.get("Retry-After", 5))
                 logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
                 time.sleep(wait)
+                token = get_token(force_refresh=True)
+                headers["Authorization"] = f"Bearer {token}"
                 last_resp = requests.request(method, url, headers=headers, **kwargs)
                 break
 
@@ -181,34 +186,39 @@ def _get_admin_user_id() -> str:
 _cached_hub_id: Optional[str] = None
 _hub_cache_time: float = 0.0
 _HUB_CACHE_TTL: float = 300.0  # seconds
+_hub_cache_lock = threading.Lock()
 
 
 def _get_hub_id() -> str:
     """Returns the first accessible hub ID with a 5-minute TTL cache.
+
+    Thread-safe: a lock wraps the read-check-write sequence to prevent
+    concurrent callers from both triggering an API request.
 
     Re-fetches from the API when the cache is empty, expired, or was
     populated with None on a previous failed call.  Failures are never
     cached so the next call will retry immediately.
     """
     global _cached_hub_id, _hub_cache_time
-    now = time.monotonic()
-    if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
+    with _hub_cache_lock:
+        now = time.monotonic()
+        if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
+            return _cached_hub_id
+        hubs = get_hubs()
+        if not hubs:
+            raise ValueError(
+                "Could not resolve hub ID \u2014 Autodesk API returned no hubs. "
+                "Check APS credentials and account access."
+            )
+        hub_id = hubs[0].get("id")
+        if not hub_id:
+            raise ValueError(
+                "Could not resolve hub ID \u2014 Autodesk API returned no hubs. "
+                "Check APS credentials and account access."
+            )
+        _cached_hub_id = hub_id
+        _hub_cache_time = now
         return _cached_hub_id
-    hubs = get_hubs()
-    if not hubs:
-        raise ValueError(
-            "Could not resolve hub ID \u2014 Autodesk API returned no hubs. "
-            "Check APS credentials and account access."
-        )
-    hub_id = hubs[0].get("id")
-    if not hub_id:
-        raise ValueError(
-            "Could not resolve hub ID \u2014 Autodesk API returned no hubs. "
-            "Check APS credentials and account access."
-        )
-    _cached_hub_id = hub_id
-    _hub_cache_time = now
-    return _cached_hub_id
 
 
 def get_hubs() -> list:
@@ -403,7 +413,7 @@ def find_design_files(
     if not root_id:
         raise ValueError("No folders found in project")
 
-    queue = [{"id": root_id, "name": "Project Files", "depth": 0}]
+    queue = deque([{"id": root_id, "name": "Project Files", "depth": 0}])
     matching: ResultList = ResultList()
     ext_list = [e.strip().lower() for e in extensions.split(",")]
     max_folders = 50
@@ -411,7 +421,7 @@ def find_design_files(
     scanned = 0
 
     while queue and scanned < max_folders:
-        current = queue.pop(0)
+        current = queue.popleft()
         scanned += 1
 
         logger.info(f"  Scanning {scanned}/{max_folders} (depth {current['depth']}): {current['name']}")
@@ -506,35 +516,37 @@ def resolve_file_to_urn(project_id: str, identifier: str) -> str:
         raise ValueError(f"Error resolving file: {e}")
 
 
-def get_latest_version_urn(project_id: str, item_id: str) -> Optional[str]:
-    """Resolves a lineage URN to its latest version URN via the tip relationship."""
-    try:
-        if "fs.file" in item_id or "version=" in item_id:
-            logger.info(f"Already a version URN: {item_id[:60]}...")
-            return item_id
+def get_latest_version_urn(project_id: str, item_id: str) -> str:
+    """Resolves a lineage URN to its latest version URN via the tip relationship.
 
-        proj_clean = ensure_b_prefix(project_id)
-        item_encoded = encode_urn(item_id)
+    Raises:
+        ValueError: If the version URN cannot be resolved.
+    """
+    if "fs.file" in item_id or "version=" in item_id:
+        logger.info(f"Already a version URN: {item_id[:60]}...")
+        return item_id
 
-        url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/items/{item_encoded}"
-        resp = _make_request("GET", url)
+    proj_clean = ensure_b_prefix(project_id)
+    item_encoded = encode_urn(item_id)
 
-        tip = (
-            resp.json()
-            .get("data", {})
-            .get("relationships", {})
-            .get("tip", {})
-            .get("data", {})
-            .get("id")
-        )
-        if tip:
-            logger.info(f"Resolved to version: {tip[:60]}...")
-        else:
-            logger.warning("No tip version found in item relationships")
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/items/{item_encoded}"
+    resp = _make_request("GET", url)
+
+    tip = (
+        resp.json()
+        .get("data", {})
+        .get("relationships", {})
+        .get("tip", {})
+        .get("data", {})
+        .get("id")
+    )
+    if tip:
+        logger.info(f"Resolved to version: {tip[:60]}...")
         return tip
-    except Exception as e:
-        logger.error(f"Version resolution error: {e}")
-        return None
+
+    raise ValueError(
+        f"No tip version found in item relationships for '{item_id[:60]}'"
+    )
 
 
 def inspect_generic_file(project_id: str, file_id: str) -> str:
@@ -552,13 +564,12 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
 
         if "lineage" in resolved:
             version_urn = get_latest_version_urn(project_id, resolved)
-            if not version_urn:
-                return "Error: Could not resolve lineage URN to version URN."
         elif "fs.file" in resolved or "version=" in resolved:
             version_urn = resolved
         else:
-            version_urn = get_latest_version_urn(project_id, resolved)
-            if not version_urn:
+            try:
+                version_urn = get_latest_version_urn(project_id, resolved)
+            except ValueError:
                 version_urn = resolved
 
         encoded = safe_b64encode(version_urn)
@@ -718,9 +729,9 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     return resp.json()
 
 
-def get_project_users(project_id: str) -> list:
-    """List users in a project (requires Admin). Paginates up to 10 pages
-    (100 users/page = 1 000 users max), matching get_project_user_permissions.
+def get_project_users(project_id: str, max_pages: int = 10) -> list:
+    """List users in a project (requires Admin). Paginates up to *max_pages* pages
+    (100 users/page), matching get_project_user_permissions.
 
     Names are sanitized — ACC sometimes appends autodeskId directly onto the
     name field (e.g. "Maxine Bruil0c1e0b3b-..."). Both standard UUID and
@@ -734,10 +745,9 @@ def get_project_users(project_id: str) -> list:
 
     all_users: ResultList = ResultList()
     url: Optional[str] = endpoint
-    max_pages = 10
 
     _hit_cap = True
-    for _ in range(max_pages):  # safety cap — 10 pages × 100 = 1 000 users max
+    for _ in range(max_pages):  # safety cap
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
 
@@ -976,7 +986,7 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
     return result, skipped_projects
 
 
-def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
+def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
     """
     Resolves a user by display name or email and returns every project they
     have access to within the account.
@@ -1123,11 +1133,11 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
         logger.warning(
             f"[UserProjects] Could not fetch projects for id={target_uid}: {api_err}"
         )
-        return (
+        raise ValueError(
             f"User found (ID: {target_uid}), but Autodesk returned an error when "
             f"fetching their projects. They may not have any assigned projects, "
             f"or API access is restricted."
-        )
+        ) from api_err
 
 
 def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> dict:
