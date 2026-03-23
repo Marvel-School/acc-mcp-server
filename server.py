@@ -968,6 +968,13 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
     is automatic. Only folders are copied, not files. Folders that already
     exist in the destination are skipped (no duplicates).
 
+    If a project name exists in multiple hubs, resolution will fail with an
+    ambiguity error listing the candidates. In that case, ask the user to
+    confirm which hub they mean and use find_project to verify first.
+
+    The completion message always shows the resolved hub for both source
+    and destination so the user can verify the correct projects were used.
+
     Args:
         hub_name:             The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         source_project_name:  Name of the template project to copy FROM.
@@ -996,8 +1003,8 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
 
             return (
                 f"\u2705 Folder structure copied successfully.\n"
-                f"Source: {src_name} ({src_hub_name})\n"
-                f"Destination: {dst_name} ({dst_hub_name})\n"
+                f"Source: {src_name} (hub: {src_hub_name})\n"
+                f"Destination: {dst_name} (hub: {dst_hub_name})\n"
                 f"Folders created: {count}\n\n"
                 f"If some folders already existed they were skipped."
             )
@@ -1373,4 +1380,10 @@ if __name__ == "__main__":
     logger.info(f"  Admin:     http://0.0.0.0:{PORT}/mcp/admin")
     logger.info(f"  Navigator: http://0.0.0.0:{PORT}/mcp/nav")
     logger.info(f"  BIM:       http://0.0.0.0:{PORT}/mcp/bim")
-    uvicorn.run(master_app, host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        master_app,
+        host="0.0.0.0",
+        port=PORT,
+        log_config=None,
+        access_log=True,
+    )

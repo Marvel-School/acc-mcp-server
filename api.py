@@ -87,18 +87,33 @@ _SYSTEM_FOLDER_PREFIXES = (
     "VIRTUAL_ROOT_FOLDER",
 )
 
+# ACC platform folders auto-created for every project — not user content.
+_ACC_DEFAULT_FOLDERS = {
+    "photos",
+    "projecttb",
+    "plans",
+    "submittals",
+    "rfis",
+    "issues",
+    "cost",
+    "schedule",
+}
+
 
 def _is_system_folder(folder_name: str) -> bool:
     """Return True if *folder_name* is an Autodesk internal system folder.
 
     Matches:
     - Known system prefixes (quantification_, issue_, COST Root Folder, …)
+    - ACC platform default folders (Photos, Plans, Issues, …)
     - Names that are purely a UUID
     - Names that contain a UUID suffix after an underscore or hyphen
     """
     if not folder_name:
         return False
     if folder_name.startswith(_SYSTEM_FOLDER_PREFIXES):
+        return True
+    if folder_name.lower().strip() in _ACC_DEFAULT_FOLDERS:
         return True
     if _UUID_RE.search(folder_name):
         return True
