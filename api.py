@@ -17,12 +17,15 @@ import base64
 import threading
 import requests
 from collections import deque
-from typing import Optional, Dict, Any
+from typing import Optional, Any
 from urllib.parse import quote
 
 from auth import get_token
 
 logger = logging.getLogger(__name__)
+
+# Concurrency limiter — caps parallel Autodesk API calls across all threads.
+_api_semaphore = threading.Semaphore(10)
 
 # ---------------------------------------------------------------------------
 # Shared numeric constants — replaces inline magic numbers throughout.
@@ -114,7 +117,7 @@ def _make_request(
     method: str,
     url: str,
     *,
-    extra_headers: Optional[Dict] = None,
+    extra_headers: Optional[dict] = None,
     retry_on_401: bool = True,
     **kwargs,
 ) -> requests.Response:
@@ -127,6 +130,10 @@ def _make_request(
       - 15 s default timeout (callers can override)
       - One retry on 401 (token refresh)
       - One retry on 429 (respects Retry-After header)
+      - One retry on 5xx (500/502/503/504) with 2 s backoff
+
+    All HTTP calls are gated by ``_api_semaphore`` (max 10 concurrent)
+    to prevent a thundering herd against the Autodesk API.
 
     Raises:
         ValueError: On any 4xx/5xx response (with Autodesk error detail).
@@ -145,17 +152,30 @@ def _make_request(
             if extra_headers:
                 headers.update(extra_headers)
 
-            last_resp = requests.request(method, url, headers=headers, **kwargs)
+            with _api_semaphore:
+                last_resp = requests.request(method, url, headers=headers, **kwargs)
 
+            # --- 429 rate limit retry ---
             if last_resp.status_code == 429:
                 wait = int(last_resp.headers.get("Retry-After", 5))
                 logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
                 time.sleep(wait)
                 token = get_token(force_refresh=True)
                 headers["Authorization"] = f"Bearer {token}"
-                last_resp = requests.request(method, url, headers=headers, **kwargs)
+                with _api_semaphore:
+                    last_resp = requests.request(method, url, headers=headers, **kwargs)
                 break
 
+            # --- 5xx server error retry (one attempt, 2 s backoff) ---
+            if last_resp.status_code in (500, 502, 503, 504) and attempt == 0:
+                logger.warning(
+                    "Autodesk API returned %d on %s %s — retrying in 2s",
+                    last_resp.status_code, method, url[:80],
+                )
+                time.sleep(2)
+                continue
+
+            # --- 401 stale token retry ---
             if last_resp.status_code == 401 and attempt == 0 and retry_on_401:
                 logger.warning(f"401 on {method} {url[:80]} — refreshing token")
                 continue
@@ -240,7 +260,7 @@ def _get_hub_id() -> str:
         return _cached_hub_id
 
 
-def get_hubs() -> list[Dict[str, Any]]:
+def get_hubs() -> list[dict[str, Any]]:
     """Fetches all accessible Hubs (BIM 360 / ACC)."""
     resp = _make_request("GET", "https://developer.api.autodesk.com/project/v1/hubs")
     return resp.json().get("data", [])
@@ -250,26 +270,23 @@ def get_projects(
     hub_id: str,
     limit: int = 50,
     fields: Optional[list] = None,
-    cache_bust: bool = False,
 ) -> ResultList:
     """List all projects in a hub (follows pagination automatically).
 
     Results are cached for 5 minutes per hub to avoid redundant API calls
     (e.g. when ``find_project_globally`` iterates over multiple hubs).
-    Pass ``cache_bust=True`` to force a fresh fetch (e.g. after creating
-    a project).
+    Use ``invalidate_project_cache()`` to evict a specific hub's entry.
 
     Args:
-        hub_id:     Hub ID (starts with 'b.').
-        limit:      Max projects per page (default 50, max 100 per Autodesk API).
-        fields:     Optional list of extra fields to include (e.g. ["status", "projectValue"]).
-        cache_bust: If True, bypass the cache and fetch fresh data.
+        hub_id: Hub ID (starts with 'b.').
+        limit:  Max projects per page (default 50, max 100 per Autodesk API).
+        fields: Optional list of extra fields to include (e.g. ["status", "projectValue"]).
     """
     hub_id = ensure_b_prefix(hub_id)
 
     # --- Check cache (only when no custom fields are requested) ---
     use_cache = fields is None or fields == []
-    if use_cache and not cache_bust:
+    if use_cache:
         with _project_cache_lock:
             cached = _project_cache.get(hub_id)
             if cached is not None:
@@ -316,6 +333,17 @@ def get_projects(
             _project_cache[hub_id] = (all_projects, time.monotonic())
 
     return all_projects
+
+
+def invalidate_project_cache(hub_id: str) -> None:
+    """Evict the project-list cache entry for a hub.
+
+    Pops both the raw and b.-prefixed key variants to be safe.
+    """
+    prefixed = ensure_b_prefix(hub_id)
+    with _project_cache_lock:
+        _project_cache.pop(prefixed, None)
+        _project_cache.pop(hub_id, None)
 
 
 _GlobalMatches = tuple[list[tuple[str, str, str, str]], list[tuple[str, str, str, str]]]
@@ -366,7 +394,7 @@ def find_project_globally(name_query: str) -> _GlobalMatches:
 
 
 
-def get_top_folders(hub_id: str, project_id: str) -> list[Dict[str, Any]]:
+def get_top_folders(hub_id: str, project_id: str) -> list[dict[str, Any]]:
     """Fetches top-level folders for a project."""
     hub_clean = ensure_b_prefix(hub_id)
     proj_clean = ensure_b_prefix(project_id)
@@ -392,7 +420,7 @@ def get_top_folders(hub_id: str, project_id: str) -> list[Dict[str, Any]]:
     return filtered
 
 
-def get_folder_contents(project_id: str, folder_id: str) -> list[Dict[str, Any]]:
+def get_folder_contents(project_id: str, folder_id: str) -> list[dict[str, Any]]:
     """Fetches contents of a folder with tip-version URN extraction for files."""
     proj_clean = ensure_b_prefix(project_id)
     folder_encoded = encode_urn(folder_id)
@@ -774,8 +802,8 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
     resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
     logger.info("Project creation API responded successfully.")
 
-    # Invalidate the project-list cache so the new project appears immediately.
-    get_projects(hub_id, cache_bust=True)
+    # Invalidate the project-list cache so the new project appears on next fetch.
+    invalidate_project_cache(hub_id)
 
     return resp.json()
 
@@ -942,7 +970,7 @@ def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -
     projects = all_hub_projects[:max_projects]
     logger.info(f"[Hub Audit] Scanning {len(projects)} projects in hub {hub_id}")
 
-    user_map: Dict[str, Dict[str, Any]] = {}
+    user_map: dict[str, dict[str, Any]] = {}
 
     skipped_projects: list[str] = []
     warnings: list[str] = []

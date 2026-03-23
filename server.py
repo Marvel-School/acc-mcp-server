@@ -2,12 +2,15 @@ import os
 import re
 import json
 import hmac
+import uuid
 import asyncio
 import hashlib
 import logging
 import pathlib
+import contextvars
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from pythonjsonlogger.json import JsonFormatter
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
 from auth import get_token, get_viewer_token
@@ -33,13 +36,43 @@ from api import (
     safe_b64encode,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# --- Request correlation ID (ContextVar) ------------------------------------
+_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="-"
+)
+
+
+class _RequestIdFilter(logging.Filter):
+    """Injects the current request_id into every log record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id.get("-")  # type: ignore[attr-defined]
+        return True
+
+
+# --- Structured JSON logging ------------------------------------------------
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(
+    JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(request_id)s %(message)s",
+        rename_fields={"asctime": "timestamp", "levelname": "level"},
+    )
+)
+_log_handler.addFilter(_RequestIdFilter())
+
+logging.root.handlers.clear()
+logging.root.addHandler(_log_handler)
+logging.root.setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 admin_mcp = FastMCP("ACC_Admin")
 nav_mcp = FastMCP("ACC_Navigator")
 bim_mcp = FastMCP("ACC_BIM")
 PORT = int(os.environ.get("WEBSITES_PORT") or os.environ.get("PORT") or 8000)
+
+# Concurrency limiter — caps parallel tool invocations across all clients.
+_tool_semaphore = asyncio.Semaphore(5)
 
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip()
 if not MCP_API_KEY:
@@ -70,6 +103,20 @@ _COLOR_MAP: dict[str, list[float]] = {
     "yellow": [1, 1, 0, 1],
     "orange": [1, 0.5, 0, 1],
     "clear": [0, 0, 0, 0],
+}
+
+# Used by _format_permissions_report to filter UUID-only role names
+_PERM_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+# Used by _format_permissions_report to map access levels to display labels
+_LEVEL_LABEL = {
+    "projectAdmin": "Project Admin",
+    "projectMember": "Project Member",
+    "executive": "Executive",
+    "projectController": "Project Controller",
 }
 
 
@@ -277,76 +324,82 @@ async def find_project(name_query: str) -> str:
     """
     Search for an ACC/BIM 360 project by name across ALL accessible hubs.
 
-    Use this FIRST to obtain a project_id before calling any other tool.
+    Use this to verify a project exists and discover which hub it belongs to.
+    Other tools accept a project name directly, so calling this first is
+    optional but useful when the exact name or hub is unknown.
     The search is case-insensitive and matches substrings.
 
     Args:
         name_query: Full or partial project name (e.g. "Marvel", "Grasbaan").
 
     Returns:
-        Project name, project_id, and hub_id on success; error message otherwise.
+        Project name, project ID, and hub name on success; error message
+        otherwise. When multiple projects match, lists all candidates.
     """
-    try:
-        exact, substring = await asyncio.to_thread(find_project_globally, name_query)
+    async with _tool_semaphore:
+        try:
+            exact, substring = await asyncio.to_thread(find_project_globally, name_query)
 
-        # Prefer exact matches; fall back to substring only when no exact match
-        effective = exact or substring
-        match_type = "exact" if exact else "substring"
+            # Prefer exact matches; fall back to substring only when no exact match
+            effective = exact or substring
+            match_type = "exact" if exact else "substring"
 
-        if not effective:
-            hubs = await asyncio.to_thread(get_hubs)
-            hub_names = [h.get("attributes", {}).get("name", "?") for h in hubs]
-            return (
-                f"No project found matching '{name_query}' in any accessible hub.\n"
-                f"Searched hubs: {', '.join(hub_names) if hub_names else '(none)'}"
-            )
+            if not effective:
+                hubs = await asyncio.to_thread(get_hubs)
+                hub_names = [h.get("attributes", {}).get("name", "?") for h in hubs]
+                return (
+                    f"No project found matching '{name_query}' in any accessible hub.\n"
+                    f"Searched hubs: {', '.join(hub_names) if hub_names else '(none)'}"
+                )
 
-        if len(effective) == 1:
-            hub_id, hub_name, project_id, project_name = effective[0]
-            return (
-                f"Found Project ({match_type} match):\n"
-                f"  Name:       {project_name}\n"
-                f"  Project ID: {project_id}\n"
-                f"  Hub:        {hub_name} ({hub_id})\n\n"
-                f"You can now use this project name with other tools."
-            )
+            if len(effective) == 1:
+                hub_id, hub_name, project_id, project_name = effective[0]
+                return (
+                    f"Found Project ({match_type} match):\n"
+                    f"  Name:       {project_name}\n"
+                    f"  Project ID: {project_id}\n"
+                    f"  Hub:        {hub_name} ({hub_id})\n\n"
+                    f"You can now use this project name with other tools."
+                )
 
-        # Multiple matches — list them all so the user can pick.
-        lines = [f"Found {len(effective)} projects matching '{name_query}' ({match_type}):\n"]
-        for hub_id, hub_name, project_id, project_name in effective:
-            lines.append(
-                f"  - {project_name} (id: {project_id}) — hub: {hub_name}"
-            )
-        lines.append("\nPlease use the exact project name to narrow down.")
-        return "\n".join(lines)
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"find_project failed: {e}")
-        return f"Failed to search for project: {e}"
+            # Multiple matches — list them all so the user can pick.
+            lines = [f"Found {len(effective)} projects matching '{name_query}' ({match_type}):\n"]
+            for hub_id, hub_name, project_id, project_name in effective:
+                lines.append(
+                    f"  - {project_name} (id: {project_id}) — hub: {hub_name}"
+                )
+            lines.append("\nPlease use the exact project name to narrow down.")
+            return "\n".join(lines)
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"find_project failed: {e}")
+            return f"Failed to search for project: {e}"
 
 
 @nav_mcp.tool()
 async def list_hubs() -> str:
     """
     Lists all Autodesk Hubs (BIM 360 / ACC) accessible to the service account.
-    Use this to find the hub_id needed for list_projects or create_project.
+    Use this to find the hub name needed for list_projects, create_project,
+    and other hub-scoped tools.
     """
-    try:
-        hubs = await asyncio.to_thread(get_hubs)
-        if not hubs:
-            return "No hubs found. Check your Autodesk account permissions."
+    async with _tool_semaphore:
+        try:
+            hubs = await asyncio.to_thread(get_hubs)
+            if not hubs:
+                return "No hubs found. Check your Autodesk account permissions."
 
-        report = "Found Hubs:\n"
-        for hub in hubs:
-            name = hub.get("attributes", {}).get("name", "Unknown")
-            report += f"- {name}\n"
-        return report
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"list_hubs failed: {e}")
-        return f"Failed to list hubs: {e}"
+            report = "Found Hubs:\n"
+            for hub in hubs:
+                name = hub.get("attributes", {}).get("name", "Unknown")
+                report += f"- {name}\n"
+            return report
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"list_hubs failed: {e}")
+            return f"Failed to list hubs: {e}"
 
 
 @nav_mcp.tool()
@@ -361,35 +414,36 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
         hub_name: The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         fields:   Comma-separated extra fields (optional). Leave empty for default view.
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
 
-        field_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
-        projects = await asyncio.to_thread(get_projects, hub_id, 50, field_list)
-        if not projects:
-            return f"No projects found in hub '{hub_name}'."
+            field_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
+            projects = await asyncio.to_thread(get_projects, hub_id, 50, field_list)
+            if not projects:
+                return f"No projects found in hub '{hub_name}'."
 
-        report = f"Found {len(projects)} Projects:\n"
-        for p in projects:
-            attrs = p.get("attributes", {})
-            name = attrs.get("name", "Unknown")
-            report += f"- {name}\n"
+            report = f"Found {len(projects)} Projects:\n"
+            for p in projects:
+                attrs = p.get("attributes", {})
+                name = attrs.get("name", "Unknown")
+                report += f"- {name}\n"
 
-            for key in (field_list or []):
-                val = attrs.get(key)
-                if val is not None:
-                    report += f"    {key}: {val}\n"
+                for key in (field_list or []):
+                    val = attrs.get(key)
+                    if val is not None:
+                        report += f"    {key}: {val}\n"
 
-        _tw = getattr(projects, "truncation_warning", "")
-        if _tw:
-            report += f"\n{_tw}"
+            _tw = getattr(projects, "truncation_warning", "")
+            if _tw:
+                report += f"\n{_tw}"
 
-        return report
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"list_projects failed: {e}")
-        return f"Failed to list projects: {e}"
+            return report
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"list_projects failed: {e}")
+            return f"Failed to list projects: {e}"
 
 
 
@@ -403,26 +457,27 @@ async def list_top_folders(hub_name: str, project_name: str) -> str:
         hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
-        folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
-        if not folders:
-            return "No top-level folders found."
+            folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
+            if not folders:
+                return "No top-level folders found."
 
-        report = "Top Folders:\n"
-        for f in folders:
-            name = f.get("name") or f.get("attributes", {}).get("displayName", "Unknown")
-            fid = f.get("id") or ""
-            fid_display = f"...{fid[-12:]}" if len(fid) > 12 else fid
-            report += f"- {name} (ID: {fid_display})\n"
-        return report
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"list_top_folders failed: {e}")
-        return f"Failed to list folders: {e}"
+            report = "Top Folders:\n"
+            for f in folders:
+                name = f.get("name") or f.get("attributes", {}).get("displayName", "Unknown")
+                fid = f.get("id") or ""
+                fid_display = f"...{fid[-12:]}" if len(fid) > 12 else fid
+                report += f"- {name} (ID: {fid_display})\n"
+            return report
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"list_top_folders failed: {e}")
+            return f"Failed to list folders: {e}"
 
 
 @nav_mcp.tool()
@@ -436,29 +491,30 @@ async def list_folder_contents(hub_name: str, project_name: str, folder_name: st
         project_name: The Project name (e.g. "Grasbaan").
         folder_name:  The top-level folder name (e.g. "Project Files"). Defaults to "Project Files".
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
-        folder_id = await _resolve_folder_id(hub_id, project_id, folder_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+            folder_id = await _resolve_folder_id(hub_id, project_id, folder_name)
 
-        items = await asyncio.to_thread(get_folder_contents, project_id, folder_id)
-        if not items:
-            return "Folder is empty."
+            items = await asyncio.to_thread(get_folder_contents, project_id, folder_id)
+            if not items:
+                return "Folder is empty."
 
-        report = f"Folder Contents ({len(items)} items):\n"
-        for item in items:
-            name = item.get("name") or item.get("attributes", {}).get("displayName", "Unknown")
-            iid = item.get("id") or ""
-            iid_display = f"...{iid[-12:]}" if len(iid) > 12 else iid
-            item_type = item.get("itemType") or item.get("type", "unknown")
-            icon = "[folder]" if item_type in ("folder", "folders") else "[file]"
-            report += f"  {icon} {name} (ID: {iid_display})\n"
-        return report
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"list_folder_contents failed: {e}")
-        return f"Failed to list folder contents: {e}"
+            report = f"Folder Contents ({len(items)} items):\n"
+            for item in items:
+                name = item.get("name") or item.get("attributes", {}).get("displayName", "Unknown")
+                iid = item.get("id") or ""
+                iid_display = f"...{iid[-12:]}" if len(iid) > 12 else iid
+                item_type = item.get("itemType") or item.get("type", "unknown")
+                icon = "[folder]" if item_type in ("folder", "folders") else "[file]"
+                report += f"  {icon} {name} (ID: {iid_display})\n"
+            return report
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"list_folder_contents failed: {e}")
+            return f"Failed to list folder contents: {e}"
 
 
 @bim_mcp.tool()
@@ -473,16 +529,17 @@ async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
         project_name: The Project name (e.g. "Grasbaan").
         file_name:    Filename (e.g. "MyFile.rvt").
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
-        return await asyncio.to_thread(inspect_generic_file, project_id, file_name)
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"inspect_file failed: {e}")
-        return f"Failed to inspect file: {e}"
+            return await asyncio.to_thread(inspect_generic_file, project_id, file_name)
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"inspect_file failed: {e}")
+            return f"Failed to inspect file: {e}"
 
 
 
@@ -501,36 +558,37 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
 
     Note: Translation typically takes 5-10 minutes. Use inspect_file to check progress.
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
-        lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
-        if not lineage_urn or not lineage_urn.startswith("urn:"):
-            return f"Error: Could not resolve '{file_name}' to a valid lineage URN."
+            lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
+            if not lineage_urn or not lineage_urn.startswith("urn:"):
+                return f"Error: Could not resolve '{file_name}' to a valid lineage URN."
 
-        version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
+            version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
 
-        result = await asyncio.to_thread(trigger_translation, version_urn)
-        errors = result.get("errors") or []
-        if errors:
-            error_detail = "; ".join(
-                e.get("detail", str(e)) if isinstance(e, dict) else str(e)
-                for e in errors
+            result = await asyncio.to_thread(trigger_translation, version_urn)
+            errors = result.get("errors") or []
+            if errors:
+                error_detail = "; ".join(
+                    e.get("detail", str(e)) if isinstance(e, dict) else str(e)
+                    for e in errors
+                )
+                logger.error(f"reprocess_file: Autodesk returned errors: {error_detail}")
+                return f"Translation request was rejected by Autodesk: {error_detail}"
+
+            status = result.get("result", "unknown")
+            return (
+                f"\u2705 Translation job started for '{file_name}' (status: {status}).\n"
+                f"Please wait 5-10 minutes, then use inspect_file or count_elements to verify."
             )
-            logger.error(f"reprocess_file: Autodesk returned errors: {error_detail}")
-            return f"Translation request was rejected by Autodesk: {error_detail}"
-
-        status = result.get("result", "unknown")
-        return (
-            f"\u2705 Translation job started for '{file_name}' (status: {status}).\n"
-            f"Please wait 5-10 minutes, then use inspect_file or count_elements to verify."
-        )
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"reprocess_file failed: {e}")
-        return f"Failed to trigger reprocessing: {e}"
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"reprocess_file failed: {e}")
+            return f"Failed to trigger reprocessing: {e}"
 
 
 @bim_mcp.tool()
@@ -548,23 +606,24 @@ async def count_elements(hub_name: str, project_name: str, file_name: str, categ
         file_name:     Filename (e.g. "MyFile.rvt").
         category_name: Category to count (e.g. "Walls", "Doors", "Windows", "Floors").
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
-        lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
-        if not lineage_urn or not lineage_urn.startswith("urn:"):
-            return f"Error: Could not resolve '{file_name}' to a valid URN."
+            lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
+            if not lineage_urn or not lineage_urn.startswith("urn:"):
+                return f"Error: Could not resolve '{file_name}' to a valid URN."
 
-        version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
+            version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
 
-        count = await asyncio.to_thread(stream_count_elements, version_urn, category_name)
-        return f"Found {count} elements matching '{category_name}' (including singular variations)."
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"count_elements failed: {e}")
-        return f"Failed to count elements: {e}"
+            count = await asyncio.to_thread(stream_count_elements, version_urn, category_name)
+            return f"Found {count} elements matching '{category_name}' (including singular variations)."
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"count_elements failed: {e}")
+            return f"Failed to count elements: {e}"
 
 
 
@@ -578,21 +637,22 @@ async def create_project(hub_name: str, name: str, project_type: str = "ACC") ->
         name:         The name of the new project.
         project_type: 'ACC' or 'BIM360' (Default: ACC).
     """
-    try:
-        real_hub_id = await _resolve_hub_id(hub_name)
+    async with _tool_semaphore:
+        try:
+            real_hub_id = await _resolve_hub_id(hub_name)
 
-        result = await asyncio.to_thread(create_acc_project, real_hub_id, name, project_type)
-        new_id = result.get("id") or result.get("projectId")
+            result = await asyncio.to_thread(create_acc_project, real_hub_id, name, project_type)
+            new_id = result.get("id") or result.get("projectId")
 
-        if new_id:
-            return f"\u2705 Project '{name}' created successfully. Project ID: {new_id}"
-        else:
-            return "API succeeded, but couldn't parse the new Project ID from the response."
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"create_project failed: {e}")
-        return f"Failed to create project: {e}"
+            if new_id:
+                return f"\u2705 Project '{name}' created successfully. Project ID: {new_id}"
+            else:
+                return "API succeeded, but couldn't parse the new Project ID from the response."
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"create_project failed: {e}")
+            return f"Failed to create project: {e}"
 
 
 @admin_mcp.tool()
@@ -604,33 +664,34 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
         hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
-        users = await asyncio.to_thread(get_project_users, project_id, 1)
-        if not users:
-            return f"No users found in project '{resolved_name}' (or insufficient permissions)."
+            users = await asyncio.to_thread(get_project_users, project_id, 1)
+            if not users:
+                return f"No users found in project '{resolved_name}' (or insufficient permissions)."
 
-        report = f"Project Members ({len(users)}):\n"
-        for u in users:
-            name = u.get("name", u.get("email", "Unknown"))
-            email = u.get("email", "")
-            report += f"- {name} ({email})\n"
+            report = f"Project Members ({len(users)}):\n"
+            for u in users:
+                name = u.get("name", u.get("email", "Unknown"))
+                email = u.get("email", "")
+                report += f"- {name} ({email})\n"
 
-        _tw = getattr(users, "truncation_warning", "")
-        if _tw:
-            report += (
-                f"\nShowing first 100 users — use check_project_permissions "
-                f"for the full list."
-            )
+            _tw = getattr(users, "truncation_warning", "")
+            if _tw:
+                report += (
+                    f"\nShowing first 100 users — use check_project_permissions "
+                    f"for the full list."
+                )
 
-        return report
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"list_project_users failed: {e}")
-        return f"Failed to list project users: {e}"
+            return report
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"list_project_users failed: {e}")
+            return f"Failed to list project users: {e}"
 
 
 @admin_mcp.tool()
@@ -643,17 +704,18 @@ async def add_user(hub_name: str, project_name: str, email: str) -> str:
         project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
         email:        The user's email address.
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
-        await asyncio.to_thread(add_project_user, project_id, email, ["docs"])
-        return f"\u2705 User '{email}' added to project '{resolved_name}'."
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"add_user failed: {e}")
-        return f"Failed to add user: {e}"
+            await asyncio.to_thread(add_project_user, project_id, email, ["docs"])
+            return f"\u2705 User '{email}' added to project '{resolved_name}'."
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"add_user failed: {e}")
+            return f"Failed to add user: {e}"
 
 
 @admin_mcp.tool()
@@ -665,54 +727,42 @@ async def audit_hub_users(hub_name: str) -> str:
     Args:
         hub_name: The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
 
-        users, skipped = await asyncio.to_thread(get_all_hub_users, hub_id)
-        if not users and not skipped:
-            return f"No users found across projects in hub '{hub_name}'."
+            users, skipped = await asyncio.to_thread(get_all_hub_users, hub_id)
+            if not users and not skipped:
+                return f"No users found across projects in hub '{hub_name}'."
 
-        MAX_USERS = 100
-        truncated = len(users) > MAX_USERS
-        display_users = users[:MAX_USERS]
+            MAX_USERS = 100
+            truncated = len(users) > MAX_USERS
+            display_users = users[:MAX_USERS]
 
-        report = f"Hub User Audit ({len(users)} unique users):\n\n"
-        for u in display_users:
-            products = ", ".join(u["products"]) if u["products"] else "none"
-            report += f"- {u['name']} ({u['email']})\n    Products: {products}\n"
+            report = f"Hub User Audit ({len(users)} unique users):\n\n"
+            for u in display_users:
+                products = ", ".join(u["products"]) if u["products"] else "none"
+                report += f"- {u['name']} ({u['email']})\n    Products: {products}\n"
 
-        if truncated:
-            report += f"\n\u26a0\ufe0f Showing first {MAX_USERS} of {len(users)} users. Use a more specific query to narrow results."
+            if truncated:
+                report += f"\n\u26a0\ufe0f Showing first {MAX_USERS} of {len(users)} users. Use a more specific query to narrow results."
 
-        if skipped:
-            report += (
-                f"\n\n\u26a0\ufe0f NOTE: {len(skipped)} project(s) were skipped due to permission errors: "
-                + ", ".join(skipped)
-            )
+            if skipped:
+                report += (
+                    f"\n\n\u26a0\ufe0f NOTE: {len(skipped)} project(s) were skipped due to permission errors: "
+                    + ", ".join(skipped)
+                )
 
-        _tw = getattr(users, "truncation_warning", "")
-        if _tw:
-            report += f"\n\n{_tw}"
+            _tw = getattr(users, "truncation_warning", "")
+            if _tw:
+                report += f"\n\n{_tw}"
 
-        return report
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"audit_hub_users failed: {e}")
-        return f"Failed to audit hub users: {e}"
-
-
-_PERM_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-
-_LEVEL_LABEL = {
-    "projectAdmin": "Project Admin",
-    "projectMember": "Project Member",
-    "executive": "Executive",
-    "projectController": "Project Controller",
-}
+            return report
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"audit_hub_users failed: {e}")
+            return f"Failed to audit hub users: {e}"
 
 
 def _format_permissions_report(raw_users: list, project_name: str) -> str:
@@ -793,24 +843,25 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
         hub_name:     Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         project_name: Project name (exact or close match, case-insensitive).
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
-        users = await asyncio.to_thread(get_project_user_permissions, project_id)
-        if not users:
-            return (
-                f"No users found for project '{resolved_name}' "
-                f"(or insufficient admin permissions)."
-            )
+            users = await asyncio.to_thread(get_project_user_permissions, project_id)
+            if not users:
+                return (
+                    f"No users found for project '{resolved_name}' "
+                    f"(or insufficient admin permissions)."
+                )
 
-        return _format_permissions_report(users, resolved_name)
+            return _format_permissions_report(users, resolved_name)
 
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"check_project_permissions failed: {e}")
-        return f"Failed to check permissions: {e}"
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"check_project_permissions failed: {e}")
+            return f"Failed to check permissions: {e}"
 
 
 @admin_mcp.tool()
@@ -823,85 +874,88 @@ async def find_user_projects(user_name: str) -> str:
     case-insensitive) or exact email address. Results are fetched live
     from ACC on every call (never cached).
 
+    Output is grouped by hub with per-hub counts and a cross-hub total.
+
     Args:
         user_name: User's full name (or part of it) or their email address.
     """
-    try:
-        hubs = await asyncio.to_thread(get_hubs)
-        if not hubs:
-            return "No hubs found. Check your Autodesk account permissions."
+    async with _tool_semaphore:
+        try:
+            hubs = await asyncio.to_thread(get_hubs)
+            if not hubs:
+                return "No hubs found. Check your Autodesk account permissions."
 
-        # Build (account_id, hub_display) pairs for valid hubs.
-        hub_pairs: list[tuple[str, str]] = []
-        for hub in hubs:
-            hub_id = hub.get("id")
-            hub_display = hub.get("attributes", {}).get("name", "Unknown")
-            if not hub_id:
-                continue
-            account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
-            hub_pairs.append((account_id, hub_display))
+            # Build (account_id, hub_display) pairs for valid hubs.
+            hub_pairs: list[tuple[str, str]] = []
+            for hub in hubs:
+                hub_id = hub.get("id")
+                hub_display = hub.get("attributes", {}).get("name", "Unknown")
+                if not hub_id:
+                    continue
+                account_id = hub_id[2:] if hub_id.startswith("b.") else hub_id
+                hub_pairs.append((account_id, hub_display))
 
-        # Query all hubs in parallel.
-        tasks = [
-            asyncio.to_thread(get_user_projects, account_id, user_name)
-            for account_id, _ in hub_pairs
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Query all hubs in parallel.
+            tasks = [
+                asyncio.to_thread(get_user_projects, account_id, user_name)
+                for account_id, _ in hub_pairs
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        lines: list[str] = []
-        total_projects = 0
-        display_name = None
-        email = None
-        hub_errors: list[str] = []
+            lines: list[str] = []
+            total_projects = 0
+            display_name = None
+            email = None
+            hub_errors: list[str] = []
 
-        for (account_id, hub_display), result in zip(hub_pairs, results):
-            if isinstance(result, Exception):
-                logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, result)
-                hub_errors.append(hub_display)
-                continue
+            for (account_id, hub_display), result in zip(hub_pairs, results):
+                if isinstance(result, Exception):
+                    logger.warning("find_user_projects: hub '%s' failed: %s", hub_display, result)
+                    hub_errors.append(hub_display)
+                    continue
 
-            # Capture user identity from the first successful result
+                # Capture user identity from the first successful result
+                if display_name is None:
+                    display_name = result["user_name"]
+                    email = result["user_email"]
+
+                projects = result["projects"]
+                if not projects:
+                    continue
+
+                total_projects += len(projects)
+                lines.append(f"\n**Hub: {hub_display}** ({len(projects)} projects)")
+                for p in projects:
+                    lines.append(f"* {p['name']} (Role: {p['role']})")
+
+                _tw = result.get("warning", "")
+                if _tw:
+                    lines.append(_tw)
+
             if display_name is None:
-                display_name = result["user_name"]
-                email = result["user_email"]
+                return f"User '{user_name}' not found in any accessible hub."
 
-            projects = result["projects"]
-            if not projects:
-                continue
+            header = f"**User**: {display_name}"
+            if email:
+                header += f"\n**Email**: {email}"
+            header += f"\n**Total projects across all hubs**: {total_projects}"
 
-            total_projects += len(projects)
-            lines.append(f"\n**Hub: {hub_display}** ({len(projects)} projects)")
-            for p in projects:
-                lines.append(f"* {p['name']} (Role: {p['role']})")
+            if hub_errors:
+                header += (
+                    f"\n\n\u26a0\ufe0f Could not search {len(hub_errors)} hub(s): "
+                    + ", ".join(hub_errors)
+                )
 
-            _tw = result.get("warning", "")
-            if _tw:
-                lines.append(_tw)
+            if total_projects == 0:
+                return header + "\n\nNo project assignments found (or insufficient admin permissions)."
 
-        if display_name is None:
-            return f"User '{user_name}' not found in any accessible hub."
+            return header + "\n" + "\n".join(lines)
 
-        header = f"**User**: {display_name}"
-        if email:
-            header += f"\n**Email**: {email}"
-        header += f"\n**Total projects across all hubs**: {total_projects}"
-
-        if hub_errors:
-            header += (
-                f"\n\n\u26a0\ufe0f Could not search {len(hub_errors)} hub(s): "
-                + ", ".join(hub_errors)
-            )
-
-        if total_projects == 0:
-            return header + "\n\nNo project assignments found (or insufficient admin permissions)."
-
-        return header + "\n" + "\n".join(lines)
-
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"find_user_projects failed: {e}")
-        return f"Failed to find user projects: {e}"
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"find_user_projects failed: {e}")
+            return f"Failed to find user projects: {e}"
 
 
 @admin_mcp.tool()
@@ -919,38 +973,39 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
         source_project_name:  Name of the template project to copy FROM.
         dest_project_name:    Name of the target project to copy TO.
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
 
-        # Resolve both projects — cross-hub fallback is automatic.
-        src_hub_id, src_id, src_name = await _resolve_project_id(hub_id, source_project_name)
-        dst_hub_id, dst_id, dst_name = await _resolve_project_id(hub_id, dest_project_name)
+            # Resolve both projects — cross-hub fallback is automatic.
+            src_hub_id, src_id, src_name = await _resolve_project_id(hub_id, source_project_name)
+            dst_hub_id, dst_id, dst_name = await _resolve_project_id(hub_id, dest_project_name)
 
-        # Look up hub display names for the completion message.
-        hubs = await asyncio.to_thread(get_hubs)
-        hub_names = {h.get("id"): h.get("attributes", {}).get("name", "?") for h in hubs}
-        src_hub_name = hub_names.get(src_hub_id, src_hub_id)
-        dst_hub_name = hub_names.get(dst_hub_id, dst_hub_id)
+            # Look up hub display names for the completion message.
+            hubs = await asyncio.to_thread(get_hubs)
+            hub_names = {h.get("id"): h.get("attributes", {}).get("name", "?") for h in hubs}
+            src_hub_name = hub_names.get(src_hub_id, src_hub_id)
+            dst_hub_name = hub_names.get(dst_hub_id, dst_hub_id)
 
-        # Execute immediately — no preview.
-        summary = await asyncio.to_thread(replicate_folders, src_hub_id, src_id, dst_id)
+            # Execute immediately — no preview.
+            summary = await asyncio.to_thread(replicate_folders, src_hub_id, src_id, dst_id)
 
-        # Extract folder count from summary string (e.g. "Successfully copied 12 folders …")
-        count_match = re.search(r"(\d+)\s+folders", summary)
-        count = count_match.group(1) if count_match else "unknown"
+            # Extract folder count from summary string (e.g. "Successfully copied 12 folders …")
+            count_match = re.search(r"(\d+)\s+folders", summary)
+            count = count_match.group(1) if count_match else "unknown"
 
-        return (
-            f"\u2705 Folder structure copied successfully.\n"
-            f"Source: {src_name} ({src_hub_name})\n"
-            f"Destination: {dst_name} ({dst_hub_name})\n"
-            f"Folders created: {count}\n\n"
-            f"If some folders already existed they were skipped."
-        )
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"apply_folder_template failed: {e}")
-        return f"Failed to apply folder template: {e}"
+            return (
+                f"\u2705 Folder structure copied successfully.\n"
+                f"Source: {src_name} ({src_hub_name})\n"
+                f"Destination: {dst_name} ({dst_hub_name})\n"
+                f"Folders created: {count}\n\n"
+                f"If some folders already existed they were skipped."
+            )
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"apply_folder_template failed: {e}")
+            return f"Failed to apply folder template: {e}"
 
 
 @admin_mcp.tool()
@@ -964,19 +1019,20 @@ async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> s
         project_name:  The name of the project containing the folder.
         folder_name:   The name of the folder to delete (e.g. '01_WIP').
     """
-    try:
-        hub_id = await _resolve_hub_id(hub_name)
-        hub_id, found_id, _ = await _resolve_project_id(hub_id, project_name)
+    async with _tool_semaphore:
+        try:
+            hub_id = await _resolve_hub_id(hub_name)
+            hub_id, found_id, _ = await _resolve_project_id(hub_id, project_name)
 
-        result = await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
-        if result.startswith("Successfully"):
-            return f"\u2705 {result}"
-        return result
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"delete_folder failed: {e}")
-        return f"Failed to delete folder: {e}"
+            result = await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
+            if result.startswith("Successfully"):
+                return f"\u2705 {result}"
+            return result
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"delete_folder failed: {e}")
+            return f"Failed to delete folder: {e}"
 
 
 _VIEWER_HTML_PATH = pathlib.Path(__file__).parent / "viewer.html"
@@ -1027,28 +1083,29 @@ async def preview_model(urn: str) -> ToolResult:
     Args:
         urn: The version URN of the model to preview (e.g. from inspect_file or count_elements).
     """
-    try:
-        encoded_urn = safe_b64encode(urn) if urn.startswith("urn:") else urn
-        access_token = await asyncio.to_thread(get_viewer_token)
+    async with _tool_semaphore:
+        try:
+            encoded_urn = safe_b64encode(urn) if urn.startswith("urn:") else urn
+            access_token = await asyncio.to_thread(get_viewer_token)
 
-        structured = {
-            "urn": encoded_urn,
-            "config": {
-                "accessToken": access_token,
-                "env": "AutodeskProduction",
-                "api": "derivativeV2_EU",
-            },
-        }
+            structured = {
+                "urn": encoded_urn,
+                "config": {
+                    "accessToken": access_token,
+                    "env": "AutodeskProduction",
+                    "api": "derivativeV2_EU",
+                },
+            }
 
-        return ToolResult(
-            content=f"Loading 3D preview for model URN: {urn[:60]}...",
-            structured_content=structured,
-        )
-    except ValueError as e:
-        return ToolResult(content=str(e))
-    except Exception as e:
-        logger.error(f"preview_model failed: {e}")
-        return ToolResult(content=f"Failed to preview model: {e}")
+            return ToolResult(
+                content=f"Loading 3D preview for model URN: {urn[:60]}...",
+                structured_content=structured,
+            )
+        except ValueError as e:
+            return ToolResult(content=str(e))
+        except Exception as e:
+            logger.error(f"preview_model failed: {e}")
+            return ToolResult(content=f"Failed to preview model: {e}")
 
 
 @bim_mcp.tool()
@@ -1064,21 +1121,22 @@ async def highlight_elements(urn: str, ids: list[int], color: str = "red") -> st
         ids:   List of dbId integers to highlight (from selection context or count_elements).
         color: Color name: "red", "green", "blue", "yellow", "orange", or "clear" to reset.
     """
-    try:
-        if color == "clear" or not ids:
-            _HIGHLIGHT_STATE[urn] = {"ids": [], "color": []}
-            return f"Cleared all highlights for model."
+    async with _tool_semaphore:
+        try:
+            if color == "clear" or not ids:
+                _HIGHLIGHT_STATE[urn] = {"ids": [], "color": []}
+                return f"Cleared all highlights for model."
 
-        rgba = _COLOR_MAP.get(color, _COLOR_MAP["red"])
-        if urn not in _HIGHLIGHT_STATE and len(_HIGHLIGHT_STATE) >= _HIGHLIGHT_MAX_ENTRIES:
-            _HIGHLIGHT_STATE.popitem(last=False)  # evict oldest entry (FIFO)
-        _HIGHLIGHT_STATE[urn] = {"ids": ids, "color": rgba}
-        return f"Highlighted {len(ids)} element(s) in {color}."
-    except ValueError as e:
-        return str(e)
-    except Exception as e:
-        logger.error(f"highlight_elements failed: {e}")
-        return f"Failed to highlight elements: {e}"
+            rgba = _COLOR_MAP.get(color, _COLOR_MAP["red"])
+            if urn not in _HIGHLIGHT_STATE and len(_HIGHLIGHT_STATE) >= _HIGHLIGHT_MAX_ENTRIES:
+                _HIGHLIGHT_STATE.popitem(last=False)  # evict oldest entry (FIFO)
+            _HIGHLIGHT_STATE[urn] = {"ids": ids, "color": rgba}
+            return f"Highlighted {len(ids)} element(s) in {color}."
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.error(f"highlight_elements failed: {e}")
+            return f"Failed to highlight elements: {e}"
 
 
 @bim_mcp.resource("highlight://{urn}")
@@ -1227,6 +1285,7 @@ if __name__ == "__main__":
         """Rejects requests without a valid X-API-Key header.
 
         GET /health is exempt so Azure health probes pass without credentials.
+        Assigns a short correlation ID to every request for log tracing.
         """
 
         def __init__(self, app: ASGIApp) -> None:
@@ -1234,6 +1293,7 @@ if __name__ == "__main__":
 
         async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
             if scope["type"] == "http":
+                _request_id.set(uuid.uuid4().hex[:8])
                 request = Request(scope)
                 if not (request.method == "GET" and request.url.path == "/health"):
                     if not hmac.compare_digest(
@@ -1250,7 +1310,38 @@ if __name__ == "__main__":
     bim_asgi = bim_mcp.http_app(path="/", transport="streamable-http")
 
     async def health_check(request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok", "version": "1.0.0"})
+        """Shallow health check for Azure load balancer.
+
+        Verifies credentials are configured and reports whether at least
+        one successful Autodesk API call has been made (hub cache populated).
+        Does NOT make live API calls — always returns fast.
+        """
+        from api import _cached_hub_id
+
+        has_aps_creds = bool(
+            os.environ.get("APS_CLIENT_ID", "").strip()
+            and os.environ.get("APS_CLIENT_SECRET", "").strip()
+        )
+        has_api_key = bool(MCP_API_KEY)
+        autodesk_connected = _cached_hub_id is not None
+
+        if has_aps_creds and has_api_key:
+            return JSONResponse({
+                "status": "ok",
+                "version": "1.0.0",
+                "autodesk_connected": autodesk_connected,
+            })
+
+        reason = "Missing APS credentials" if not has_aps_creds else "Missing MCP_API_KEY"
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "version": "1.0.0",
+                "autodesk_connected": False,
+                "reason": reason,
+            },
+            status_code=503,
+        )
 
     @asynccontextmanager
     async def master_lifespan(app):
