@@ -660,6 +660,9 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
     """
     Lists users assigned to a project (requires Admin permissions).
 
+    Returns up to 100 users. For projects with more than 100 members,
+    use check_project_permissions which retrieves the full list.
+
     Args:
         hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
         project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
@@ -1134,7 +1137,11 @@ async def highlight_elements(urn: str, ids: list[int], color: str = "red") -> st
                 _HIGHLIGHT_STATE[urn] = {"ids": [], "color": []}
                 return f"Cleared all highlights for model."
 
-            rgba = _COLOR_MAP.get(color, _COLOR_MAP["red"])
+            if color not in _COLOR_MAP:
+                valid = ", ".join(_COLOR_MAP.keys())
+                return f"Unknown color '{color}'. Valid colors: {valid}."
+
+            rgba = _COLOR_MAP[color]
             if urn not in _HIGHLIGHT_STATE and len(_HIGHLIGHT_STATE) >= _HIGHLIGHT_MAX_ENTRIES:
                 _HIGHLIGHT_STATE.popitem(last=False)  # evict oldest entry (FIFO)
             _HIGHLIGHT_STATE[urn] = {"ids": ids, "color": rgba}
@@ -1323,14 +1330,14 @@ if __name__ == "__main__":
         one successful Autodesk API call has been made (hub cache populated).
         Does NOT make live API calls — always returns fast.
         """
-        from api import _cached_hub_id
+        import api as _api_module
 
         has_aps_creds = bool(
             os.environ.get("APS_CLIENT_ID", "").strip()
             and os.environ.get("APS_CLIENT_SECRET", "").strip()
         )
         has_api_key = bool(MCP_API_KEY)
-        autodesk_connected = _cached_hub_id is not None
+        autodesk_connected = _api_module._cached_hub_id is not None
 
         if has_aps_creds and has_api_key:
             return JSONResponse({

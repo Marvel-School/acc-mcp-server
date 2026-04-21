@@ -78,7 +78,11 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
-_SYSTEM_FOLDER_PREFIXES = (
+# Each entry is matched via str.startswith(), so entries that are genuine
+# prefixes (e.g. "quantification_") catch all variants, while entries that
+# are exact names (e.g. "VIRTUAL_ROOT_FOLDER", "COST Root Folder") are also
+# handled correctly because startswith() returns True for an exact match.
+_SYSTEM_FOLDER_PATTERNS = (
     "quantification_",
     "correspondence-project-",
     "issue_",
@@ -90,7 +94,7 @@ _SYSTEM_FOLDER_PREFIXES = (
 # ACC platform folders auto-created for every project — not user content.
 _ACC_DEFAULT_FOLDERS = {
     "photos",
-    "projecttb",
+    "projecttb",  # TBI-specific ACC default folder
     "plans",
     "submittals",
     "rfis",
@@ -104,14 +108,15 @@ def _is_system_folder(folder_name: str) -> bool:
     """Return True if *folder_name* is an Autodesk internal system folder.
 
     Matches:
-    - Known system prefixes (quantification_, issue_, COST Root Folder, …)
+    - Known system prefixes and exact names in _SYSTEM_FOLDER_PATTERNS
+      (e.g. quantification_, issue_, COST Root Folder, VIRTUAL_ROOT_FOLDER)
     - ACC platform default folders (Photos, Plans, Issues, …)
     - Names that are purely a UUID
     - Names that contain a UUID suffix after an underscore or hyphen
     """
     if not folder_name:
         return False
-    if folder_name.startswith(_SYSTEM_FOLDER_PREFIXES):
+    if folder_name.startswith(_SYSTEM_FOLDER_PATTERNS):
         return True
     if folder_name.lower().strip() in _ACC_DEFAULT_FOLDERS:
         return True
@@ -990,12 +995,12 @@ def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -
     skipped_projects: list[str] = []
     warnings: list[str] = []
 
-    # Propagate project-list truncation warning
     _proj_warn = getattr(all_hub_projects, "truncation_warning", "")
-    if _proj_warn:
-        warnings.append(_proj_warn)
 
     if truncated_projects:
+        # The scan cap was hit — this already implies the project list may also
+        # be truncated, so emit one combined message rather than two overlapping
+        # warnings.
         w = (
             f"⚠️ Results truncated: only scanned {max_projects} of "
             f"{len(all_hub_projects)} projects in this hub. "
@@ -1003,6 +1008,10 @@ def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -
         )
         logger.warning(w)
         warnings.append(w)
+    elif _proj_warn:
+        # Project list hit the pagination cap but the scan cap was not reached —
+        # forward the warning from get_projects unchanged.
+        warnings.append(_proj_warn)
 
     for p in projects:
         pid = p.get("id", "")
@@ -1156,34 +1165,60 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
     # --- Step 2: Fetch projects assigned to this user -----------------------
     # Unified ACC construction/admin/v1 endpoint — supports both ACC and BIM 360.
     # Region is passed as a header instead of being embedded in the URL path.
-    proj_url = (
+    # Paginated with the same next_url pattern used by _paginate_project_users.
+    proj_base_url = (
         f"https://developer.api.autodesk.com/construction/admin/v1"
         f"/accounts/{clean_account_id}/users/{target_uid}/projects?limit=100"
     )
     try:
-        raw = _make_request(
-            "GET",
-            proj_url,
-            extra_headers={"Region": "EMEA"},
-        ).json()
-        # Unified endpoint returns projects inside a 'results' array.
-        raw_projects = raw.get("results", [])
+        projects: list[dict] = []
+        proj_url: Optional[str] = proj_base_url
+        _hit_proj_cap = True
 
-        projects = []
-        for p in raw_projects:
-            role = (
-                "Project Admin"
-                if p.get("access_level") == "project_admin"
-                else "Member"
+        for _ in range(_MAX_USER_PAGES):
+            raw = _make_request(
+                "GET",
+                proj_url,  # type: ignore[arg-type]
+                extra_headers={"Region": "EMEA"},
+            ).json()
+            # Unified endpoint returns projects inside a 'results' array.
+            for p in raw.get("results", []):
+                role = (
+                    "Project Admin"
+                    if p.get("access_level") == "project_admin"
+                    else "Member"
+                )
+                projects.append({"name": p.get("name", "—"), "role": role})
+
+            next_url = raw.get("pagination", {}).get("nextUrl")
+            if next_url:
+                proj_url = next_url
+            else:
+                _hit_proj_cap = False
+                break
+
+        _proj_truncation_warning = ""
+        if _hit_proj_cap:
+            _proj_truncation_warning = (
+                f"⚠️ Results truncated: retrieved {len(projects)} projects across "
+                f"{_MAX_USER_PAGES} pages (safety limit). There may be more project "
+                f"assignments. Try searching by exact email for a more specific result."
             )
-            projects.append({"name": p.get("name", "—"), "role": role})
+            logger.warning(_proj_truncation_warning)
 
         logger.info(
             f"[UserProjects] Found {len(projects)} projects for '{display_name}' (live, uncached)"
         )
-        result_dict: dict = {"user_name": display_name, "user_email": email, "projects": projects}
+
+        warnings_out: list[str] = []
         if _name_search_warning:
-            result_dict["warning"] = _name_search_warning
+            warnings_out.append(_name_search_warning)
+        if _proj_truncation_warning:
+            warnings_out.append(_proj_truncation_warning)
+
+        result_dict: dict = {"user_name": display_name, "user_email": email, "projects": projects}
+        if warnings_out:
+            result_dict["warning"] = "\n".join(warnings_out)
         return result_dict
 
     except ValueError as api_err:
