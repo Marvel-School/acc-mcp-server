@@ -11,7 +11,7 @@ import pathlib
 import contextvars
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from pythonjsonlogger.json import JsonFormatter
+from pythonjsonlogger.jsonlogger import JsonFormatter
 from fastmcp import FastMCP, Context
 from fastmcp.tools.tool import ToolResult
 from auth import get_token, get_viewer_token
