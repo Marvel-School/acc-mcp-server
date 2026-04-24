@@ -42,6 +42,17 @@ _CHUNK_SIZE = 65536
 _BUFFER_OVERLAP = 512
 _PROJECT_CACHE_TTL = 300  # seconds
 
+# Base Autodesk API domain — stripped from URLs in log lines so the log
+# stream shows short paths (e.g. /project/v1/hubs) instead of full URLs.
+_API_BASE = "https://developer.api.autodesk.com"
+
+
+def _short_url(url: str) -> str:
+    """Return a log-friendly path by stripping the Autodesk API base domain."""
+    if url and url.startswith(_API_BASE):
+        return url[len(_API_BASE):]
+    return url or ""
+
 
 class ResultList(list):
     """List subclass that can carry an optional truncation warning.
@@ -161,6 +172,8 @@ def _make_request(
     kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
     max_attempts = 2 if retry_on_401 else 1
     last_resp: requests.Response = None  # type: ignore[assignment]
+    short = _short_url(url)
+    elapsed = 0.0
 
     try:
         for attempt in range(max_attempts):
@@ -172,32 +185,43 @@ def _make_request(
             if extra_headers:
                 headers.update(extra_headers)
 
+            logger.debug("API %s %s", method, short)
+            _req_start = time.monotonic()
             with _api_semaphore:
                 last_resp = requests.request(method, url, headers=headers, **kwargs)
+            elapsed = time.monotonic() - _req_start
 
             # --- 429 rate limit retry ---
             if last_resp.status_code == 429:
                 wait = int(last_resp.headers.get("Retry-After", 5))
-                logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
+                logger.warning(
+                    "API 429 — rate limited, waiting %ss | %s %s",
+                    wait, method, short,
+                )
                 time.sleep(wait)
                 token = get_token(force_refresh=True)
                 headers["Authorization"] = f"Bearer {token}"
+                _req_start = time.monotonic()
                 with _api_semaphore:
                     last_resp = requests.request(method, url, headers=headers, **kwargs)
+                elapsed = time.monotonic() - _req_start
                 break
 
             # --- 5xx server error retry (one attempt, 2 s backoff) ---
             if last_resp.status_code in (500, 502, 503, 504) and attempt == 0:
                 logger.warning(
-                    "Autodesk API returned %d on %s %s — retrying in 2s",
-                    last_resp.status_code, method, url[:80],
+                    "API %s — server error, retrying in 2s | %s %s",
+                    last_resp.status_code, method, short,
                 )
                 time.sleep(2)
                 continue
 
             # --- 401 stale token retry ---
             if last_resp.status_code == 401 and attempt == 0 and retry_on_401:
-                logger.warning(f"401 on {method} {url[:80]} — refreshing token")
+                logger.warning(
+                    "API 401 — refreshing token and retrying | %s %s",
+                    method, short,
+                )
                 continue
 
             break
@@ -214,9 +238,16 @@ def _make_request(
                     error_detail = error_json.get("detail", last_resp.text)
             except ValueError:
                 pass
-            logger.error(f"API HTTP Error ({last_resp.status_code}): {error_detail}")
+            logger.error(
+                "API %s %s | failed with %s: %s",
+                method, short, last_resp.status_code, str(error_detail)[:120],
+            )
             raise ValueError(f"Autodesk API Error {last_resp.status_code}: {error_detail}") from http_err
 
+        logger.info(
+            "API %s %s | %s | %.2fs",
+            method, short, last_resp.status_code, elapsed,
+        )
         return last_resp
 
     except ValueError:
@@ -262,7 +293,9 @@ def _get_hub_id() -> str:
     with _hub_cache_lock:
         now = time.monotonic()
         if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
+            logger.debug("CACHE hit  hub_id=%s", _cached_hub_id)
             return _cached_hub_id
+        logger.debug("CACHE miss hub_id \u2014 fetching")
         hubs = get_hubs()
         if not hubs:
             raise ValueError(
@@ -312,8 +345,9 @@ def get_projects(
             if cached is not None:
                 cached_list, cached_at = cached
                 if (time.monotonic() - cached_at) < _PROJECT_CACHE_TTL:
-                    logger.debug("Project cache hit for hub %s (%d projects)", hub_id, len(cached_list))
+                    logger.debug("CACHE hit  projects[%s]", hub_id)
                     return cached_list
+        logger.debug("CACHE miss projects[%s] — fetching", hub_id)
 
     # --- Fetch from API ---
     base = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects?page[limit]={limit}"
@@ -323,7 +357,11 @@ def get_projects(
     all_projects: ResultList = ResultList()
 
     _hit_cap = True
+    page_count = 0
     for _ in range(_MAX_PROJECT_PAGES):  # safety cap
+        page_count += 1
+        if page_count > 1:
+            logger.debug("PAGINATE projects[%s] page %d", hub_id, page_count)
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
         all_projects.extend(data.get("data", []))
@@ -351,6 +389,9 @@ def get_projects(
     if use_cache:
         with _project_cache_lock:
             _project_cache[hub_id] = (all_projects, time.monotonic())
+        logger.debug(
+            "CACHE stored projects[%s] (%d projects)", hub_id, len(all_projects),
+        )
 
     return all_projects
 
@@ -518,6 +559,11 @@ def find_design_files(
         scanned += 1
 
         logger.info(f"  Scanning {scanned}/{_MAX_FOLDER_SCAN} (depth {current['depth']}): {current['name']}")
+        if scanned % 10 == 0:
+            logger.debug(
+                "BFS scan: %d folders scanned so far in project %s",
+                scanned, project_id[:20],
+            )
         try:
             contents = get_folder_contents(project_id, current["id"])
         except Exception as e:
@@ -737,6 +783,7 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
 
     count = 0
     buffer = b""
+    chunk_count = 0
 
     resp = _make_request("GET", url, stream=True, timeout=_STREAM_TIMEOUT)
     try:
@@ -746,6 +793,7 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
             if not chunk:
                 continue
 
+            chunk_count += 1
             buffer += chunk
             matches = list(pattern.finditer(buffer))
             count += len(matches)
@@ -754,6 +802,12 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
                 buffer = buffer[matches[-1].end():]
             else:
                 buffer = buffer[-_BUFFER_OVERLAP:]
+
+            if chunk_count % 10 == 0:
+                logger.debug(
+                    "STREAM count: %d chunks processed, %d matches so far",
+                    chunk_count, count,
+                )
 
     except requests.exceptions.HTTPError as e:
         raise ValueError(f"HTTP error streaming metadata: {e}")
@@ -877,7 +931,11 @@ def _paginate_project_users(
     url: Optional[str] = endpoint
 
     _hit_cap = True
+    page_count = 0
     for _ in range(max_pages):
+        page_count += 1
+        if page_count > 1:
+            logger.debug("PAGINATE users[%s] page %d", clean_id, page_count)
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
 
@@ -1174,8 +1232,15 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
         projects: list[dict] = []
         proj_url: Optional[str] = proj_base_url
         _hit_proj_cap = True
+        user_page_count = 0
 
         for _ in range(_MAX_USER_PAGES):
+            user_page_count += 1
+            if user_page_count > 1:
+                logger.debug(
+                    "PAGINATE user-projects[%s] page %d",
+                    target_uid, user_page_count,
+                )
             raw = _make_request(
                 "GET",
                 proj_url,  # type: ignore[arg-type]

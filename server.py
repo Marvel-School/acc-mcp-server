@@ -2,6 +2,7 @@ import os
 import re
 import json
 import hmac
+import time
 import uuid
 import asyncio
 import hashlib
@@ -11,9 +12,18 @@ import contextvars
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pythonjsonlogger.json import JsonFormatter
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 from fastmcp.tools.tool import ToolResult
 from auth import get_token, get_viewer_token
+from auth_3lo import (
+    build_auth_url,
+    exchange_code,
+    get_session_user,
+    is_authenticated,
+    logout as logout_3lo,
+    migrate_pending_tokens,
+    store_pending_tokens,
+)
 from api import (
     find_project_globally,
     inspect_generic_file,
@@ -138,7 +148,9 @@ async def _resolve_hub_id(hub_name: str) -> str:
         if h.get("attributes", {}).get("name", "").lower().strip() == target
     ]
     if len(exact) == 1:
-        return exact[0].get("id")
+        hub_id = exact[0].get("id")
+        logger.debug("RESOLVE hub '%s' → %s", hub_name, hub_id)
+        return hub_id
     if len(exact) > 1:
         names = [h.get("attributes", {}).get("name", "?") for h in exact]
         raise ValueError(
@@ -153,7 +165,9 @@ async def _resolve_hub_id(hub_name: str) -> str:
         if target in h.get("attributes", {}).get("name", "").lower()
     ]
     if len(substring) == 1:
-        return substring[0].get("id")
+        hub_id = substring[0].get("id")
+        logger.debug("RESOLVE hub '%s' → %s", hub_name, hub_id)
+        return hub_id
 
     all_names = [h.get("attributes", {}).get("name", "?") for h in hubs]
     if not substring:
@@ -196,6 +210,8 @@ async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str, str,
 
     # Exact matches take priority
     if len(exact) == 1:
+        _hid, _pid, _ = exact[0]
+        logger.debug("RESOLVE project '%s' → %s (hub: %s)", project_name, _pid, _hid)
         return exact[0]
     if len(exact) > 1:
         listing = "\n".join(f"  - {name} (id: {pid})" for _, pid, name in exact)
@@ -207,6 +223,8 @@ async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str, str,
 
     # Substring fallback (only when zero exact matches in this hub)
     if len(substring) == 1:
+        _hid, _pid, _ = substring[0]
+        logger.debug("RESOLVE project '%s' → %s (hub: %s)", project_name, _pid, _hid)
         return substring[0]
     if len(substring) > 1:
         listing = "\n".join(f"  - {name} (id: {pid})" for _, pid, name in substring)
@@ -229,6 +247,10 @@ async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str, str,
     if len(global_exact) == 1:
         g_hub_id, g_hub_name, g_proj_id, g_proj_name = global_exact[0]
         logger.info(
+            "RESOLVE cross-hub fallback: '%s' found in hub %s",
+            project_name, g_hub_id,
+        )
+        logger.info(
             "Found project '%s' in hub '%s' (cross-hub exact match)",
             g_proj_name, g_hub_name,
         )
@@ -248,6 +270,10 @@ async def _resolve_project_id(hub_id: str, project_name: str) -> tuple[str, str,
     # Substring fallback across all hubs
     if len(global_sub) == 1:
         g_hub_id, g_hub_name, g_proj_id, g_proj_name = global_sub[0]
+        logger.info(
+            "RESOLVE cross-hub fallback: '%s' found in hub %s",
+            project_name, g_hub_id,
+        )
         logger.info(
             "Found project '%s' in hub '%s' (cross-hub substring match)",
             g_proj_name, g_hub_name,
@@ -288,7 +314,9 @@ async def _resolve_folder_id(hub_id: str, project_id: str, folder_name: str) -> 
     # Phase 1: exact match (case-insensitive)
     exact = [f for f in folders if (f.get("name") or "").lower().strip() == target]
     if len(exact) == 1:
-        return exact[0].get("id")
+        folder_id = exact[0].get("id")
+        logger.debug("RESOLVE folder '%s' → %s", folder_name, folder_id)
+        return folder_id
     if len(exact) > 1:
         names = [f.get("name") or "?" for f in exact]
         raise ValueError(
@@ -303,7 +331,9 @@ async def _resolve_folder_id(hub_id: str, project_id: str, folder_name: str) -> 
         if target in (f.get("name") or "").lower() or (f.get("name") or "").lower() in target
     ]
     if len(substring) == 1:
-        return substring[0].get("id")
+        folder_id = substring[0].get("id")
+        logger.debug("RESOLVE folder '%s' → %s", folder_name, folder_id)
+        return folder_id
 
     all_names = [f.get("name") or "?" for f in folders]
     if not substring:
@@ -337,7 +367,10 @@ async def find_project(name_query: str) -> str:
         otherwise. When multiple projects match, lists all candidates.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info("TOOL %s | params: %s", "find_project", {"query": name_query})
+
             exact, substring = await asyncio.to_thread(find_project_globally, name_query)
 
             # Prefer exact matches; fall back to substring only when no exact match
@@ -347,6 +380,10 @@ async def find_project(name_query: str) -> str:
             if not effective:
                 hubs = await asyncio.to_thread(get_hubs)
                 hub_names = [h.get("attributes", {}).get("name", "?") for h in hubs]
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "find_project",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return (
                     f"No project found matching '{name_query}' in any accessible hub.\n"
                     f"Searched hubs: {', '.join(hub_names) if hub_names else '(none)'}"
@@ -354,6 +391,10 @@ async def find_project(name_query: str) -> str:
 
             if len(effective) == 1:
                 hub_id, hub_name, project_id, project_name = effective[0]
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "find_project",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return (
                     f"Found Project ({match_type} match):\n"
                     f"  Name:       {project_name}\n"
@@ -369,11 +410,22 @@ async def find_project(name_query: str) -> str:
                     f"  - {project_name} (id: {project_id}) — hub: {hub_name}"
                 )
             lines.append("\nPlease use the exact project name to narrow down.")
+            logger.info(
+                "TOOL %s | completed in %.2fs", "find_project",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return "\n".join(lines)
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "find_project",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"find_project failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "find_project",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to search for project: {e}"
 
 
@@ -385,20 +437,38 @@ async def list_hubs() -> str:
     and other hub-scoped tools.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info("TOOL %s | params: %s", "list_hubs", {})
+
             hubs = await asyncio.to_thread(get_hubs)
             if not hubs:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "list_hubs",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return "No hubs found. Check your Autodesk account permissions."
 
             report = "Found Hubs:\n"
             for hub in hubs:
                 name = hub.get("attributes", {}).get("name", "Unknown")
                 report += f"- {name}\n"
+            logger.info(
+                "TOOL %s | completed in %.2fs", "list_hubs",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return report
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "list_hubs",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"list_hubs failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "list_hubs",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to list hubs: {e}"
 
 
@@ -415,12 +485,19 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
         fields:   Comma-separated extra fields (optional). Leave empty for default view.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info("TOOL %s | params: %s", "list_projects", {"hub": hub_name})
+
             hub_id = await _resolve_hub_id(hub_name)
 
             field_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
             projects = await asyncio.to_thread(get_projects, hub_id, 50, field_list)
             if not projects:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "list_projects",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"No projects found in hub '{hub_name}'."
 
             report = f"Found {len(projects)} Projects:\n"
@@ -438,11 +515,22 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
             if _tw:
                 report += f"\n{_tw}"
 
+            logger.info(
+                "TOOL %s | completed in %.2fs", "list_projects",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return report
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "list_projects",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"list_projects failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "list_projects",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to list projects: {e}"
 
 
@@ -458,12 +546,22 @@ async def list_top_folders(hub_name: str, project_name: str) -> str:
         project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "list_top_folders",
+                {"hub": hub_name, "project": project_name},
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
             folders = await asyncio.to_thread(get_top_folders, hub_id, project_id)
             if not folders:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "list_top_folders",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return "No top-level folders found."
 
             report = "Top Folders:\n"
@@ -472,11 +570,22 @@ async def list_top_folders(hub_name: str, project_name: str) -> str:
                 fid = f.get("id") or ""
                 fid_display = f"...{fid[-12:]}" if len(fid) > 12 else fid
                 report += f"- {name} (ID: {fid_display})\n"
+            logger.info(
+                "TOOL %s | completed in %.2fs", "list_top_folders",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return report
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "list_top_folders",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"list_top_folders failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "list_top_folders",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to list folders: {e}"
 
 
@@ -492,13 +601,23 @@ async def list_folder_contents(hub_name: str, project_name: str, folder_name: st
         folder_name:  The top-level folder name (e.g. "Project Files"). Defaults to "Project Files".
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "list_folder_contents",
+                {"hub": hub_name, "project": project_name, "folder": folder_name},
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
             folder_id = await _resolve_folder_id(hub_id, project_id, folder_name)
 
             items = await asyncio.to_thread(get_folder_contents, project_id, folder_id)
             if not items:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "list_folder_contents",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return "Folder is empty."
 
             report = f"Folder Contents ({len(items)} items):\n"
@@ -509,12 +628,123 @@ async def list_folder_contents(hub_name: str, project_name: str, folder_name: st
                 item_type = item.get("itemType") or item.get("type", "unknown")
                 icon = "[folder]" if item_type in ("folder", "folders") else "[file]"
                 report += f"  {icon} {name} (ID: {iid_display})\n"
+            logger.info(
+                "TOOL %s | completed in %.2fs", "list_folder_contents",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return report
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "list_folder_contents",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"list_folder_contents failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "list_folder_contents",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to list folder contents: {e}"
+
+
+@nav_mcp.tool()
+async def autodesk_login(ctx: Context) -> str:
+    """
+    Connect your Autodesk Construction Cloud account to this session.
+
+    Starts (or confirms) a 3-legged OAuth session. On first call, returns
+    an authorization URL — open it in a browser, sign in with your
+    Autodesk credentials, then call this tool again to confirm.
+
+    Session tokens are stored in memory only and are lost on server
+    restart. After a restart, sign in again.
+    """
+    async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
+        try:
+            session_id = ctx.session_id
+            logger.info(
+                "TOOL %s | params: %s", "autodesk_login",
+                {"session": (session_id or "")[:8]},
+            )
+
+            await migrate_pending_tokens(session_id)
+
+            if is_authenticated(session_id):
+                user = get_session_user(session_id) or {}
+                name = user.get("name") or "Autodesk User"
+                email = user.get("email") or ""
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "autodesk_login",
+                    asyncio.get_event_loop().time() - _t0,
+                )
+                return (
+                    f"✅ You are already logged in to Autodesk as "
+                    f"{name} ({email}). Your session is active."
+                )
+
+            auth_url = build_auth_url(session_id)
+            logger.info(
+                "TOOL %s | completed in %.2fs", "autodesk_login",
+                asyncio.get_event_loop().time() - _t0,
+            )
+            return (
+                f"To connect your Autodesk account, open this URL in your browser:\n\n"
+                f"{auth_url}\n\n"
+                f"After signing in, call this tool again to confirm your session is active."
+            )
+        except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "autodesk_login",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
+            return str(e)
+        except Exception as e:
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "autodesk_login",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
+            return f"Failed to start Autodesk login: {e}"
+
+
+@nav_mcp.tool()
+async def autodesk_logout(ctx: Context) -> str:
+    """
+    End the current Autodesk 3-legged OAuth session.
+
+    Removes stored access/refresh tokens for this MCP session. A fresh
+    autodesk_login is required before any user-authenticated tool can
+    be used again.
+    """
+    async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
+        try:
+            session_id = ctx.session_id
+            logger.info(
+                "TOOL %s | params: %s", "autodesk_logout",
+                {"session": (session_id or "")[:8]},
+            )
+
+            removed = logout_3lo(session_id)
+            logger.info(
+                "TOOL %s | completed in %.2fs", "autodesk_logout",
+                asyncio.get_event_loop().time() - _t0,
+            )
+            if removed:
+                return "✅ Successfully logged out of your Autodesk session."
+            return "You were not logged in."
+        except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "autodesk_logout",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
+            return str(e)
+        except Exception as e:
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "autodesk_logout",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
+            return f"Failed to log out: {e}"
 
 
 @bim_mcp.tool()
@@ -530,15 +760,33 @@ async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
         file_name:    Filename (e.g. "MyFile.rvt").
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "inspect_file",
+                {"hub": hub_name, "project": project_name, "file": file_name},
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
-            return await asyncio.to_thread(inspect_generic_file, project_id, file_name)
+            result = await asyncio.to_thread(inspect_generic_file, project_id, file_name)
+            logger.info(
+                "TOOL %s | completed in %.2fs", "inspect_file",
+                asyncio.get_event_loop().time() - _t0,
+            )
+            return result
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "inspect_file",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"inspect_file failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "inspect_file",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to inspect file: {e}"
 
 
@@ -559,12 +807,22 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
     Note: Translation typically takes 5-10 minutes. Use inspect_file to check progress.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "reprocess_file",
+                {"hub": hub_name, "project": project_name, "file": file_name},
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
             lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
             if not lineage_urn or not lineage_urn.startswith("urn:"):
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "reprocess_file",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"Error: Could not resolve '{file_name}' to a valid lineage URN."
 
             version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
@@ -577,17 +835,32 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
                     for e in errors
                 )
                 logger.error(f"reprocess_file: Autodesk returned errors: {error_detail}")
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "reprocess_file",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"Translation request was rejected by Autodesk: {error_detail}"
 
             status = result.get("result", "unknown")
+            logger.info(
+                "TOOL %s | completed in %.2fs", "reprocess_file",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return (
                 f"\u2705 Translation job started for '{file_name}' (status: {status}).\n"
                 f"Please wait 5-10 minutes, then use inspect_file or count_elements to verify."
             )
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "reprocess_file",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"reprocess_file failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "reprocess_file",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to trigger reprocessing: {e}"
 
 
@@ -607,22 +880,48 @@ async def count_elements(hub_name: str, project_name: str, file_name: str, categ
         category_name: Category to count (e.g. "Walls", "Doors", "Windows", "Floors").
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "count_elements",
+                {
+                    "hub": hub_name,
+                    "project": project_name,
+                    "file": file_name,
+                    "category": category_name,
+                },
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
             lineage_urn = await asyncio.to_thread(resolve_file_to_urn, project_id, file_name)
             if not lineage_urn or not lineage_urn.startswith("urn:"):
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "count_elements",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"Error: Could not resolve '{file_name}' to a valid URN."
 
             version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
 
             count = await asyncio.to_thread(stream_count_elements, version_urn, category_name)
+            logger.info(
+                "TOOL %s | completed in %.2fs", "count_elements",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return f"Found {count} elements matching '{category_name}' (including singular variations)."
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "count_elements",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"count_elements failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "count_elements",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to count elements: {e}"
 
 
@@ -638,20 +937,37 @@ async def create_project(hub_name: str, name: str, project_type: str = "ACC") ->
         project_type: 'ACC' or 'BIM360' (Default: ACC).
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "create_project",
+                {"hub": hub_name, "name": name},
+            )
+
             real_hub_id = await _resolve_hub_id(hub_name)
 
             result = await asyncio.to_thread(create_acc_project, real_hub_id, name, project_type)
             new_id = result.get("id") or result.get("projectId")
 
+            logger.info(
+                "TOOL %s | completed in %.2fs", "create_project",
+                asyncio.get_event_loop().time() - _t0,
+            )
             if new_id:
                 return f"\u2705 Project '{name}' created successfully. Project ID: {new_id}"
             else:
                 return "API succeeded, but couldn't parse the new Project ID from the response."
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "create_project",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"create_project failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "create_project",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to create project: {e}"
 
 
@@ -668,12 +984,22 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
         project_name: The Project name (e.g. "Grasbaan"). Use list_projects to find names.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "list_project_users",
+                {"hub": hub_name, "project": project_name},
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
             users = await asyncio.to_thread(get_project_users, project_id, 1)
             if not users:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "list_project_users",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"No users found in project '{resolved_name}' (or insufficient permissions)."
 
             report = f"Project Members ({len(users)}):\n"
@@ -689,11 +1015,22 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
                     f"for the full list."
                 )
 
+            logger.info(
+                "TOOL %s | completed in %.2fs", "list_project_users",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return report
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "list_project_users",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"list_project_users failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "list_project_users",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to list project users: {e}"
 
 
@@ -708,16 +1045,33 @@ async def add_user(hub_name: str, project_name: str, email: str) -> str:
         email:        The user's email address.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "add_user",
+                {"hub": hub_name, "project": project_name, "email": email},
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
             await asyncio.to_thread(add_project_user, project_id, email, ["docs"])
+            logger.info(
+                "TOOL %s | completed in %.2fs", "add_user",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return f"\u2705 User '{email}' added to project '{resolved_name}'."
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "add_user",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"add_user failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "add_user",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to add user: {e}"
 
 
@@ -731,11 +1085,18 @@ async def audit_hub_users(hub_name: str) -> str:
         hub_name: The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info("TOOL %s | params: %s", "audit_hub_users", {"hub": hub_name})
+
             hub_id = await _resolve_hub_id(hub_name)
 
             users, skipped = await asyncio.to_thread(get_all_hub_users, hub_id)
             if not users and not skipped:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "audit_hub_users",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"No users found across projects in hub '{hub_name}'."
 
             MAX_USERS = 100
@@ -760,11 +1121,22 @@ async def audit_hub_users(hub_name: str) -> str:
             if _tw:
                 report += f"\n\n{_tw}"
 
+            logger.info(
+                "TOOL %s | completed in %.2fs", "audit_hub_users",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return report
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "audit_hub_users",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"audit_hub_users failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "audit_hub_users",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to audit hub users: {e}"
 
 
@@ -847,23 +1219,45 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
         project_name: Project name (exact or close match, case-insensitive).
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "check_project_permissions",
+                {"hub": hub_name, "project": project_name},
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
             users = await asyncio.to_thread(get_project_user_permissions, project_id)
             if not users:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "check_project_permissions",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return (
                     f"No users found for project '{resolved_name}' "
                     f"(or insufficient admin permissions)."
                 )
 
-            return _format_permissions_report(users, resolved_name)
+            report = _format_permissions_report(users, resolved_name)
+            logger.info(
+                "TOOL %s | completed in %.2fs", "check_project_permissions",
+                asyncio.get_event_loop().time() - _t0,
+            )
+            return report
 
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "check_project_permissions",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"check_project_permissions failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "check_project_permissions",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to check permissions: {e}"
 
 
@@ -883,9 +1277,16 @@ async def find_user_projects(user_name: str) -> str:
         user_name: User's full name (or part of it) or their email address.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info("TOOL %s | params: %s", "find_user_projects", {"user": user_name})
+
             hubs = await asyncio.to_thread(get_hubs)
             if not hubs:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "find_user_projects",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return "No hubs found. Check your Autodesk account permissions."
 
             # Build (account_id, hub_display) pairs for valid hubs.
@@ -936,6 +1337,10 @@ async def find_user_projects(user_name: str) -> str:
                     lines.append(_tw)
 
             if display_name is None:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "find_user_projects",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"User '{user_name}' not found in any accessible hub."
 
             header = f"**User**: {display_name}"
@@ -950,14 +1355,29 @@ async def find_user_projects(user_name: str) -> str:
                 )
 
             if total_projects == 0:
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "find_user_projects",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return header + "\n\nNo project assignments found (or insufficient admin permissions)."
 
+            logger.info(
+                "TOOL %s | completed in %.2fs", "find_user_projects",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return header + "\n" + "\n".join(lines)
 
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "find_user_projects",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"find_user_projects failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "find_user_projects",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to find user projects: {e}"
 
 
@@ -984,7 +1404,17 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
         dest_project_name:    Name of the target project to copy TO.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "apply_folder_template",
+                {
+                    "hub": hub_name,
+                    "src": source_project_name,
+                    "dst": dest_project_name,
+                },
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
 
             # Resolve both projects — cross-hub fallback is automatic.
@@ -1004,6 +1434,10 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
             count_match = re.search(r"(\d+)\s+folders", summary)
             count = count_match.group(1) if count_match else "unknown"
 
+            logger.info(
+                "TOOL %s | completed in %.2fs", "apply_folder_template",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return (
                 f"\u2705 Folder structure copied successfully.\n"
                 f"Source: {src_name} (hub: {src_hub_name})\n"
@@ -1012,9 +1446,16 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
                 f"If some folders already existed they were skipped."
             )
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "apply_folder_template",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"apply_folder_template failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "apply_folder_template",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to apply folder template: {e}"
 
 
@@ -1030,18 +1471,35 @@ async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> s
         folder_name:   The name of the folder to delete (e.g. '01_WIP').
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "delete_folder",
+                {"hub": hub_name, "project": project_name, "folder": folder_name},
+            )
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, found_id, _ = await _resolve_project_id(hub_id, project_name)
 
             result = await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
+            logger.info(
+                "TOOL %s | completed in %.2fs", "delete_folder",
+                asyncio.get_event_loop().time() - _t0,
+            )
             if result.startswith("Successfully"):
                 return f"\u2705 {result}"
             return result
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "delete_folder",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"delete_folder failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "delete_folder",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to delete folder: {e}"
 
 
@@ -1094,7 +1552,10 @@ async def preview_model(urn: str) -> ToolResult:
         urn: The version URN of the model to preview (e.g. from inspect_file or count_elements).
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info("TOOL %s | params: %s", "preview_model", {"urn": urn[:40]})
+
             encoded_urn = safe_b64encode(urn) if urn.startswith("urn:") else urn
             access_token = await asyncio.to_thread(get_viewer_token)
 
@@ -1107,14 +1568,25 @@ async def preview_model(urn: str) -> ToolResult:
                 },
             }
 
+            logger.info(
+                "TOOL %s | completed in %.2fs", "preview_model",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return ToolResult(
                 content=f"Loading 3D preview for model URN: {urn[:60]}...",
                 structured_content=structured,
             )
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "preview_model",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return ToolResult(content=str(e))
         except Exception as e:
-            logger.error(f"preview_model failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "preview_model",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return ToolResult(content=f"Failed to preview model: {e}")
 
 
@@ -1132,24 +1604,49 @@ async def highlight_elements(urn: str, ids: list[int], color: str = "red") -> st
         color: Color name: "red", "green", "blue", "yellow", "orange", or "clear" to reset.
     """
     async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
         try:
+            logger.info(
+                "TOOL %s | params: %s", "highlight_elements",
+                {"urn": urn[:40], "count": len(ids), "color": color},
+            )
+
             if color == "clear" or not ids:
                 _HIGHLIGHT_STATE[urn] = {"ids": [], "color": []}
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "highlight_elements",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"Cleared all highlights for model."
 
             if color not in _COLOR_MAP:
                 valid = ", ".join(_COLOR_MAP.keys())
+                logger.info(
+                    "TOOL %s | completed in %.2fs", "highlight_elements",
+                    asyncio.get_event_loop().time() - _t0,
+                )
                 return f"Unknown color '{color}'. Valid colors: {valid}."
 
             rgba = _COLOR_MAP[color]
             if urn not in _HIGHLIGHT_STATE and len(_HIGHLIGHT_STATE) >= _HIGHLIGHT_MAX_ENTRIES:
                 _HIGHLIGHT_STATE.popitem(last=False)  # evict oldest entry (FIFO)
             _HIGHLIGHT_STATE[urn] = {"ids": ids, "color": rgba}
+            logger.info(
+                "TOOL %s | completed in %.2fs", "highlight_elements",
+                asyncio.get_event_loop().time() - _t0,
+            )
             return f"Highlighted {len(ids)} element(s) in {color}."
         except ValueError as e:
+            logger.info(
+                "TOOL %s | user error in %.2fs: %s", "highlight_elements",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return str(e)
         except Exception as e:
-            logger.error(f"highlight_elements failed: {e}")
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "highlight_elements",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
             return f"Failed to highlight elements: {e}"
 
 
@@ -1291,14 +1788,17 @@ if __name__ == "__main__":
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
     from starlette.requests import Request
-    from starlette.responses import PlainTextResponse, JSONResponse
+    from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse
     from starlette.routing import Mount, Route
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     class APIKeyMiddleware:
         """Rejects requests without a valid X-API-Key header.
 
-        GET /health is exempt so Azure health probes pass without credentials.
+        Exempt paths:
+          - GET /health    — Azure health probes (no credentials).
+          - GET /callback  — Autodesk OAuth redirect (signed by state+code,
+                             Autodesk's server cannot send an X-API-Key).
         Assigns a short correlation ID to every request for log tracing.
         """
 
@@ -1309,7 +1809,11 @@ if __name__ == "__main__":
             if scope["type"] == "http":
                 _request_id.set(uuid.uuid4().hex[:8])
                 request = Request(scope)
-                if not (request.method == "GET" and request.url.path == "/health"):
+                exempt = request.method == "GET" and request.url.path in (
+                    "/health",
+                    "/callback",
+                )
+                if not exempt:
                     if not hmac.compare_digest(
                         request.headers.get("x-api-key", "").encode(),
                         MCP_API_KEY.encode(),
@@ -1357,6 +1861,68 @@ if __name__ == "__main__":
             status_code=503,
         )
 
+    async def oauth_callback(request: Request) -> HTMLResponse:
+        """Handle the Autodesk 3LO redirect after the user signs in.
+
+        The MCP session_id is round-tripped through the OAuth `state`
+        parameter so tokens can be filed under the correct session.
+
+        Exempt from APIKeyMiddleware because Autodesk's authorization
+        server calls this endpoint directly and cannot attach our
+        X-API-Key header.
+        """
+        params = dict(request.query_params)
+
+        if "error" in params:
+            error = params["error"]
+            description = params.get("error_description", "Unknown error")
+            logger.warning("3LO /callback error: %s — %s", error, description)
+            return HTMLResponse(
+                f"<h1>Authentication failed</h1><p>{error}: {description}</p>",
+                status_code=400,
+            )
+
+        if "code" not in params:
+            return HTMLResponse(
+                "<h1>Missing authorization code</h1>",
+                status_code=400,
+            )
+
+        session_id = params.get("state", "")
+        if not session_id:
+            return HTMLResponse(
+                "<h1>Missing session ID</h1>",
+                status_code=400,
+            )
+
+        try:
+            tokens = await exchange_code(params["code"])
+            store_pending_tokens(session_id, {
+                "access_token": tokens["access_token"],
+                "refresh_token": tokens.get("refresh_token"),
+                "expires_at": time.time() + tokens.get("expires_in", 3600),
+            })
+            logger.info(
+                "3LO /callback stored pending tokens for session=%s",
+                session_id[:8],
+            )
+            return HTMLResponse(
+                "<html>\n"
+                "<head><title>Autodesk Authentication</title></head>\n"
+                "<body style=\"font-family: Arial; text-align: center; padding: 60px;\">\n"
+                "  <h2 style=\"color: #1B4F8A;\">✅ Authentication Successful</h2>\n"
+                "  <p>You are now logged in to Autodesk Construction Cloud.</p>\n"
+                "  <p>You can close this window and return to your conversation.</p>\n"
+                "</body>\n"
+                "</html>"
+            )
+        except Exception as e:
+            logger.error("3LO /callback token exchange failed: %s", e)
+            return HTMLResponse(
+                f"<h1>Token exchange failed</h1><p>{e}</p>",
+                status_code=500,
+            )
+
     @asynccontextmanager
     async def master_lifespan(app):
         async with admin_asgi.lifespan(app):
@@ -1368,6 +1934,7 @@ if __name__ == "__main__":
         lifespan=master_lifespan,
         routes=[
             Route("/health", health_check),
+            Route("/callback", oauth_callback),
             Mount("/mcp/admin", app=admin_asgi),
             Mount("/mcp/nav", app=nav_asgi),
             Mount("/mcp/bim", app=bim_asgi),
@@ -1387,6 +1954,14 @@ if __name__ == "__main__":
     logger.info(f"  Admin:     http://0.0.0.0:{PORT}/mcp/admin")
     logger.info(f"  Navigator: http://0.0.0.0:{PORT}/mcp/nav")
     logger.info(f"  BIM:       http://0.0.0.0:{PORT}/mcp/bim")
+    logger.info(
+        "SERVER starting | port=%d | tools=%d | cors_origins=%s | "
+        "viewer_patches=%d/3",
+        PORT,
+        20,
+        ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else "* (all)",
+        _viewer_patches_applied,
+    )
     uvicorn.run(
         master_app,
         host="0.0.0.0",
