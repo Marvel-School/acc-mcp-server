@@ -461,9 +461,14 @@ async def find_project(name_query: str) -> str:
 @nav_mcp.tool()
 async def list_hubs() -> str:
     """
-    Lists all Autodesk Hubs (BIM 360 / ACC) accessible to the service account.
-    Use this to find the hub name needed for list_projects, create_project,
-    and other hub-scoped tools.
+    Lists all Autodesk Hubs accessible to the service account.
+
+    NOTE: This tool always uses the service account, regardless of
+    whether the user is logged in via autodesk_login. Do NOT use this
+    tool to check if the user is authenticated — use
+    autodesk_session_info for that instead.
+
+    Returns a list of hub names and IDs.
     """
     async with _tool_semaphore:
         _t0 = asyncio.get_event_loop().time()
@@ -695,14 +700,19 @@ async def list_folder_contents(hub_name: str, project_name: str, folder_name: st
 @nav_mcp.tool()
 async def autodesk_login(ctx: Context) -> str:
     """
-    Connect your Autodesk Construction Cloud account to this session.
+    Connects the user's personal Autodesk account via 3-legged OAuth.
 
-    Starts (or confirms) a 3-legged OAuth session. On first call, returns
-    an authorization URL — open it in a browser, sign in with your
-    Autodesk credentials, then call this tool again to confirm.
+    Use this when the user says "log me in to Autodesk", "connect my
+    account", or similar.
 
-    Session tokens are stored in memory only and are lost on server
-    restart. After a restart, sign in again.
+    If already logged in, returns a confirmation with the user's name
+    and email. If not logged in, returns an authorization URL the user
+    must open in their browser. After the user signs in via the browser,
+    call this tool again to confirm the session is established.
+
+    Required before using admin tools like create_project, add_user,
+    delete_folder, apply_folder_template, or reprocess_file — those
+    tools will reject requests from unauthenticated sessions.
     """
     async with _tool_semaphore:
         _t0 = asyncio.get_event_loop().time()
@@ -795,12 +805,21 @@ async def autodesk_logout(ctx: Context) -> str:
 @nav_mcp.tool()
 async def autodesk_session_info(ctx: Context) -> str:
     """
-    Shows whether you are currently logged in to Autodesk and which
-    account the session is tied to.
+    THE AUTHORITATIVE way to check Autodesk authentication status.
 
-    Use this to confirm which Autodesk identity write tools (such as
-    create_project, add_user, apply_folder_template) will act as. If
-    not logged in, those tools will refuse the request.
+    USE THIS TOOL — NOT list_hubs or any other tool — when the user
+    asks:
+      - "Am I logged in?"
+      - "What's my session status?"
+      - "Who am I signed in as?"
+      - "Do I need to log in?"
+
+    Other tools may succeed without a personal login because they use
+    a service account. Only this tool can tell you whether the user
+    has a personal 3-legged OAuth session.
+
+    Returns the user's name, email, and session expiry if logged in,
+    or an instruction to use autodesk_login if not.
     """
     async with _tool_semaphore:
         _t0 = asyncio.get_event_loop().time()

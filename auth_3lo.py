@@ -55,7 +55,7 @@ APS_3LO_SCOPES = "data:read data:write data:create viewables:read account:read"
 
 APS_AUTH_URL = "https://developer.api.autodesk.com/authentication/v2/authorize"
 APS_TOKEN_URL = "https://developer.api.autodesk.com/authentication/v2/token"
-APS_USERINFO_URL = "https://developer.api.autodesk.com/userprofile/v1/users/@me"
+APS_USERINFO_URL = "https://api.userprofile.autodesk.com/userinfo"
 
 # --- In-memory session store -----------------------------------------------
 # Keyed by MCP session_id. Entry shape:
@@ -156,24 +156,42 @@ async def refresh_access_token(session_id: str) -> Optional[str]:
 
 
 async def get_user_info(access_token: str) -> dict:
-    """Fetch display name and email from the APS userinfo endpoint.
+    """Fetch display name and email from the OpenID Connect userinfo endpoint.
 
-    Returns a dict with 'name' and 'email' keys. Missing fields are
-    returned as empty strings.
+    Uses ``https://api.userprofile.autodesk.com/userinfo`` (the legacy
+    ``/userprofile/v1/users/@me`` endpoint on developer.api.autodesk.com
+    returns 410 Gone).
+
+    The OIDC response shape is:
+        {
+          "sub":                "...",
+          "name":               "Full Name",
+          "given_name":         "First",
+          "family_name":        "Last",
+          "email":              "user@example.com",
+          "preferred_username": "..."
+        }
+
+    Returns a dict with 'name' and 'email' keys. On any failure (network
+    error, non-2xx response, malformed JSON) this function logs a warning
+    and returns {"name": "Autodesk User", "email": ""} so the caller's
+    auth flow is never interrupted by a profile-lookup failure.
     """
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            APS_USERINFO_URL,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    first = (data.get("firstName") or "").strip()
-    last = (data.get("lastName") or "").strip()
-    name = data.get("name") or f"{first} {last}".strip() or "Autodesk User"
-    email = data.get("emailId") or data.get("email") or ""
-    return {"name": name, "email": email}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                APS_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return {
+            "name": data.get("name", "") or "Autodesk User",
+            "email": data.get("email", "") or "",
+        }
+    except Exception as e:
+        logger.warning("TOKEN 3LO userinfo fetch failed: %s", e)
+        return {"name": "Autodesk User", "email": ""}
 
 
 async def get_user_token(session_id: str) -> Optional[str]:
