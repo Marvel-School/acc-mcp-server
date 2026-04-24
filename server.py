@@ -19,6 +19,7 @@ from auth_3lo import (
     build_auth_url,
     exchange_code,
     get_session_user,
+    get_user_token,
     is_authenticated,
     logout as logout_3lo,
     migrate_pending_tokens,
@@ -349,6 +350,34 @@ async def _resolve_folder_id(hub_id: str, project_id: str, folder_name: str) -> 
     )
 
 
+async def _require_user_token(ctx: Context) -> str:
+    """Return the logged-in user's 3LO access token, or raise ValueError.
+
+    Used by tools that require strict user attribution (writes and
+    permission-sensitive operations). The ValueError message is surfaced
+    verbatim to the LLM so the user sees a clear, actionable instruction.
+    """
+    await migrate_pending_tokens(ctx.session_id)
+    token = await get_user_token(ctx.session_id)
+    if not token:
+        raise ValueError(
+            "This action requires you to be logged in to Autodesk. "
+            "Please use 'autodesk_login' first to authenticate your session."
+        )
+    return token
+
+
+async def _optional_user_token(ctx: Context) -> str | None:
+    """Return the logged-in user's 3LO access token, or None if unauthenticated.
+
+    Used by tools that prefer user-scoped data but can fall back to the
+    service account. Still migrates any pending tokens so that a browser
+    redirect that landed just before this call is honoured.
+    """
+    await migrate_pending_tokens(ctx.session_id)
+    return await get_user_token(ctx.session_id)
+
+
 @nav_mcp.tool()
 async def find_project(name_query: str) -> str:
     """
@@ -473,9 +502,17 @@ async def list_hubs() -> str:
 
 
 @nav_mcp.tool()
-async def list_projects(hub_name: str, fields: str = "") -> str:
+async def list_projects(
+    hub_name: str,
+    fields: str = "",
+    ctx: Context = None,
+) -> str:
     """
     Lists all projects in a hub.
+
+    If you are logged in via autodesk_login, results are scoped to
+    projects your Autodesk account has access to. Otherwise returns
+    all projects the service account can see.
 
     Optionally request extra metadata by passing a comma-separated list of fields
     (e.g. "status,projectValue,postalCode,city,constructionType").
@@ -489,10 +526,15 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
         try:
             logger.info("TOOL %s | params: %s", "list_projects", {"hub": hub_name})
 
+            user_token = await _optional_user_token(ctx) if ctx is not None else None
+
             hub_id = await _resolve_hub_id(hub_name)
 
             field_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
-            projects = await asyncio.to_thread(get_projects, hub_id, 50, field_list)
+            projects = await asyncio.to_thread(
+                get_projects, hub_id, 50, field_list,
+                user_token=user_token,
+            )
             if not projects:
                 logger.info(
                     "TOOL %s | completed in %.2fs", "list_projects",
@@ -514,6 +556,9 @@ async def list_projects(hub_name: str, fields: str = "") -> str:
             _tw = getattr(projects, "truncation_warning", "")
             if _tw:
                 report += f"\n{_tw}"
+
+            if user_token:
+                report = "[Showing results scoped to your account]\n\n" + report
 
             logger.info(
                 "TOOL %s | completed in %.2fs", "list_projects",
@@ -747,6 +792,60 @@ async def autodesk_logout(ctx: Context) -> str:
             return f"Failed to log out: {e}"
 
 
+@nav_mcp.tool()
+async def autodesk_session_info(ctx: Context) -> str:
+    """
+    Shows whether you are currently logged in to Autodesk and which
+    account the session is tied to.
+
+    Use this to confirm which Autodesk identity write tools (such as
+    create_project, add_user, apply_folder_template) will act as. If
+    not logged in, those tools will refuse the request.
+    """
+    async with _tool_semaphore:
+        _t0 = asyncio.get_event_loop().time()
+        try:
+            logger.info(
+                "TOOL %s | params: %s", "autodesk_session_info",
+                {"session": (ctx.session_id or "")[:8]},
+            )
+
+            from auth_3lo import _session_tokens, _session_lock
+            with _session_lock:
+                session = _session_tokens.get(ctx.session_id)
+                snapshot = dict(session) if session else None
+
+            logger.info(
+                "TOOL %s | completed in %.2fs", "autodesk_session_info",
+                asyncio.get_event_loop().time() - _t0,
+            )
+
+            if not snapshot:
+                return (
+                    "You are not currently logged in to Autodesk. "
+                    "Use 'autodesk_login' to connect your account."
+                )
+
+            expires_in = int(snapshot["expires_at"] - time.time())
+            if expires_in < 0:
+                return (
+                    f"Your session for {snapshot['user_name']} has expired. "
+                    f"Use 'autodesk_login' to reconnect."
+                )
+            return (
+                f"Logged in to Autodesk as:\n"
+                f"  Name:  {snapshot['user_name']}\n"
+                f"  Email: {snapshot['user_email']}\n"
+                f"  Session expires in: {expires_in} seconds"
+            )
+        except Exception as e:
+            logger.error(
+                "TOOL %s | failed in %.2fs: %s", "autodesk_session_info",
+                asyncio.get_event_loop().time() - _t0, str(e)[:120],
+            )
+            return f"Failed to get session info: {e}"
+
+
 @bim_mcp.tool()
 async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
     """
@@ -792,12 +891,21 @@ async def inspect_file(hub_name: str, project_name: str, file_name: str) -> str:
 
 
 @bim_mcp.tool()
-async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> str:
+async def reprocess_file(
+    hub_name: str,
+    project_name: str,
+    file_name: str,
+    ctx: Context = None,
+) -> str:
     """
     Trigger a fresh Model Derivative translation job for a file.
 
     Use this when a file shows "No Property Database", translation errors,
     or when count_elements returns 0 unexpectedly.
+
+    REQUIRES: You must be logged in to Autodesk via autodesk_login
+    before using this tool. The translation job is attributed to your
+    user account.
 
     Args:
         hub_name:     The Hub name (e.g. "TBI Holding").
@@ -814,6 +922,8 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
                 {"hub": hub_name, "project": project_name, "file": file_name},
             )
 
+            user_token = await _require_user_token(ctx)
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, _ = await _resolve_project_id(hub_id, project_name)
 
@@ -827,7 +937,10 @@ async def reprocess_file(hub_name: str, project_name: str, file_name: str) -> st
 
             version_urn = await asyncio.to_thread(get_latest_version_urn, project_id, lineage_urn)
 
-            result = await asyncio.to_thread(trigger_translation, version_urn)
+            result = await asyncio.to_thread(
+                trigger_translation, version_urn,
+                user_token=user_token,
+            )
             errors = result.get("errors") or []
             if errors:
                 error_detail = "; ".join(
@@ -927,9 +1040,18 @@ async def count_elements(hub_name: str, project_name: str, file_name: str, categ
 
 
 @admin_mcp.tool()
-async def create_project(hub_name: str, name: str, project_type: str = "ACC") -> str:
+async def create_project(
+    hub_name: str,
+    name: str,
+    project_type: str = "ACC",
+    ctx: Context = None,
+) -> str:
     """
     Creates a new project in the specified Hub.
+
+    REQUIRES: You must be logged in to Autodesk via autodesk_login
+    before using this tool. The project will be created under your
+    user account and the ACC audit log will attribute it to you.
 
     Args:
         hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
@@ -944,17 +1066,24 @@ async def create_project(hub_name: str, name: str, project_type: str = "ACC") ->
                 {"hub": hub_name, "name": name},
             )
 
+            user_token = await _require_user_token(ctx)
+            actor = get_session_user(ctx.session_id) or {}
+
             real_hub_id = await _resolve_hub_id(hub_name)
 
-            result = await asyncio.to_thread(create_acc_project, real_hub_id, name, project_type)
+            result = await asyncio.to_thread(
+                create_acc_project, real_hub_id, name, project_type,
+                user_token=user_token,
+            )
             new_id = result.get("id") or result.get("projectId")
 
             logger.info(
                 "TOOL %s | completed in %.2fs", "create_project",
                 asyncio.get_event_loop().time() - _t0,
             )
+            by = f" (created by {actor['name']})" if actor.get("name") else ""
             if new_id:
-                return f"\u2705 Project '{name}' created successfully. Project ID: {new_id}"
+                return f"\u2705 Project '{name}' created successfully{by}. Project ID: {new_id}"
             else:
                 return "API succeeded, but couldn't parse the new Project ID from the response."
         except ValueError as e:
@@ -972,9 +1101,17 @@ async def create_project(hub_name: str, name: str, project_type: str = "ACC") ->
 
 
 @admin_mcp.tool()
-async def list_project_users(hub_name: str, project_name: str) -> str:
+async def list_project_users(
+    hub_name: str,
+    project_name: str,
+    ctx: Context = None,
+) -> str:
     """
     Lists users assigned to a project (requires Admin permissions).
+
+    If you are logged in via autodesk_login, the list is scoped to
+    members your Autodesk account has visibility into. Otherwise
+    returns all members the service account can see.
 
     Returns up to 100 users. For projects with more than 100 members,
     use check_project_permissions which retrieves the full list.
@@ -991,10 +1128,15 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
                 {"hub": hub_name, "project": project_name},
             )
 
+            user_token = await _optional_user_token(ctx) if ctx is not None else None
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
-            users = await asyncio.to_thread(get_project_users, project_id, 1)
+            users = await asyncio.to_thread(
+                get_project_users, project_id, 1,
+                user_token=user_token,
+            )
             if not users:
                 logger.info(
                     "TOOL %s | completed in %.2fs", "list_project_users",
@@ -1014,6 +1156,9 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
                     f"\nShowing first 100 users — use check_project_permissions "
                     f"for the full list."
                 )
+
+            if user_token:
+                report = "[Showing results scoped to your account]\n\n" + report
 
             logger.info(
                 "TOOL %s | completed in %.2fs", "list_project_users",
@@ -1035,9 +1180,18 @@ async def list_project_users(hub_name: str, project_name: str) -> str:
 
 
 @admin_mcp.tool()
-async def add_user(hub_name: str, project_name: str, email: str) -> str:
+async def add_user(
+    hub_name: str,
+    project_name: str,
+    email: str,
+    ctx: Context = None,
+) -> str:
     """
     Adds a user to a project by email.
+
+    REQUIRES: You must be logged in to Autodesk via autodesk_login
+    before using this tool. The invitation will be attributed to your
+    user account in the ACC audit log.
 
     Args:
         hub_name:     The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
@@ -1052,15 +1206,22 @@ async def add_user(hub_name: str, project_name: str, email: str) -> str:
                 {"hub": hub_name, "project": project_name, "email": email},
             )
 
+            user_token = await _require_user_token(ctx)
+            actor = get_session_user(ctx.session_id) or {}
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
 
-            await asyncio.to_thread(add_project_user, project_id, email, ["docs"])
+            await asyncio.to_thread(
+                add_project_user, project_id, email, ["docs"],
+                user_token=user_token,
+            )
             logger.info(
                 "TOOL %s | completed in %.2fs", "add_user",
                 asyncio.get_event_loop().time() - _t0,
             )
-            return f"\u2705 User '{email}' added to project '{resolved_name}'."
+            by = f" (invited by {actor['name']})" if actor.get("name") else ""
+            return f"\u2705 User '{email}' added to project '{resolved_name}'{by}."
         except ValueError as e:
             logger.info(
                 "TOOL %s | user error in %.2fs: %s", "add_user",
@@ -1262,9 +1423,13 @@ async def check_project_permissions(hub_name: str, project_name: str) -> str:
 
 
 @admin_mcp.tool()
-async def find_user_projects(user_name: str) -> str:
+async def find_user_projects(user_name: str, ctx: Context = None) -> str:
     """
     Lists every ACC project a specific user has access to.
+
+    If you are logged in via autodesk_login, results are scoped to
+    projects your Autodesk account can see. Otherwise returns the full
+    list the service account can see.
 
     Automatically searches ALL accessible hubs in parallel — no hub
     parameter is needed. Resolves the user by display name (substring,
@@ -1280,6 +1445,8 @@ async def find_user_projects(user_name: str) -> str:
         _t0 = asyncio.get_event_loop().time()
         try:
             logger.info("TOOL %s | params: %s", "find_user_projects", {"user": user_name})
+
+            user_token = await _optional_user_token(ctx) if ctx is not None else None
 
             hubs = await asyncio.to_thread(get_hubs)
             if not hubs:
@@ -1301,7 +1468,10 @@ async def find_user_projects(user_name: str) -> str:
 
             # Query all hubs in parallel.
             tasks = [
-                asyncio.to_thread(get_user_projects, account_id, user_name)
+                asyncio.to_thread(
+                    get_user_projects, account_id, user_name,
+                    user_token=user_token,
+                )
                 for account_id, _ in hub_pairs
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1354,18 +1524,20 @@ async def find_user_projects(user_name: str) -> str:
                     + ", ".join(hub_errors)
                 )
 
+            scope_prefix = "[Showing results scoped to your account]\n\n" if user_token else ""
+
             if total_projects == 0:
                 logger.info(
                     "TOOL %s | completed in %.2fs", "find_user_projects",
                     asyncio.get_event_loop().time() - _t0,
                 )
-                return header + "\n\nNo project assignments found (or insufficient admin permissions)."
+                return scope_prefix + header + "\n\nNo project assignments found (or insufficient admin permissions)."
 
             logger.info(
                 "TOOL %s | completed in %.2fs", "find_user_projects",
                 asyncio.get_event_loop().time() - _t0,
             )
-            return header + "\n" + "\n".join(lines)
+            return scope_prefix + header + "\n" + "\n".join(lines)
 
         except ValueError as e:
             logger.info(
@@ -1382,10 +1554,19 @@ async def find_user_projects(user_name: str) -> str:
 
 
 @admin_mcp.tool()
-async def apply_folder_template(hub_name: str, source_project_name: str, dest_project_name: str) -> str:
+async def apply_folder_template(
+    hub_name: str,
+    source_project_name: str,
+    dest_project_name: str,
+    ctx: Context = None,
+) -> str:
     """
     Copies the folder structure from a Source Project to a Destination Project.
     Executes immediately — no preview or confirmation step.
+
+    REQUIRES: You must be logged in to Autodesk via autodesk_login
+    before using this tool. Every folder created by this operation is
+    attributed to your user account in the ACC audit log.
 
     Source and destination may live in different hubs; cross-hub resolution
     is automatic. Only folders are copied, not files. Folders that already
@@ -1415,6 +1596,9 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
                 },
             )
 
+            user_token = await _require_user_token(ctx)
+            actor = get_session_user(ctx.session_id) or {}
+
             hub_id = await _resolve_hub_id(hub_name)
 
             # Resolve both projects — cross-hub fallback is automatic.
@@ -1427,8 +1611,12 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
             src_hub_name = hub_names.get(src_hub_id, src_hub_id)
             dst_hub_name = hub_names.get(dst_hub_id, dst_hub_id)
 
-            # Execute immediately — no preview.
-            summary = await asyncio.to_thread(replicate_folders, src_hub_id, src_id, dst_id)
+            # Execute immediately — no preview. Only the folder-create writes
+            # use the 3LO token; listing the source stays on the service token.
+            summary = await asyncio.to_thread(
+                replicate_folders, src_hub_id, src_id, dst_id,
+                user_token=user_token,
+            )
 
             # Extract folder count from summary string (e.g. "Successfully copied 12 folders …")
             count_match = re.search(r"(\d+)\s+folders", summary)
@@ -1438,11 +1626,12 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
                 "TOOL %s | completed in %.2fs", "apply_folder_template",
                 asyncio.get_event_loop().time() - _t0,
             )
+            by = f"\nCopied by: {actor['name']}" if actor.get("name") else ""
             return (
                 f"\u2705 Folder structure copied successfully.\n"
                 f"Source: {src_name} (hub: {src_hub_name})\n"
                 f"Destination: {dst_name} (hub: {dst_hub_name})\n"
-                f"Folders created: {count}\n\n"
+                f"Folders created: {count}{by}\n\n"
                 f"If some folders already existed they were skipped."
             )
         except ValueError as e:
@@ -1460,10 +1649,19 @@ async def apply_folder_template(hub_name: str, source_project_name: str, dest_pr
 
 
 @admin_mcp.tool()
-async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> str:
+async def delete_folder(
+    hub_name: str,
+    project_name: str,
+    folder_name: str,
+    ctx: Context = None,
+) -> str:
     """
     Deletes (hides) a specific top-level folder within a project.
     Useful for cleaning up mistakes or removing unwanted template folders.
+
+    REQUIRES: You must be logged in to Autodesk via autodesk_login
+    before using this tool. The delete action is attributed to your
+    user account in the ACC audit log.
 
     Args:
         hub_name:      The Hub name (e.g. "TBI Holding"). Use list_hubs to find names.
@@ -1478,16 +1676,23 @@ async def delete_folder(hub_name: str, project_name: str, folder_name: str) -> s
                 {"hub": hub_name, "project": project_name, "folder": folder_name},
             )
 
+            user_token = await _require_user_token(ctx)
+            actor = get_session_user(ctx.session_id) or {}
+
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, found_id, _ = await _resolve_project_id(hub_id, project_name)
 
-            result = await asyncio.to_thread(soft_delete_folder, hub_id, found_id, folder_name)
+            result = await asyncio.to_thread(
+                soft_delete_folder, hub_id, found_id, folder_name,
+                user_token=user_token,
+            )
             logger.info(
                 "TOOL %s | completed in %.2fs", "delete_folder",
                 asyncio.get_event_loop().time() - _t0,
             )
+            by = f" (deleted by {actor['name']})" if actor.get("name") else ""
             if result.startswith("Successfully"):
-                return f"\u2705 {result}"
+                return f"\u2705 {result}{by}"
             return result
         except ValueError as e:
             logger.info(
@@ -1958,7 +2163,7 @@ if __name__ == "__main__":
         "SERVER starting | port=%d | tools=%d | cors_origins=%s | "
         "viewer_patches=%d/3",
         PORT,
-        20,
+        21,
         ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else "* (all)",
         _viewer_patches_applied,
     )
