@@ -899,6 +899,7 @@ def create_acc_project(
                     header is omitted in that case because ACC derives
                     the acting user from the bearer token.
     """
+    logger.info(f"[DEBUG] create_acc_project called with user_token={'present' if user_token else 'None'}")
     account_id = _strip_b_prefix(hub_id)
 
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
