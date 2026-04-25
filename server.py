@@ -11,7 +11,6 @@ import pathlib
 import contextvars
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from pythonjsonlogger.jsonlogger import JsonFormatter
 from fastmcp import FastMCP, Context
 from fastmcp.tools.tool import ToolResult
 from auth import get_token, get_viewer_token
@@ -61,12 +60,14 @@ class _RequestIdFilter(logging.Filter):
         return True
 
 
-# --- Structured JSON logging ------------------------------------------------
+# --- Human-readable text logging --------------------------------------------
+# JSON output was unreadable in the Azure Log Stream UI; column-aligned
+# plain text is far easier to scan there.
 _log_handler = logging.StreamHandler()
 _log_handler.setFormatter(
-    JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(request_id)s %(message)s",
-        rename_fields={"asctime": "timestamp", "levelname": "level"},
+    logging.Formatter(
+        fmt="%(asctime)s %(levelname)-5s [%(request_id)s] %(name)-28s | %(message)s",
+        datefmt="%H:%M:%S",
     )
 )
 _log_handler.addFilter(_RequestIdFilter())
