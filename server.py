@@ -78,6 +78,19 @@ logging.root.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
+# Override MCP framework logger levels — must happen AFTER FastMCP
+# imports because the framework re-applies its own logging config.
+logging.getLogger("mcp.server.streamable_http_manager").setLevel(logging.WARNING)
+logging.getLogger("mcp.server.lowlevel.server").setLevel(logging.WARNING)
+logging.getLogger("mcp").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+# Tame docket worker startup noise — emits 4 lines per worker on boot
+logging.getLogger("docket.worker").setLevel(logging.WARNING)
+
+# Silence authlib deprecation warnings — handled at import level
+logging.getLogger("authlib").setLevel(logging.WARNING)
+
 admin_mcp = FastMCP("ACC_Admin")
 nav_mcp = FastMCP("ACC_Navigator")
 bim_mcp = FastMCP("ACC_BIM")
@@ -2017,13 +2030,24 @@ if __name__ == "__main__":
     from starlette.routing import Mount, Route
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    # Paths that bypass the X-API-Key check on GET requests.
+    # MCP protocol traffic at /mcp/<name>/ (with trailing slash) is NOT
+    # listed here — it still requires the API key. Only the no-trailing-
+    # slash status probes at /mcp/<name> are exempt.
+    _EXEMPT_GET_PATHS: frozenset[str] = frozenset({
+        "/health",     # Azure health probes
+        "/callback",   # Autodesk OAuth redirect
+        "/mcp/admin",  # bare-GET status probe for the admin endpoint
+        "/mcp/nav",    # bare-GET status probe for the nav endpoint
+        "/mcp/bim",    # bare-GET status probe for the bim endpoint
+    })
+
     class APIKeyMiddleware:
         """Rejects requests without a valid X-API-Key header.
 
-        Exempt paths:
-          - GET /health    — Azure health probes (no credentials).
-          - GET /callback  — Autodesk OAuth redirect (signed by state+code,
-                             Autodesk's server cannot send an X-API-Key).
+        Exempt paths (GET only) are listed in _EXEMPT_GET_PATHS above.
+        These cover Azure health probes, the Autodesk OAuth redirect,
+        and bare-GET status probes from MCP-aware connector frameworks.
         Assigns a short correlation ID to every request for log tracing.
         """
 
@@ -2034,9 +2058,9 @@ if __name__ == "__main__":
             if scope["type"] == "http":
                 _request_id.set(uuid.uuid4().hex[:8])
                 request = Request(scope)
-                exempt = request.method == "GET" and request.url.path in (
-                    "/health",
-                    "/callback",
+                exempt = (
+                    request.method == "GET"
+                    and request.url.path in _EXEMPT_GET_PATHS
                 )
                 if not exempt:
                     if not hmac.compare_digest(
@@ -2085,6 +2109,22 @@ if __name__ == "__main__":
             },
             status_code=503,
         )
+
+    async def mcp_endpoint_status(request: Request) -> JSONResponse:
+        """Status response for bare GETs on MCP endpoints.
+
+        Real MCP traffic uses POST with a session header — those go to
+        the Mount sub-app at /mcp/.../  (with trailing slash). This route
+        catches the no-trailing-slash GETs from health probes and returns
+        a clean 200 instead of a 404.
+        """
+        endpoint_name = request.url.path.split("/")[-1]
+        return JSONResponse({
+            "status": "ok",
+            "endpoint": endpoint_name,
+            "type": "mcp_streamable_http",
+            "note": "Use POST with mcp-session-id header for MCP protocol calls",
+        })
 
     async def oauth_callback(request: Request) -> HTMLResponse:
         """Handle the Autodesk 3LO redirect after the user signs in.
@@ -2160,6 +2200,9 @@ if __name__ == "__main__":
         routes=[
             Route("/health", health_check),
             Route("/callback", oauth_callback),
+            Route("/mcp/admin", mcp_endpoint_status),
+            Route("/mcp/nav", mcp_endpoint_status),
+            Route("/mcp/bim", mcp_endpoint_status),
             Mount("/mcp/admin", app=admin_asgi),
             Mount("/mcp/nav", app=nav_asgi),
             Mount("/mcp/bim", app=bim_asgi),
