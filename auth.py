@@ -52,13 +52,13 @@ def _fetch_token(scope: str, cache: dict, lock: threading.Lock, force_refresh: b
     """
     with lock:
         if not force_refresh and time.time() < cache["expires_at"]:
-            logger.debug(f"Using cached token (expires in {int(cache['expires_at'] - time.time())}s)")
+            logger.debug(
+                "TOKEN cache hit (expires in %.0fs)",
+                cache["expires_at"] - time.time(),
+            )
             return cache["access_token"]
 
-        if force_refresh:
-            logger.info("Force refreshing token (requested by caller)")
-
-        logger.info(f"Authenticating with scopes: {scope}")
+        logger.info("TOKEN requesting new token (scopes: %s)", scope[:40])
 
         resp = requests.post(
             "https://developer.api.autodesk.com/authentication/v2/token",
@@ -76,9 +76,10 @@ def _fetch_token(scope: str, cache: dict, lock: threading.Lock, force_refresh: b
             resp.raise_for_status()
 
         token_data = resp.json()
+        expires_in = token_data["expires_in"]
         cache["access_token"] = token_data["access_token"]
-        cache["expires_at"] = time.time() + token_data["expires_in"] - 60
-        logger.info("Token acquired successfully.")
+        cache["expires_at"] = time.time() + expires_in - 60
+        logger.info("TOKEN acquired (expires in %ds)", expires_in)
         return cache["access_token"]
 
 

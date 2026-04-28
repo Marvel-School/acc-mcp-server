@@ -42,6 +42,17 @@ _CHUNK_SIZE = 65536
 _BUFFER_OVERLAP = 512
 _PROJECT_CACHE_TTL = 300  # seconds
 
+# Base Autodesk API domain — stripped from URLs in log lines so the log
+# stream shows short paths (e.g. /project/v1/hubs) instead of full URLs.
+_API_BASE = "https://developer.api.autodesk.com"
+
+
+def _short_url(url: str) -> str:
+    """Return a log-friendly path by stripping the Autodesk API base domain."""
+    if url and url.startswith(_API_BASE):
+        return url[len(_API_BASE):]
+    return url or ""
+
 
 class ResultList(list):
     """List subclass that can carry an optional truncation warning.
@@ -139,6 +150,7 @@ def _make_request(
     *,
     extra_headers: Optional[dict] = None,
     retry_on_401: bool = True,
+    user_token: Optional[str] = None,
     **kwargs,
 ) -> requests.Response:
     """
@@ -148,23 +160,37 @@ def _make_request(
       - Authorization: Bearer <token>
       - x-ads-region: EMEA
       - 15 s default timeout (callers can override)
-      - One retry on 401 (token refresh)
+      - One retry on 401 (token refresh)  [service token only]
       - One retry on 429 (respects Retry-After header)
       - One retry on 5xx (500/502/503/504) with 2 s backoff
 
     All HTTP calls are gated by ``_api_semaphore`` (max 10 concurrent)
     to prevent a thundering herd against the Autodesk API.
 
+    Args:
+        user_token: If provided, used as the bearer token instead of the
+                    service-account token. 401 retry is disabled because
+                    a 401 on a user token means the user needs to re-auth —
+                    not that we have a stale service token.
+
     Raises:
         ValueError: On any 4xx/5xx response (with Autodesk error detail).
     """
     kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
-    max_attempts = 2 if retry_on_401 else 1
+    # Disable 401-refresh retry when a user token is supplied: refreshing
+    # the service-account token would not help, and the user must re-auth.
+    effective_retry_on_401 = retry_on_401 and user_token is None
+    max_attempts = 2 if effective_retry_on_401 else 1
     last_resp: requests.Response = None  # type: ignore[assignment]
+    short = _short_url(url)
+    elapsed = 0.0
 
     try:
         for attempt in range(max_attempts):
-            token = get_token(force_refresh=(attempt > 0))
+            if user_token is not None:
+                token = user_token
+            else:
+                token = get_token(force_refresh=(attempt > 0))
             headers = {
                 "Authorization": f"Bearer {token}",
                 "x-ads-region": "EMEA",
@@ -172,32 +198,45 @@ def _make_request(
             if extra_headers:
                 headers.update(extra_headers)
 
+            logger.debug("API %s %s", method, short)
+            _req_start = time.monotonic()
             with _api_semaphore:
                 last_resp = requests.request(method, url, headers=headers, **kwargs)
+            elapsed = time.monotonic() - _req_start
 
             # --- 429 rate limit retry ---
             if last_resp.status_code == 429:
                 wait = int(last_resp.headers.get("Retry-After", 5))
-                logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
+                logger.warning(
+                    "API 429 — rate limited, waiting %ss | %s %s",
+                    wait, method, short,
+                )
                 time.sleep(wait)
-                token = get_token(force_refresh=True)
-                headers["Authorization"] = f"Bearer {token}"
+                # Only refresh the service token — never the user token.
+                if user_token is None:
+                    token = get_token(force_refresh=True)
+                    headers["Authorization"] = f"Bearer {token}"
+                _req_start = time.monotonic()
                 with _api_semaphore:
                     last_resp = requests.request(method, url, headers=headers, **kwargs)
+                elapsed = time.monotonic() - _req_start
                 break
 
             # --- 5xx server error retry (one attempt, 2 s backoff) ---
             if last_resp.status_code in (500, 502, 503, 504) and attempt == 0:
                 logger.warning(
-                    "Autodesk API returned %d on %s %s — retrying in 2s",
-                    last_resp.status_code, method, url[:80],
+                    "API %s — server error, retrying in 2s | %s %s",
+                    last_resp.status_code, method, short,
                 )
                 time.sleep(2)
                 continue
 
             # --- 401 stale token retry ---
-            if last_resp.status_code == 401 and attempt == 0 and retry_on_401:
-                logger.warning(f"401 on {method} {url[:80]} — refreshing token")
+            if last_resp.status_code == 401 and attempt == 0 and effective_retry_on_401:
+                logger.warning(
+                    "API 401 — refreshing token and retrying | %s %s",
+                    method, short,
+                )
                 continue
 
             break
@@ -214,9 +253,16 @@ def _make_request(
                     error_detail = error_json.get("detail", last_resp.text)
             except ValueError:
                 pass
-            logger.error(f"API HTTP Error ({last_resp.status_code}): {error_detail}")
+            logger.error(
+                "API %s %s | failed with %s: %s",
+                method, short, last_resp.status_code, str(error_detail)[:120],
+            )
             raise ValueError(f"Autodesk API Error {last_resp.status_code}: {error_detail}") from http_err
 
+        logger.info(
+            "API %s %s | %s | %.2fs",
+            method, short, last_resp.status_code, elapsed,
+        )
         return last_resp
 
     except ValueError:
@@ -262,7 +308,9 @@ def _get_hub_id() -> str:
     with _hub_cache_lock:
         now = time.monotonic()
         if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
+            logger.debug("CACHE hit  hub_id=%s", _cached_hub_id)
             return _cached_hub_id
+        logger.debug("CACHE miss hub_id \u2014 fetching")
         hubs = get_hubs()
         if not hubs:
             raise ValueError(
@@ -290,6 +338,7 @@ def get_projects(
     hub_id: str,
     limit: int = 50,
     fields: Optional[list] = None,
+    user_token: Optional[str] = None,
 ) -> ResultList:
     """List all projects in a hub (follows pagination automatically).
 
@@ -298,22 +347,29 @@ def get_projects(
     Use ``invalidate_project_cache()`` to evict a specific hub's entry.
 
     Args:
-        hub_id: Hub ID (starts with 'b.').
-        limit:  Max projects per page (default 50, max 100 per Autodesk API).
-        fields: Optional list of extra fields to include (e.g. ["status", "projectValue"]).
+        hub_id:     Hub ID (starts with 'b.').
+        limit:      Max projects per page (default 50, max 100 per Autodesk API).
+        fields:     Optional list of extra fields to include (e.g. ["status", "projectValue"]).
+        user_token: Optional 3LO access token. When supplied the result set
+                    is scoped to projects the user can see and the shared
+                    cache is bypassed (writing/reading user-scoped data into
+                    the shared cache would leak visibility across users).
     """
     hub_id = ensure_b_prefix(hub_id)
 
-    # --- Check cache (only when no custom fields are requested) ---
-    use_cache = fields is None or fields == []
+    # --- Check cache (only when no custom fields are requested AND we are
+    #     using the service token — user-scoped results must not pollute
+    #     the shared cache).
+    use_cache = (fields is None or fields == []) and user_token is None
     if use_cache:
         with _project_cache_lock:
             cached = _project_cache.get(hub_id)
             if cached is not None:
                 cached_list, cached_at = cached
                 if (time.monotonic() - cached_at) < _PROJECT_CACHE_TTL:
-                    logger.debug("Project cache hit for hub %s (%d projects)", hub_id, len(cached_list))
+                    logger.debug("CACHE hit  projects[%s]", hub_id)
                     return cached_list
+        logger.debug("CACHE miss projects[%s] — fetching", hub_id)
 
     # --- Fetch from API ---
     base = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects?page[limit]={limit}"
@@ -323,8 +379,12 @@ def get_projects(
     all_projects: ResultList = ResultList()
 
     _hit_cap = True
+    page_count = 0
     for _ in range(_MAX_PROJECT_PAGES):  # safety cap
-        resp = _make_request("GET", url)  # type: ignore[arg-type]
+        page_count += 1
+        if page_count > 1:
+            logger.debug("PAGINATE projects[%s] page %d", hub_id, page_count)
+        resp = _make_request("GET", url, user_token=user_token)  # type: ignore[arg-type]
         data = resp.json()
         all_projects.extend(data.get("data", []))
 
@@ -347,10 +407,13 @@ def get_projects(
         )
         logger.warning(all_projects.truncation_warning)
 
-    # --- Store in cache (only default-field responses) ---
+    # --- Store in cache (only default-field, service-token responses) ---
     if use_cache:
         with _project_cache_lock:
             _project_cache[hub_id] = (all_projects, time.monotonic())
+        logger.debug(
+            "CACHE stored projects[%s] (%d projects)", hub_id, len(all_projects),
+        )
 
     return all_projects
 
@@ -518,6 +581,11 @@ def find_design_files(
         scanned += 1
 
         logger.info(f"  Scanning {scanned}/{_MAX_FOLDER_SCAN} (depth {current['depth']}): {current['name']}")
+        if scanned % 10 == 0:
+            logger.debug(
+                "BFS scan: %d folders scanned so far in project %s",
+                scanned, project_id[:20],
+            )
         try:
             contents = get_folder_contents(project_id, current["id"])
         except Exception as e:
@@ -737,6 +805,7 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
 
     count = 0
     buffer = b""
+    chunk_count = 0
 
     resp = _make_request("GET", url, stream=True, timeout=_STREAM_TIMEOUT)
     try:
@@ -746,6 +815,7 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
             if not chunk:
                 continue
 
+            chunk_count += 1
             buffer += chunk
             matches = list(pattern.finditer(buffer))
             count += len(matches)
@@ -754,6 +824,12 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
                 buffer = buffer[matches[-1].end():]
             else:
                 buffer = buffer[-_BUFFER_OVERLAP:]
+
+            if chunk_count % 10 == 0:
+                logger.debug(
+                    "STREAM count: %d chunks processed, %d matches so far",
+                    chunk_count, count,
+                )
 
     except requests.exceptions.HTTPError as e:
         raise ValueError(f"HTTP error streaming metadata: {e}")
@@ -766,10 +842,17 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     return count
 
 
-def trigger_translation(version_urn: str) -> dict[str, Any]:
+def trigger_translation(
+    version_urn: str,
+    user_token: Optional[str] = None,
+) -> dict[str, Any]:
     """
     Triggers a fresh Model Derivative translation job (SVF Classic).
     Uses x-ads-force to overwrite existing partial derivatives.
+
+    Args:
+        user_token: Optional 3LO access token; attributes the translation
+                    job to the logged-in user when supplied.
     """
     logger.info(f"[Translation] Starting job for: {version_urn[:80]}...")
 
@@ -789,6 +872,7 @@ def trigger_translation(version_urn: str) -> dict[str, Any]:
             "Content-Type": "application/json",
         },
         json=payload,
+        user_token=user_token,
     )
 
     result = resp.json()
@@ -797,14 +881,26 @@ def trigger_translation(version_urn: str) -> dict[str, Any]:
 
 
 
-def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict[str, Any]:
+def create_acc_project(
+    hub_id: str,
+    project_name: str,
+    project_type: str = "BIM360",
+    user_token: Optional[str] = None,
+) -> dict[str, Any]:
     """Creates a project using the ACC Account Admin API.
 
     After a successful creation the project-list cache for this hub is
     invalidated so subsequent ``get_projects`` calls see the new project.
+
+    Args:
+        user_token: Optional 3LO access token. When supplied, the request
+                    runs on behalf of the logged-in user (and the ACC
+                    audit log records them as the creator). The X-User-Id
+                    header is omitted in that case because ACC derives
+                    the acting user from the bearer token.
     """
+    logger.info(f"[DEBUG] create_acc_project called with user_token={'present' if user_token else 'None'}")
     account_id = _strip_b_prefix(hub_id)
-    user_id = _get_admin_user_id()
 
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
     payload = {
@@ -818,8 +914,20 @@ def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM3
         "postalCode": os.environ.get("DEFAULT_PROJECT_POSTAL_CODE", ""),
     }
 
-    logger.info(f"POSTing to {endpoint} with User-Id: {user_id}")
-    resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
+    extra_headers: dict[str, str] = {}
+    if user_token is None:
+        # Service-token path — impersonate the configured admin.
+        user_id = _get_admin_user_id()
+        extra_headers["User-Id"] = user_id
+        logger.info(f"POSTing to {endpoint} with User-Id: {user_id}")
+    else:
+        logger.info(f"POSTing to {endpoint} with 3LO user token")
+
+    resp = _make_request(
+        "POST", endpoint, json=payload,
+        extra_headers=extra_headers or None,
+        user_token=user_token,
+    )
     logger.info("Project creation API responded successfully.")
 
     # Invalidate the project-list cache so the new project appears on next fetch.
@@ -854,6 +962,7 @@ def _paginate_project_users(
     project_id: str,
     max_pages: int,
     include_permissions: bool,
+    user_token: Optional[str] = None,
 ) -> ResultList:
     """Shared pagination helper for project user endpoints.
 
@@ -866,6 +975,9 @@ def _paginate_project_users(
         include_permissions: If True, enrich each record with role/product/
                              access-level details.  If False, return the raw
                              API record with only the name sanitised.
+        user_token:          Optional 3LO access token. When supplied the
+                             result set is scoped to users visible to the
+                             logged-in user.
     """
     clean_id = _strip_b_prefix(project_id)
     endpoint = (
@@ -877,8 +989,12 @@ def _paginate_project_users(
     url: Optional[str] = endpoint
 
     _hit_cap = True
+    page_count = 0
     for _ in range(max_pages):
-        resp = _make_request("GET", url)  # type: ignore[arg-type]
+        page_count += 1
+        if page_count > 1:
+            logger.debug("PAGINATE users[%s] page %d", clean_id, page_count)
+        resp = _make_request("GET", url, user_token=user_token)  # type: ignore[arg-type]
         data = resp.json()
 
         for raw in data.get("results", []):
@@ -922,13 +1038,25 @@ def _paginate_project_users(
     return all_users
 
 
-def get_project_users(project_id: str, max_pages: int = _MAX_USER_PAGES) -> ResultList:
+def get_project_users(
+    project_id: str,
+    max_pages: int = _MAX_USER_PAGES,
+    user_token: Optional[str] = None,
+) -> ResultList:
     """List users in a project (requires Admin).
 
     Thin wrapper around _paginate_project_users — returns simplified records
     with sanitised names.
+
+    Args:
+        user_token: Optional 3LO access token. When supplied the result set
+                    is scoped to members visible to the logged-in user.
     """
-    return _paginate_project_users(project_id, max_pages, include_permissions=False)
+    return _paginate_project_users(
+        project_id, max_pages,
+        include_permissions=False,
+        user_token=user_token,
+    )
 
 
 def get_project_user_permissions(project_id: str) -> ResultList:
@@ -949,28 +1077,43 @@ def get_project_user_permissions(project_id: str) -> ResultList:
     return result
 
 
-def add_project_user(project_id: str, email: str, products: list[str] | None = None) -> dict[str, Any]:
+def add_project_user(
+    project_id: str,
+    email: str,
+    products: list[str] | None = None,
+    user_token: Optional[str] = None,
+) -> dict[str, Any]:
     """
     Add a user to a project.
 
     Args:
         project_id: The project ID.
-        email: User's email address.
-        products: Product keys (e.g. ["docs"]). Defaults to ["docs"].
+        email:      User's email address.
+        products:   Product keys (e.g. ["docs"]). Defaults to ["docs"].
+        user_token: Optional 3LO access token. When supplied the ACC audit
+                    log records the logged-in user as the inviter. The
+                    X-User-Id header is omitted in that case.
     """
     clean_project_id = _strip_b_prefix(project_id)
 
     if products is None:
         products = ["docs"]
 
-    user_id = _get_admin_user_id()
-
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
     payload = {
         "email": email,
         "products": [{"key": p, "access": "administrator"} for p in products],
     }
-    resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
+
+    extra_headers: dict[str, str] = {}
+    if user_token is None:
+        extra_headers["User-Id"] = _get_admin_user_id()
+
+    resp = _make_request(
+        "POST", endpoint, json=payload,
+        extra_headers=extra_headers or None,
+        user_token=user_token,
+    )
     return resp.json()
 
 
@@ -1053,7 +1196,11 @@ def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -
     return result, skipped_projects
 
 
-def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
+def get_user_projects(
+    account_id: str,
+    user_name_or_email: str,
+    user_token: Optional[str] = None,
+) -> dict:
     """
     Resolves a user by display name or email and returns every project they
     have access to within the account.
@@ -1097,7 +1244,7 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
             f"https://developer.api.autodesk.com/hq/v1/regions/eu"
             f"/accounts/{clean_account_id}/users/search?email={query.lower()}"
         )
-        candidates: list = _make_request("GET", search_url).json()
+        candidates: list = _make_request("GET", search_url, user_token=user_token).json()
     else:
         # Slow path: paginate through all account users, filter by name
         candidates = []
@@ -1110,7 +1257,7 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
                 f"https://developer.api.autodesk.com/hq/v1/regions/eu"
                 f"/accounts/{clean_account_id}/users?limit={limit}&offset={offset}"
             )
-            page: list = _make_request("GET", list_url).json()
+            page: list = _make_request("GET", list_url, user_token=user_token).json()
             for u in page:
                 full = (
                     u.get("name")
@@ -1174,12 +1321,20 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
         projects: list[dict] = []
         proj_url: Optional[str] = proj_base_url
         _hit_proj_cap = True
+        user_page_count = 0
 
         for _ in range(_MAX_USER_PAGES):
+            user_page_count += 1
+            if user_page_count > 1:
+                logger.debug(
+                    "PAGINATE user-projects[%s] page %d",
+                    target_uid, user_page_count,
+                )
             raw = _make_request(
                 "GET",
                 proj_url,  # type: ignore[arg-type]
                 extra_headers={"Region": "EMEA"},
+                user_token=user_token,
             ).json()
             # Unified endpoint returns projects inside a 'results' array.
             for p in raw.get("results", []):
@@ -1232,13 +1387,20 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
         ) from api_err
 
 
-def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> dict:
+def create_folder(
+    project_id: str,
+    parent_folder_id: str,
+    folder_name: str,
+    user_token: Optional[str] = None,
+) -> dict:
     """Creates a subfolder inside a parent folder using the Data Management API.
 
     Args:
         project_id:       Project ID (will be b.-prefixed automatically).
         parent_folder_id: The ID of the parent folder.
         folder_name:      Name for the new folder.
+        user_token:       Optional 3LO access token; attributes folder creation
+                          to the logged-in user when supplied.
 
     Returns:
         The created folder object from the API.
@@ -1267,6 +1429,7 @@ def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> d
     resp = _make_request(
         "POST", url, json=payload,
         extra_headers={"Content-Type": "application/vnd.api+json"},
+        user_token=user_token,
     )
     return resp.json()
 
@@ -1276,6 +1439,7 @@ def replicate_folders(
     source_project_id: str,
     dest_project_id: str,
     max_depth: int = 5,
+    user_token: Optional[str] = None,
 ) -> str:
     """Recursively copies the folder structure from a source project to a destination project.
 
@@ -1291,6 +1455,11 @@ def replicate_folders(
         source_project_id:  Source project ID.
         dest_project_id:    Destination project ID.
         max_depth:          Maximum folder nesting depth (default 5).
+        user_token:         Optional 3LO access token. Only the folder-create
+                            writes use it; listing source contents stays on
+                            the service token so replication does not fail
+                            when the user lacks read access to source system
+                            folders.
 
     Returns:
         Summary string with the count of created folders.
@@ -1331,7 +1500,10 @@ def replicate_folders(
             full_path = f"{path}/{name}"
 
             try:
-                result = create_folder(dest_project_id, dst_parent_id, name)
+                result = create_folder(
+                    dest_project_id, dst_parent_id, name,
+                    user_token=user_token,
+                )
                 new_folder_id = result.get("data", {}).get("id")
                 count += 1
                 logger.info(f"  Created: {full_path}")
@@ -1347,16 +1519,26 @@ def replicate_folders(
     return f"Successfully copied {count} folders from source to destination."
 
 
-def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
+def soft_delete_folder(
+    hub_id: str,
+    project_id: str,
+    folder_name: str,
+    user_token: Optional[str] = None,
+) -> str:
     """Hides a top-level folder inside a project's 'Project Files' root.
 
     Searches for the folder by name (case-insensitive), then sends a PATCH
     to set ``hidden: true`` on it.
 
     Args:
-        hub_id:     Hub ID (needed to list top folders).
-        project_id: Project ID.
+        hub_id:      Hub ID (needed to list top folders).
+        project_id:  Project ID.
         folder_name: Name of the folder to hide.
+        user_token:  Optional 3LO access token; attributes the hide action
+                     to the logged-in user when supplied. Only the PATCH
+                     uses the user token — directory reads stay on the
+                     service token so the lookup cannot fail for users
+                     without deep read permissions.
 
     Returns:
         Success or not-found message.
@@ -1405,6 +1587,7 @@ def soft_delete_folder(hub_id: str, project_id: str, folder_name: str) -> str:
     _make_request(
         "PATCH", url, json=payload,
         extra_headers={"Content-Type": "application/vnd.api+json"},
+        user_token=user_token,
     )
     logger.info(f"Folder '{matched_name}' hidden in project {project_id}")
     return f"Successfully deleted folder '{matched_name}'."
