@@ -62,7 +62,7 @@ APS_REDIRECT_URI = os.environ.get(
     "APS_REDIRECT_URI",
     "https://autodesk-agent-dev.azurewebsites.net/callback",
 )
-APS_3LO_SCOPES = "data:read data:write data:create viewables:read account:read"
+APS_3LO_SCOPES = "data:read data:write data:create viewables:read account:read account:write"
 
 APS_AUTH_URL = "https://developer.api.autodesk.com/authentication/v2/authorize"
 APS_TOKEN_URL = "https://developer.api.autodesk.com/authentication/v2/token"
