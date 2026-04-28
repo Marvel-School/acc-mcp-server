@@ -152,6 +152,30 @@ async def delete_token_by_email(email: str) -> bool:
     return deleted
 
 
+def _list_user_emails() -> list[str]:
+    # select=["PartitionKey"] keeps the response payload tiny — we only
+    # care about the partition keys (emails), not the token columns.
+    entities = tokens_table.list_entities(select=["PartitionKey"])
+    return [e["PartitionKey"] for e in entities]
+
+
+async def list_all_user_emails() -> list[str]:
+    """Return all email addresses with stored tokens.
+
+    Used by the single-user fallback in auth_3lo.get_user_token.
+    Raises TokenStorageUnavailable if Azure Table Storage is unreachable.
+    """
+    try:
+        emails = await asyncio.to_thread(_list_user_emails)
+    except (HttpResponseError, ServiceRequestError, ServiceResponseError) as e:
+        logger.error(
+            "STORE list users FAILED | %s: %s", type(e).__name__, e,
+        )
+        raise TokenStorageUnavailable(str(e)) from e
+    logger.debug("STORE listed users | count=%d", len(emails))
+    return emails
+
+
 # --- Session pointer (sessiontouser) --------------------------------------
 
 def _write_session_entity(session_id: str, email: str) -> None:

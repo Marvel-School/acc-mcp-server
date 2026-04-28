@@ -52,6 +52,7 @@ from token_store import (
     link_session_to_email,
     get_email_for_session,
     unlink_session,
+    list_all_user_emails,
 )
 
 logger = logging.getLogger(__name__)
@@ -172,14 +173,47 @@ async def get_user_info(access_token: str) -> dict:
         return {"name": "Autodesk User", "email": "", "id": ""}
 
 
+# TODO: REMOVE WHEN STAGE 2 LANDS
+async def _resolve_session_to_email(session_id: str) -> Optional[str]:
+    """Resolve a session_id to a user email, with single-user fallback.
+
+    SINGLE-USER FALLBACK for the experimental environment.
+    Each FastMCP instance (nav, admin, bim) assigns its own session_id
+    on connect, so a login on nav-server is invisible to admin-server.
+    If exactly ONE user is logged in across the whole deployment, we
+    assume any incoming session belongs to them and back-fill the
+    sessiontouser pointer so future lookups are O(1) again.
+
+    This is safe in single-user experimental but MUST be removed before
+    multi-user production deployment — it would otherwise hand any
+    drive-by session a fully authenticated identity.
+    """
+    email = await get_email_for_session(session_id)
+    if email:
+        return email
+
+    all_emails = await list_all_user_emails()
+    if len(all_emails) == 1:
+        email = all_emails[0]
+        await link_session_to_email(session_id, email)
+        logger.warning(
+            "TOKEN single-user fallback: linking session=%s to %s "
+            "(remove this fallback before multi-user prod)",
+            session_id[:8], email,
+        )
+        return email
+    return None
+
+
 async def get_user_token(session_id: str) -> Optional[str]:
     """Return a valid 3LO access token for the given MCP session.
 
-    Resolves session_id → email via the session pointer table, then loads
-    the token row keyed by that email. Auto-refreshes the token when it
-    has expired (or is within 60 s of expiry) provided a refresh token is
+    Resolves session_id → email via the session pointer table (with
+    single-user fallback while on experimental), then loads the token
+    row keyed by that email. Auto-refreshes the token when it has
+    expired (or is within 60 s of expiry) provided a refresh token is
     on file. Returns None when:
-      - this session has no email mapping (user never logged in here), or
+      - no user has any token stored (single-user fallback can't trigger), or
       - the token row is missing, or
       - refresh fails (token revoked).
 
@@ -187,7 +221,7 @@ async def get_user_token(session_id: str) -> Optional[str]:
     unreachable so the caller can render a "try again in a moment"
     message rather than a misleading "please log in".
     """
-    email = await get_email_for_session(session_id)
+    email = await _resolve_session_to_email(session_id)
     if not email:
         return None
 
@@ -310,7 +344,7 @@ async def logout(session_id: str) -> bool:
 
 async def is_authenticated(session_id: str) -> bool:
     """Return True if a non-expired 3LO token exists for this session."""
-    email = await get_email_for_session(session_id)
+    email = await _resolve_session_to_email(session_id)
     if not email:
         return False
     entry = await get_token_by_email(email)
@@ -324,7 +358,7 @@ async def get_session_user(session_id: str) -> Optional[dict]:
 
     Used by tools to show "(created by ...)" in success messages.
     """
-    email = await get_email_for_session(session_id)
+    email = await _resolve_session_to_email(session_id)
     if not email:
         return None
     entry = await get_token_by_email(email)
