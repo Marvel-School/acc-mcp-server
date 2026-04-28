@@ -24,6 +24,7 @@ from auth_3lo import (
     migrate_pending_tokens,
     store_pending_tokens,
 )
+from token_store import TokenStorageUnavailable, get_token_by_email
 from api import (
     find_project_globally,
     inspect_generic_file,
@@ -370,9 +371,18 @@ async def _require_user_token(ctx: Context) -> str:
     Used by tools that require strict user attribution (writes and
     permission-sensitive operations). The ValueError message is surfaced
     verbatim to the LLM so the user sees a clear, actionable instruction.
+
+    Raises ValueError with a "try again" message if the token store is
+    unreachable — distinct from "please log in".
     """
-    await migrate_pending_tokens(ctx.session_id)
-    token = await get_user_token(ctx.session_id)
+    try:
+        await migrate_pending_tokens(ctx.session_id)
+        token = await get_user_token(ctx.session_id)
+    except TokenStorageUnavailable:
+        raise ValueError(
+            "Token storage is temporarily unavailable. "
+            "Please try again in a moment."
+        )
     if not token:
         raise ValueError(
             "This action requires you to be logged in to Autodesk. "
@@ -386,10 +396,19 @@ async def _optional_user_token(ctx: Context) -> str | None:
 
     Used by tools that prefer user-scoped data but can fall back to the
     service account. Still migrates any pending tokens so that a browser
-    redirect that landed just before this call is honoured.
+    redirect that landed just before this call is honoured. If the token
+    store is unreachable, returns None and lets the caller fall back to
+    the service account rather than failing the whole tool call.
     """
-    await migrate_pending_tokens(ctx.session_id)
-    return await get_user_token(ctx.session_id)
+    try:
+        await migrate_pending_tokens(ctx.session_id)
+        return await get_user_token(ctx.session_id)
+    except TokenStorageUnavailable as e:
+        logger.warning(
+            "TOKEN store unavailable on optional read | session=%s | %s",
+            (ctx.session_id or "")[:8], e,
+        )
+        return None
 
 
 @nav_mcp.tool()
@@ -737,19 +756,28 @@ async def autodesk_login(ctx: Context) -> str:
                 {"session": (session_id or "")[:8]},
             )
 
-            await migrate_pending_tokens(session_id)
+            try:
+                await migrate_pending_tokens(session_id)
 
-            if is_authenticated(session_id):
-                user = get_session_user(session_id) or {}
-                name = user.get("name") or "Autodesk User"
-                email = user.get("email") or ""
-                logger.info(
-                    "TOOL %s | completed in %.2fs", "autodesk_login",
-                    asyncio.get_event_loop().time() - _t0,
+                if await is_authenticated(session_id):
+                    user = await get_session_user(session_id) or {}
+                    name = user.get("name") or "Autodesk User"
+                    email = user.get("email") or ""
+                    logger.info(
+                        "TOOL %s | completed in %.2fs", "autodesk_login",
+                        asyncio.get_event_loop().time() - _t0,
+                    )
+                    return (
+                        f"✅ You are already logged in to Autodesk as "
+                        f"{name} ({email}). Your session is active."
+                    )
+            except TokenStorageUnavailable:
+                logger.error(
+                    "TOOL %s | token storage unavailable", "autodesk_login",
                 )
                 return (
-                    f"✅ You are already logged in to Autodesk as "
-                    f"{name} ({email}). Your session is active."
+                    "Token storage is temporarily unavailable. "
+                    "Please try again in a moment."
                 )
 
             auth_url = build_auth_url(session_id)
@@ -794,7 +822,16 @@ async def autodesk_logout(ctx: Context) -> str:
                 {"session": (session_id or "")[:8]},
             )
 
-            removed = logout_3lo(session_id)
+            try:
+                removed = await logout_3lo(session_id)
+            except TokenStorageUnavailable:
+                logger.error(
+                    "TOOL %s | token storage unavailable", "autodesk_logout",
+                )
+                return (
+                    "Token storage is temporarily unavailable. "
+                    "Please try again in a moment."
+                )
             logger.info(
                 "TOOL %s | completed in %.2fs", "autodesk_logout",
                 asyncio.get_event_loop().time() - _t0,
@@ -843,32 +880,46 @@ async def autodesk_session_info(ctx: Context) -> str:
                 {"session": (ctx.session_id or "")[:8]},
             )
 
-            from auth_3lo import _session_tokens, _session_lock
-            with _session_lock:
-                session = _session_tokens.get(ctx.session_id)
-                snapshot = dict(session) if session else None
+            try:
+                user = await get_session_user(ctx.session_id)
+                token = await get_token_by_email(user["email"]) if user else None
+            except TokenStorageUnavailable:
+                logger.error(
+                    "TOOL %s | token storage unavailable",
+                    "autodesk_session_info",
+                )
+                return (
+                    "Token storage is temporarily unavailable. "
+                    "Please try again in a moment."
+                )
 
             logger.info(
                 "TOOL %s | completed in %.2fs", "autodesk_session_info",
                 asyncio.get_event_loop().time() - _t0,
             )
 
-            if not snapshot:
+            if not user:
                 return (
                     "You are not currently logged in to Autodesk. "
                     "Use 'autodesk_login' to connect your account."
                 )
 
-            expires_in = int(snapshot["expires_at"] - time.time())
+            if not token:
+                return (
+                    f"Your session has expired. "
+                    f"Use 'autodesk_login' to reconnect."
+                )
+
+            expires_in = int(token["expires_at"] - time.time())
             if expires_in < 0:
                 return (
-                    f"Your session for {snapshot['user_name']} has expired. "
+                    f"Your session for {token['user_name']} has expired. "
                     f"Use 'autodesk_login' to reconnect."
                 )
             return (
                 f"Logged in to Autodesk as:\n"
-                f"  Name:  {snapshot['user_name']}\n"
-                f"  Email: {snapshot['user_email']}\n"
+                f"  Name:  {token['user_name']}\n"
+                f"  Email: {token['user_email']}\n"
                 f"  Session expires in: {expires_in} seconds"
             )
         except Exception as e:
@@ -1100,7 +1151,7 @@ async def create_project(
             )
 
             user_token = await _require_user_token(ctx)
-            actor = get_session_user(ctx.session_id) or {}
+            actor = await get_session_user(ctx.session_id) or {}
 
             real_hub_id = await _resolve_hub_id(hub_name)
 
@@ -1240,7 +1291,7 @@ async def add_user(
             )
 
             user_token = await _require_user_token(ctx)
-            actor = get_session_user(ctx.session_id) or {}
+            actor = await get_session_user(ctx.session_id) or {}
 
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, project_id, resolved_name = await _resolve_project_id(hub_id, project_name)
@@ -1630,7 +1681,7 @@ async def apply_folder_template(
             )
 
             user_token = await _require_user_token(ctx)
-            actor = get_session_user(ctx.session_id) or {}
+            actor = await get_session_user(ctx.session_id) or {}
 
             hub_id = await _resolve_hub_id(hub_name)
 
@@ -1710,7 +1761,7 @@ async def delete_folder(
             )
 
             user_token = await _require_user_token(ctx)
-            actor = get_session_user(ctx.session_id) or {}
+            actor = await get_session_user(ctx.session_id) or {}
 
             hub_id = await _resolve_hub_id(hub_name)
             hub_id, found_id, _ = await _resolve_project_id(hub_id, project_name)
