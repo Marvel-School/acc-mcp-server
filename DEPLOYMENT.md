@@ -33,7 +33,7 @@ a single Starlette app behind API key authentication.
 
 ## Environments
 
-Three independent environments run the same codebase from different git
+Two independent environments run the same codebase from different git
 branches. Each has its own Azure App Service, its own API key, and its
 own Copilot Studio configuration where applicable.
 
@@ -41,7 +41,9 @@ own Copilot Studio configuration where applicable.
 |---|---|---|---|
 | Production | `main` | https://autodesk-agent-prod.azurewebsites.net | Real users via Copilot Studio |
 | Development | `dev` | https://autodesk-agent-dev.azurewebsites.net | Pre-production testing |
-| Experimental | `experimental` | https://autodesk-agent-experimental.azurewebsites.net | 3LO and Entra ID work |
+
+A third **experimental** environment is planned for 3LO and Microsoft
+Entra ID integration work. See the Roadmap section for details.
 
 ### Production
 - **18 tools** across three MCP endpoints
@@ -54,12 +56,6 @@ own Copilot Studio configuration where applicable.
 - **2-legged OAuth only**
 - Used by: developer testing before promoting to production
 - Stability: should always be working — this is "next week's prod"
-
-### Experimental
-- **21 tools** — adds `autodesk_login`, `autodesk_logout`, `autodesk_session_info`
-- **3-legged OAuth** with user-attributed write actions
-- Used by: developer testing 3LO and (eventually) Entra ID integration via Claude Desktop
-- Stability: can break freely — no impact on prod or dev users
 
 ---
 
@@ -111,31 +107,28 @@ Each environment has independent values for:
 - `MCP_API_KEY` — the X-API-Key header value required for all MCP traffic
 - `APS_CLIENT_ID` and `APS_CLIENT_SECRET` — Autodesk APS app credentials
 - `ACC_ADMIN_ID` — Autodesk admin user UUID for service account operations
-- `APS_REDIRECT_URI` — only set on experimental, points to that env's /callback
 - `ALLOWED_ORIGINS` — CORS allow-list for browser-based MCP clients
 
 Personal copies of all keys are stored in the team password manager
 under entries named:
 - `acc-mcp-server prod`
 - `acc-mcp-server dev`
-- `acc-mcp-server experimental`
 
 To rotate any key, update the value in Azure → restart the App Service →
 update the corresponding consumer (Copilot Studio connector for prod, or
-Claude Desktop config for dev/experimental).
+Claude Desktop config for dev).
 
 ---
 
 ## Autodesk APS Configuration
 
-A single APS app named "Copilot(Dev)" backs all three environments.
+A single APS app named "Copilot(Dev)" backs both environments.
 
 - **Application Type:** Traditional Web App
 - **Grant Type:** Authorization Code and Client Credentials (supports both 2LO and 3LO)
 - **Callback URLs registered:**
   - https://autodesk-agent-dev.azurewebsites.net/callback
   - https://autodesk-agent-prod.azurewebsites.net/callback
-  - https://autodesk-agent-experimental.azurewebsites.net/callback
 
 All necessary APIs are enabled on the app: Data Management, Autodesk
 Construction Cloud, Model Derivative, BIM 360 Account Administration.
@@ -150,13 +143,12 @@ GitHub Actions deploys each branch to its corresponding App Service:
 |---|---|---|
 | .github/workflows/main_autodesk-agent-prod.yml | push to `main` | autodesk-agent-prod |
 | .github/workflows/deploy_dev.yml | push to `dev` | autodesk-agent-dev |
-| .github/workflows/deploy_experimental.yml | push to `experimental` | autodesk-agent-experimental |
 
 All workflows are SHA-pinned for reproducibility and use concurrency
 guards to prevent overlapping deploys.
 
 ### Promotion flow
-experimental ──(cherry-pick proven commits)──► dev ──(merge --no-ff)──► main
+dev ──(merge --no-ff)──► main
 
 Never push directly to `main`. All production changes flow through `dev`
 first for verification.
@@ -170,7 +162,6 @@ Each environment exposes a `/health` endpoint that returns 200 OK with
 load balancers automatically and can be used for manual verification.
 https://autodesk-agent-prod.azurewebsites.net/health
 https://autodesk-agent-dev.azurewebsites.net/health
-https://autodesk-agent-experimental.azurewebsites.net/health
 
 Each MCP endpoint also responds to bare GETs (without trailing slash and
 without API key) with a status JSON, useful for connector health checks:
@@ -182,7 +173,7 @@ https://autodesk-agent-prod.azurewebsites.net/mcp/bim
 
 ## Logging
 
-All three App Services use a human-readable text log format. Logs are
+Both App Services use a human-readable text log format. Logs are
 viewable in real time via:
 Azure Portal → autodesk-agent-{env} → Log stream
 
@@ -212,7 +203,7 @@ and verify /health returns 200.
 3. Apply (App Service restarts automatically)
 4. Update consumers:
    - **Production:** update each of the three Power Platform custom connectors → Security → API key
-   - **Development/Experimental:** update Claude Desktop config and restart Claude Desktop
+   - **Development:** update Claude Desktop config and restart Claude Desktop
 5. Update password manager entry
 
 ### Deploy a hotfix to production
@@ -248,10 +239,6 @@ Watch GitHub Actions, then verify /health.
   Parallelization deferred — typical folder structures are small enough
   that this is acceptable.
 
-- **In-memory token storage on experimental.** 3LO tokens stored in
-  experimental do not survive container restarts. Persistent storage via
-  Azure Table Storage is the next planned improvement.
-
 ---
 
 ## Support and Escalation
@@ -270,8 +257,21 @@ Watch GitHub Actions, then verify /health.
 
 Items planned but not yet implemented:
 
-- **Persistent token storage** for experimental environment (Azure Table Storage)
+### Experimental Environment
+
+A third Azure App Service (`autodesk-agent-experimental`) on its own
+`experimental` git branch will host risky features that aren't ready for
+production. Initial focus: 3-legged OAuth (3LO) and Microsoft Entra ID
+integration. The current `experimental` git branch already contains
+working 3LO code (21 tools) — it just needs an App Service to deploy to.
+
+### 3LO and Entra ID Integration
+
+- **Persistent token storage** via Azure Table Storage (no more in-memory dicts)
 - **Microsoft Entra ID integration** for proper user attribution in Copilot Studio
-- **Hybrid auth routing** — internal users via Entra SSO, external users via 3LO
+- **Hybrid auth routing** — internal TBI users via Entra SSO, external collaborators via 3LO
+
+### Other planned improvements
+
 - **Bidirectional visual overrides** in Claude Desktop viewer (isolation commands)
-- **Parallelize replicate_folders**
+- **Parallelize `replicate_folders`** for very large folder structures
