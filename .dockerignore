@@ -1,0 +1,11 @@
+.env
+.env.*
+.git
+.github
+.claude
+__pycache__
+*.pyc
+*.pyo
+TODO.md
+.python-version
+*.md

@@ -14,13 +14,45 @@ import re
 import logging
 import time
 import base64
+import threading
 import requests
-from typing import Optional, Dict, Any, List
+from collections import deque
+from typing import Optional, Any
 from urllib.parse import quote
 
 from auth import get_token
 
 logger = logging.getLogger(__name__)
+
+# Concurrency limiter — caps parallel Autodesk API calls across all threads.
+_api_semaphore = threading.Semaphore(10)
+
+# ---------------------------------------------------------------------------
+# Shared numeric constants — replaces inline magic numbers throughout.
+# ---------------------------------------------------------------------------
+_MAX_PROJECT_PAGES = 50
+_MAX_USER_PAGES = 10
+_MAX_FOLDER_SCAN = 50
+_MAX_FOLDER_DEPTH = 3
+_MAX_HUB_SCAN_PROJECTS = 20
+_MAX_USER_SEARCH_PAGES = 20
+_DEFAULT_TIMEOUT = 15
+_STREAM_TIMEOUT = 120
+_CHUNK_SIZE = 65536
+_BUFFER_OVERLAP = 512
+_PROJECT_CACHE_TTL = 300  # seconds
+
+
+class ResultList(list):
+    """List subclass that can carry an optional truncation warning.
+
+    Functions with hard pagination caps set ``truncation_warning`` when the
+    cap is hit so the LLM knows results may be incomplete.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.truncation_warning: str = ""
 
 
 
@@ -41,6 +73,58 @@ def encode_urn(urn: Optional[str]) -> str:
     return quote(urn, safe="") if urn else ""
 
 
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+# Each entry is matched via str.startswith(), so entries that are genuine
+# prefixes (e.g. "quantification_") catch all variants, while entries that
+# are exact names (e.g. "VIRTUAL_ROOT_FOLDER", "COST Root Folder") are also
+# handled correctly because startswith() returns True for an exact match.
+_SYSTEM_FOLDER_PATTERNS = (
+    "quantification_",
+    "correspondence-project-",
+    "issue_",
+    "submittals-",
+    "COST Root Folder",
+    "VIRTUAL_ROOT_FOLDER",
+)
+
+# ACC platform folders auto-created for every project — not user content.
+_ACC_DEFAULT_FOLDERS = {
+    "photos",
+    "projecttb",  # TBI-specific ACC default folder
+    "plans",
+    "submittals",
+    "rfis",
+    "issues",
+    "cost",
+    "schedule",
+}
+
+
+def _is_system_folder(folder_name: str) -> bool:
+    """Return True if *folder_name* is an Autodesk internal system folder.
+
+    Matches:
+    - Known system prefixes and exact names in _SYSTEM_FOLDER_PATTERNS
+      (e.g. quantification_, issue_, COST Root Folder, VIRTUAL_ROOT_FOLDER)
+    - ACC platform default folders (Photos, Plans, Issues, …)
+    - Names that are purely a UUID
+    - Names that contain a UUID suffix after an underscore or hyphen
+    """
+    if not folder_name:
+        return False
+    if folder_name.startswith(_SYSTEM_FOLDER_PATTERNS):
+        return True
+    if folder_name.lower().strip() in _ACC_DEFAULT_FOLDERS:
+        return True
+    if _UUID_RE.search(folder_name):
+        return True
+    return False
+
+
 def safe_b64encode(value: Optional[str]) -> str:
     """Base64url-encode a URN (no padding) for Model Derivative API."""
     if not value:
@@ -53,7 +137,7 @@ def _make_request(
     method: str,
     url: str,
     *,
-    extra_headers: Optional[Dict] = None,
+    extra_headers: Optional[dict] = None,
     retry_on_401: bool = True,
     **kwargs,
 ) -> requests.Response:
@@ -66,11 +150,15 @@ def _make_request(
       - 15 s default timeout (callers can override)
       - One retry on 401 (token refresh)
       - One retry on 429 (respects Retry-After header)
+      - One retry on 5xx (500/502/503/504) with 2 s backoff
+
+    All HTTP calls are gated by ``_api_semaphore`` (max 10 concurrent)
+    to prevent a thundering herd against the Autodesk API.
 
     Raises:
         ValueError: On any 4xx/5xx response (with Autodesk error detail).
     """
-    kwargs.setdefault("timeout", 15)
+    kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
     max_attempts = 2 if retry_on_401 else 1
     last_resp: requests.Response = None  # type: ignore[assignment]
 
@@ -84,15 +172,30 @@ def _make_request(
             if extra_headers:
                 headers.update(extra_headers)
 
-            last_resp = requests.request(method, url, headers=headers, **kwargs)
+            with _api_semaphore:
+                last_resp = requests.request(method, url, headers=headers, **kwargs)
 
+            # --- 429 rate limit retry ---
             if last_resp.status_code == 429:
                 wait = int(last_resp.headers.get("Retry-After", 5))
                 logger.warning(f"429 on {method} {url[:80]} — waiting {wait}s")
                 time.sleep(wait)
-                last_resp = requests.request(method, url, headers=headers, **kwargs)
+                token = get_token(force_refresh=True)
+                headers["Authorization"] = f"Bearer {token}"
+                with _api_semaphore:
+                    last_resp = requests.request(method, url, headers=headers, **kwargs)
                 break
 
+            # --- 5xx server error retry (one attempt, 2 s backoff) ---
+            if last_resp.status_code in (500, 502, 503, 504) and attempt == 0:
+                logger.warning(
+                    "Autodesk API returned %d on %s %s — retrying in 2s",
+                    last_resp.status_code, method, url[:80],
+                )
+                time.sleep(2)
+                continue
+
+            # --- 401 stale token retry ---
             if last_resp.status_code == 401 and attempt == 0 and retry_on_401:
                 logger.warning(f"401 on {method} {url[:80]} — refreshing token")
                 continue
@@ -124,25 +227,12 @@ def _make_request(
 
 
 
-def _get_admin_user_id(account_id: str) -> str:
-    """Fetches the Autodesk User ID for the Account Admin."""
-    admin_email = os.environ.get("ACC_ADMIN_EMAIL")
-    if not admin_email:
-        raise ValueError("ACC_ADMIN_EMAIL environment variable is required.")
-    return get_user_id_by_email(account_id, admin_email)
-
-
-def get_user_id_by_email(account_id: str, email: str) -> str:
-    """Fetches the internal Autodesk User ID for an email address."""
-    endpoint = f"https://developer.api.autodesk.com/hq/v1/regions/eu/accounts/{account_id}/users/search?email={email}"
-    resp = _make_request("GET", endpoint)
-    users = resp.json()
-    if not users:
-        raise ValueError(f"Could not find an Autodesk user with email: {email}")
-    user_id = users[0].get("id")
-    if not user_id:
-        raise ValueError(f"Autodesk returned a user for {email}, but the 'id' field is missing.")
-    return user_id
+def _get_admin_user_id() -> str:
+    """Returns the Autodesk User ID for the Account Admin from env."""
+    admin_id = os.environ.get("ACC_ADMIN_ID", "").strip()
+    if not admin_id:
+        raise ValueError("ACC_ADMIN_ID environment variable is required for admin operations")
+    return admin_id
 
 
 
@@ -151,33 +241,61 @@ def get_user_id_by_email(account_id: str, email: str) -> str:
 _cached_hub_id: Optional[str] = None
 _hub_cache_time: float = 0.0
 _HUB_CACHE_TTL: float = 300.0  # seconds
+_hub_cache_lock = threading.Lock()
+
+# Project-list cache — keyed by hub_id, stores (project_list, cached_at).
+_project_cache: dict[str, tuple[ResultList, float]] = {}
+_project_cache_lock = threading.Lock()
 
 
-def _get_hub_id() -> Optional[str]:
+def _get_hub_id() -> str:
     """Returns the first accessible hub ID with a 5-minute TTL cache.
 
+    Thread-safe: a lock wraps the read-check-write sequence to prevent
+    concurrent callers from both triggering an API request.
+
     Re-fetches from the API when the cache is empty, expired, or was
-    populated with None on a previous failed call.
+    populated with None on a previous failed call.  Failures are never
+    cached so the next call will retry immediately.
     """
     global _cached_hub_id, _hub_cache_time
-    now = time.monotonic()
-    if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
-        return _cached_hub_id
-    hubs = get_hubs()
-    if hubs:
-        _cached_hub_id = hubs[0].get("id")
+    with _hub_cache_lock:
+        now = time.monotonic()
+        if _cached_hub_id and (now - _hub_cache_time) < _HUB_CACHE_TTL:
+            return _cached_hub_id
+        hubs = get_hubs()
+        if not hubs:
+            raise ValueError(
+                "Could not resolve hub ID \u2014 Autodesk API returned no hubs. "
+                "Check APS credentials and account access."
+            )
+        hub_id = hubs[0].get("id")
+        if not hub_id:
+            raise ValueError(
+                "Could not resolve hub ID \u2014 Autodesk API returned no hubs. "
+                "Check APS credentials and account access."
+            )
+        _cached_hub_id = hub_id
         _hub_cache_time = now
-    return _cached_hub_id
+        return _cached_hub_id
 
 
-def get_hubs() -> list:
+def get_hubs() -> list[dict[str, Any]]:
     """Fetches all accessible Hubs (BIM 360 / ACC)."""
     resp = _make_request("GET", "https://developer.api.autodesk.com/project/v1/hubs")
     return resp.json().get("data", [])
 
 
-def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) -> list:
+def get_projects(
+    hub_id: str,
+    limit: int = 50,
+    fields: Optional[list] = None,
+) -> ResultList:
     """List all projects in a hub (follows pagination automatically).
+
+    Results are cached for 5 minutes per hub to avoid redundant API calls
+    (e.g. when ``find_project_globally`` iterates over multiple hubs).
+    Use ``invalidate_project_cache()`` to evict a specific hub's entry.
 
     Args:
         hub_id: Hub ID (starts with 'b.').
@@ -185,13 +303,27 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
         fields: Optional list of extra fields to include (e.g. ["status", "projectValue"]).
     """
     hub_id = ensure_b_prefix(hub_id)
+
+    # --- Check cache (only when no custom fields are requested) ---
+    use_cache = fields is None or fields == []
+    if use_cache:
+        with _project_cache_lock:
+            cached = _project_cache.get(hub_id)
+            if cached is not None:
+                cached_list, cached_at = cached
+                if (time.monotonic() - cached_at) < _PROJECT_CACHE_TTL:
+                    logger.debug("Project cache hit for hub %s (%d projects)", hub_id, len(cached_list))
+                    return cached_list
+
+    # --- Fetch from API ---
     base = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_id}/projects?page[limit]={limit}"
     if fields:
         base += f"&fields[projects]={','.join(fields)}"
     url: Optional[str] = base
-    all_projects: list = []
+    all_projects: ResultList = ResultList()
 
-    for _ in range(50):  # safety cap
+    _hit_cap = True
+    for _ in range(_MAX_PROJECT_PAGES):  # safety cap
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
         all_projects.extend(data.get("data", []))
@@ -205,52 +337,84 @@ def get_projects(hub_id: str, limit: int = 50, fields: Optional[list] = None) ->
             url = None
 
         if not url:
+            _hit_cap = False
             break
+
+    if _hit_cap:
+        all_projects.truncation_warning = (
+            f"⚠️ Results truncated: retrieved {len(all_projects)} projects across "
+            f"{_MAX_PROJECT_PAGES} pages (safety limit). There may be more projects in this hub."
+        )
+        logger.warning(all_projects.truncation_warning)
+
+    # --- Store in cache (only default-field responses) ---
+    if use_cache:
+        with _project_cache_lock:
+            _project_cache[hub_id] = (all_projects, time.monotonic())
 
     return all_projects
 
 
-def find_project_globally(name_query: str) -> Optional[tuple]:
+def invalidate_project_cache(hub_id: str) -> None:
+    """Evict the project-list cache entry for a hub.
+
+    Pops both the raw and b.-prefixed key variants to be safe.
+    """
+    prefixed = ensure_b_prefix(hub_id)
+    with _project_cache_lock:
+        _project_cache.pop(prefixed, None)
+        _project_cache.pop(hub_id, None)
+
+
+_GlobalMatches = tuple[list[tuple[str, str, str, str]], list[tuple[str, str, str, str]]]
+
+
+def find_project_globally(name_query: str) -> _GlobalMatches:
     """
     Search for a project by name across ALL accessible hubs.
-    Case-insensitive substring match.
+    Uses two-phase matching: exact first, then substring.
 
     Returns:
-        (hub_id, project_id, project_name) or None.
+        (exact_matches, substring_matches) — each a list of
+        (hub_id, hub_name, project_id, project_name) tuples.
     """
-    try:
-        logger.info(f"Searching globally for project: {name_query}")
-        hubs = get_hubs()
-        if not hubs:
-            logger.error("No hubs found.")
-            return None
+    logger.info(f"Searching globally for project: {name_query}")
+    hubs = get_hubs()
+    if not hubs:
+        logger.error("No hubs found.")
+        return ([], [])
 
-        search_term = name_query.lower().strip()
+    search_term = name_query.lower().strip()
+    exact: list[tuple[str, str, str, str]] = []
+    substring: list[tuple[str, str, str, str]] = []
 
-        for hub in hubs:
-            hub_id = hub.get("id")
-            hub_name = hub.get("attributes", {}).get("name", "Unknown")
-            if not hub_id:
-                continue
+    for hub in hubs:
+        hub_id = hub.get("id")
+        hub_name = hub.get("attributes", {}).get("name", "Unknown")
+        if not hub_id:
+            continue
 
-            logger.info(f"  Searching hub: {hub_name}")
-            projects = get_projects(hub_id)
+        logger.info(f"  Searching hub: {hub_name}")
+        projects = get_projects(hub_id)
 
-            for p in projects:
-                p_name = p.get("attributes", {}).get("name", "")
-                if search_term in p_name.lower():
-                    logger.info(f"  Found: {p_name}")
-                    return (hub_id, p.get("id"), p_name)
+        for p in projects:
+            p_name = p.get("attributes", {}).get("name", "")
+            p_lower = p_name.lower().strip()
+            entry = (hub_id, hub_name, p.get("id"), p_name)
+            if p_lower == search_term:
+                logger.info(f"  Exact match: {p_name} in hub {hub_name}")
+                exact.append(entry)
+            elif search_term in p_lower:
+                logger.info(f"  Substring match: {p_name} in hub {hub_name}")
+                substring.append(entry)
 
-        logger.warning(f"Project '{name_query}' not found")
-        return None
-    except Exception as e:
-        logger.error(f"Project search error: {e}")
-        return None
+    if not exact and not substring:
+        logger.warning(f"Project '{name_query}' not found in any hub")
+    return (exact, substring)
 
 
 
-def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
+def get_top_folders(hub_id: str, project_id: str) -> list[dict[str, Any]]:
     """Fetches top-level folders for a project."""
     hub_clean = ensure_b_prefix(hub_id)
     proj_clean = ensure_b_prefix(project_id)
@@ -258,7 +422,7 @@ def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
     url = f"https://developer.api.autodesk.com/project/v1/hubs/{hub_clean}/projects/{proj_clean}/topFolders"
     resp = _make_request("GET", url)
 
-    return [
+    all_folders = [
         {
             "id": f.get("id"),
             "name": f.get("attributes", {}).get("displayName"),
@@ -266,9 +430,17 @@ def get_top_folders(hub_id: str, project_id: str) -> List[Dict[str, Any]]:
         }
         for f in resp.json().get("data", [])
     ]
+    filtered = [f for f in all_folders if not _is_system_folder(f.get("name") or "")]
+    removed = len(all_folders) - len(filtered)
+    if removed:
+        logger.debug(
+            "Filtered %d system folders from top-level folder list for project %s",
+            removed, project_id,
+        )
+    return filtered
 
 
-def get_folder_contents(project_id: str, folder_id: str) -> List[Dict[str, Any]]:
+def get_folder_contents(project_id: str, folder_id: str) -> list[dict[str, Any]]:
     """Fetches contents of a folder with tip-version URN extraction for files."""
     proj_clean = ensure_b_prefix(project_id)
     folder_encoded = encode_urn(folder_id)
@@ -302,12 +474,23 @@ def get_folder_contents(project_id: str, folder_id: str) -> List[Dict[str, Any]]
 
         result.append(parsed)
 
+    before = len(result)
+    result = [
+        item for item in result
+        if item.get("itemType") != "folder" or not _is_system_folder(item.get("name") or "")
+    ]
+    removed = before - len(result)
+    if removed:
+        logger.debug(
+            "Filtered %d system folders from folder contents of %s",
+            removed, folder_id,
+        )
     return result
 
 
 def find_design_files(
     hub_id: str, project_id: str, extensions: str = "rvt"
-) -> List[Dict[str, Any]]:
+) -> ResultList:
     """
     BFS file search through 'Project Files' folder.
     Depth-limited to 3 levels, max 50 folders scanned.
@@ -325,18 +508,16 @@ def find_design_files(
     if not root_id:
         raise ValueError("No folders found in project")
 
-    queue = [{"id": root_id, "name": "Project Files", "depth": 0}]
-    matching = []
+    queue = deque([{"id": root_id, "name": "Project Files", "depth": 0}])
+    matching: ResultList = ResultList()
     ext_list = [e.strip().lower() for e in extensions.split(",")]
-    max_folders = 50
-    max_depth = 3
     scanned = 0
 
-    while queue and scanned < max_folders:
-        current = queue.pop(0)
+    while queue and scanned < _MAX_FOLDER_SCAN:
+        current = queue.popleft()
         scanned += 1
 
-        logger.info(f"  Scanning {scanned}/{max_folders} (depth {current['depth']}): {current['name']}")
+        logger.info(f"  Scanning {scanned}/{_MAX_FOLDER_SCAN} (depth {current['depth']}): {current['name']}")
         try:
             contents = get_folder_contents(project_id, current["id"])
         except Exception as e:
@@ -355,8 +536,11 @@ def find_design_files(
                     })
                     logger.info(f"    Found: {name}")
 
-            elif item.get("itemType") == "folder" and current["depth"] < max_depth:
+            elif item.get("itemType") == "folder" and current["depth"] < _MAX_FOLDER_DEPTH:
                 sub_name = item.get("name", "Unknown")
+                if _is_system_folder(sub_name):
+                    logger.debug("Skipping system folder during BFS: %s", sub_name)
+                    continue
                 queue.append({
                     "id": item.get("id"),
                     "name": f"{current['name']}/{sub_name}",
@@ -364,6 +548,15 @@ def find_design_files(
                 })
 
     logger.info(f"Search complete: {scanned} folders, {len(matching)} files")
+
+    if scanned >= _MAX_FOLDER_SCAN and queue:
+        matching.truncation_warning = (
+            f"⚠️ Results truncated: only scanned {_MAX_FOLDER_SCAN} of "
+            f"{_MAX_FOLDER_SCAN + len(queue)} reachable folders (depth limit: {_MAX_FOLDER_DEPTH}). "
+            f"There may be more design files. Narrow your search to get complete results."
+        )
+        logger.warning(matching.truncation_warning)
+
     return matching
 
 
@@ -384,8 +577,6 @@ def resolve_file_to_urn(project_id: str, identifier: str) -> str:
         logger.info(f"  Searching for filename: {identifier}")
 
         hub_id = _get_hub_id()
-        if not hub_id:
-            raise ValueError("Could not determine hub_id for file search")
 
         extensions = ["rvt", "dwg", "nwc", "rcp", "ifc", "nwd"]
         if "." in identifier:
@@ -416,35 +607,37 @@ def resolve_file_to_urn(project_id: str, identifier: str) -> str:
         raise ValueError(f"Error resolving file: {e}")
 
 
-def get_latest_version_urn(project_id: str, item_id: str) -> Optional[str]:
-    """Resolves a lineage URN to its latest version URN via the tip relationship."""
-    try:
-        if "fs.file" in item_id or "version=" in item_id:
-            logger.info(f"Already a version URN: {item_id[:60]}...")
-            return item_id
+def get_latest_version_urn(project_id: str, item_id: str) -> str:
+    """Resolves a lineage URN to its latest version URN via the tip relationship.
 
-        proj_clean = ensure_b_prefix(project_id)
-        item_encoded = encode_urn(item_id)
+    Raises:
+        ValueError: If the version URN cannot be resolved.
+    """
+    if "fs.file" in item_id or "version=" in item_id:
+        logger.info(f"Already a version URN: {item_id[:60]}...")
+        return item_id
 
-        url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/items/{item_encoded}"
-        resp = _make_request("GET", url)
+    proj_clean = ensure_b_prefix(project_id)
+    item_encoded = encode_urn(item_id)
 
-        tip = (
-            resp.json()
-            .get("data", {})
-            .get("relationships", {})
-            .get("tip", {})
-            .get("data", {})
-            .get("id")
-        )
-        if tip:
-            logger.info(f"Resolved to version: {tip[:60]}...")
-        else:
-            logger.warning("No tip version found in item relationships")
+    url = f"https://developer.api.autodesk.com/data/v1/projects/{proj_clean}/items/{item_encoded}"
+    resp = _make_request("GET", url)
+
+    tip = (
+        resp.json()
+        .get("data", {})
+        .get("relationships", {})
+        .get("tip", {})
+        .get("data", {})
+        .get("id")
+    )
+    if tip:
+        logger.info(f"Resolved to version: {tip[:60]}...")
         return tip
-    except Exception as e:
-        logger.error(f"Version resolution error: {e}")
-        return None
+
+    raise ValueError(
+        f"No tip version found in item relationships for '{item_id[:60]}'"
+    )
 
 
 def inspect_generic_file(project_id: str, file_id: str) -> str:
@@ -462,13 +655,12 @@ def inspect_generic_file(project_id: str, file_id: str) -> str:
 
         if "lineage" in resolved:
             version_urn = get_latest_version_urn(project_id, resolved)
-            if not version_urn:
-                return "Error: Could not resolve lineage URN to version URN."
         elif "fs.file" in resolved or "version=" in resolved:
             version_urn = resolved
         else:
-            version_urn = get_latest_version_urn(project_id, resolved)
-            if not version_urn:
+            try:
+                version_urn = get_latest_version_urn(project_id, resolved)
+            except ValueError:
                 version_urn = resolved
 
         encoded = safe_b64encode(version_urn)
@@ -546,11 +738,11 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     count = 0
     buffer = b""
 
-    resp = _make_request("GET", url, stream=True, timeout=120)
+    resp = _make_request("GET", url, stream=True, timeout=_STREAM_TIMEOUT)
     try:
         resp.raise_for_status()
 
-        for chunk in resp.iter_content(chunk_size=65536):
+        for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
             if not chunk:
                 continue
 
@@ -561,7 +753,7 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
             if matches:
                 buffer = buffer[matches[-1].end():]
             else:
-                buffer = buffer[-512:]
+                buffer = buffer[-_BUFFER_OVERLAP:]
 
     except requests.exceptions.HTTPError as e:
         raise ValueError(f"HTTP error streaming metadata: {e}")
@@ -574,7 +766,7 @@ def stream_count_elements(version_urn: str, category_name: str) -> int:
     return count
 
 
-def trigger_translation(version_urn: str) -> Dict[str, Any]:
+def trigger_translation(version_urn: str) -> dict[str, Any]:
     """
     Triggers a fresh Model Derivative translation job (SVF Classic).
     Uses x-ads-force to overwrite existing partial derivatives.
@@ -605,178 +797,173 @@ def trigger_translation(version_urn: str) -> Dict[str, Any]:
 
 
 
-def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict:
-    """Creates a project using the ACC Account Admin API."""
+def create_acc_project(hub_id: str, project_name: str, project_type: str = "BIM360") -> dict[str, Any]:
+    """Creates a project using the ACC Account Admin API.
+
+    After a successful creation the project-list cache for this hub is
+    invalidated so subsequent ``get_projects`` calls see the new project.
+    """
     account_id = _strip_b_prefix(hub_id)
-    user_id = _get_admin_user_id(account_id)
+    user_id = _get_admin_user_id()
 
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/accounts/{account_id}/projects"
     payload = {
         "name": project_name,
         "type": "Office",
         "platform": "acc" if project_type.upper() == "ACC" else "bim360",
+        "timezone": os.environ.get("DEFAULT_PROJECT_TIMEZONE", "Europe/Amsterdam"),
+        "addressLine1": os.environ.get("DEFAULT_PROJECT_ADDRESS_LINE1", ""),
+        "city": os.environ.get("DEFAULT_PROJECT_CITY", ""),
+        "country": os.environ.get("DEFAULT_PROJECT_COUNTRY", "NL"),
+        "postalCode": os.environ.get("DEFAULT_PROJECT_POSTAL_CODE", ""),
     }
 
     logger.info(f"POSTing to {endpoint} with User-Id: {user_id}")
     resp = _make_request("POST", endpoint, json=payload, extra_headers={"User-Id": user_id})
     logger.info("Project creation API responded successfully.")
+
+    # Invalidate the project-list cache so the new project appears on next fetch.
+    invalidate_project_cache(hub_id)
+
     return resp.json()
 
 
-def get_project_users(project_id: str) -> list:
-    """List users in a project (requires Admin). Paginates up to 10 pages
-    (100 users/page = 1 000 users max), matching get_project_user_permissions.
+def _sanitize_user_name(raw: dict) -> str:
+    """Build a clean display name from an ACC user record.
 
-    Names are sanitized — ACC sometimes appends autodeskId directly onto the
-    name field (e.g. "Maxine Bruil0c1e0b3b-..."). Both standard UUID and
-    non-standard hex-run suffixes are stripped before the data is returned.
+    ACC sometimes appends autodeskId directly onto the name field
+    (e.g. "Maxine Bruil0c1e0b3b-..."). Prefer firstName/lastName;
+    fall back to name; strip any embedded hex-ID substring.
     """
-    clean_project_id = _strip_b_prefix(project_id)
-    endpoint = (
-        f"https://developer.api.autodesk.com/construction/admin/v1"
-        f"/projects/{clean_project_id}/users?limit=100"
+    _first = (raw.get("firstName") or "").strip()
+    _last = (raw.get("lastName") or "").strip()
+    _raw_name = (
+        f"{_first} {_last}".strip()
+        if (_first or _last)
+        else (raw.get("name") or "").strip()
     )
-
-    all_users: list = []
-    url: Optional[str] = endpoint
-
-    for _ in range(10):  # safety cap — 10 pages × 100 = 1 000 users max
-        resp = _make_request("GET", url)  # type: ignore[arg-type]
-        data = resp.json()
-
-        for raw in data.get("results", []):
-            _first = (raw.get("firstName") or "").strip()
-            _last = (raw.get("lastName") or "").strip()
-            _raw_name = (
-                f"{_first} {_last}".strip()
-                if (_first or _last)
-                else (raw.get("name") or "").strip()
-            )
-            # Strip standard 36-char UUIDs (8-4-4-4-12)
-            clean_name = re.sub(
-                r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
-                "",
-                _raw_name,
-            )
-            # Strip any remaining long hex-only run at end of string
-            clean_name = re.sub(r"[a-fA-F0-9]{10,}$", "", clean_name).strip() or "-"
-            raw["name"] = clean_name
-            all_users.append(raw)
-
-        next_url = data.get("pagination", {}).get("nextUrl")
-        if next_url:
-            url = next_url
-        else:
-            break
-
-    return all_users
+    clean = re.sub(
+        r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
+        "",
+        _raw_name,
+    )
+    return re.sub(r"[a-fA-F0-9]{10,}$", "", clean).strip() or "-"
 
 
-def get_project_user_permissions(project_id: str) -> List[Dict[str, Any]]:
-    """
-    Fetches all project members with full permission and role details.
+def _paginate_project_users(
+    project_id: str,
+    max_pages: int,
+    include_permissions: bool,
+) -> ResultList:
+    """Shared pagination helper for project user endpoints.
 
-    NEVER cached — every call executes a live HTTP request to ACC to return
-    the absolute current truth. This prevents stale data from in-process caches
-    reflecting a state that has since changed in the platform.
-
-    Uses the ACC Admin API (construction/admin/v1) with automatic pagination
-    (up to 10 pages, 100 users/page = 1 000 users max).
+    Fetches users from the ACC Admin API with automatic pagination,
+    name sanitisation, and truncation warnings.
 
     Args:
-        project_id: Project ID (b. prefix is stripped automatically).
-
-    Returns:
-        List of user dicts with keys: name, email, companyId, companyName,
-        roleIds, products, accessLevels.
-
-    Raises:
-        ValueError: On any API or HTTP error.
+        project_id:          Project ID (b. prefix stripped automatically).
+        max_pages:           Maximum pages to fetch (100 users/page).
+        include_permissions: If True, enrich each record with role/product/
+                             access-level details.  If False, return the raw
+                             API record with only the name sanitised.
     """
     clean_id = _strip_b_prefix(project_id)
-    base_url = (
+    endpoint = (
         f"https://developer.api.autodesk.com/construction/admin/v1"
         f"/projects/{clean_id}/users?limit=100"
     )
 
-    all_users: List[Dict[str, Any]] = []
-    url: Optional[str] = base_url
+    all_users: ResultList = ResultList()
+    url: Optional[str] = endpoint
 
-    for _ in range(10):  # safety cap — 10 pages × 100 = 1 000 users max
+    _hit_cap = True
+    for _ in range(max_pages):
         resp = _make_request("GET", url)  # type: ignore[arg-type]
         data = resp.json()
 
         for raw in data.get("results", []):
-            company = raw.get("company") or {}
-            products_raw = raw.get("products") or []
-            roles_raw = raw.get("roles") or []
-            access_levels = raw.get("accessLevels") or []
+            display_name = _sanitize_user_name(raw)
 
-            # Build a clean display name.
-            # ACC sometimes appends autodeskId directly onto the name field
-            # (e.g. "Maxine Bruil0c1e0b3b-..."). Prefer the separate
-            # firstName/lastName fields; fall back to name; strip any
-            # embedded hex-ID substring from whatever we end up with.
-            _first = (raw.get("firstName") or "").strip()
-            _last = (raw.get("lastName") or "").strip()
-            _raw_name = (
-                f"{_first} {_last}".strip()
-                if (_first or _last)
-                else (raw.get("name") or "").strip()
-            )
-            # Pass 1 — strip standard 36-char UUIDs (8-4-4-4-12 with dashes)
-            display_name = re.sub(
-                r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}",
-                "",
-                _raw_name,
-            )
-            # Pass 2 — strip any remaining long hex-only run at end of string
-            # (catches non-standard IDs like "0c1e0b3b6b3a4" with no dashes)
-            display_name = re.sub(r"[a-fA-F0-9]{10,}$", "", display_name).strip() or "-"
-
-            all_users.append({
-                "name": display_name,
-                "email": (raw.get("email") or "").lower(),
-                "companyId": company.get("id", ""),
-                "companyName": company.get("name", "") or "-",
-                "roleIds": [r.get("id", "") for r in roles_raw],
-                "roleNames": [r.get("name", "") for r in roles_raw],
-                "products": [
-                    {"key": p.get("key", ""), "access": p.get("access", "")}
-                    for p in products_raw
-                ],
-                "accessLevels": access_levels,
-            })
+            if include_permissions:
+                company = raw.get("company") or {}
+                products_raw = raw.get("products") or []
+                roles_raw = raw.get("roles") or []
+                all_users.append({
+                    "name": display_name,
+                    "email": (raw.get("email") or "").lower(),
+                    "companyId": company.get("id", ""),
+                    "companyName": company.get("name", "") or "-",
+                    "roleIds": [r.get("id", "") for r in roles_raw],
+                    "roleNames": [r.get("name", "") for r in roles_raw],
+                    "products": [
+                        {"key": p.get("key", ""), "access": p.get("access", "")}
+                        for p in products_raw
+                    ],
+                    "accessLevels": raw.get("accessLevels") or [],
+                })
+            else:
+                raw["name"] = display_name
+                all_users.append(raw)
 
         next_url = data.get("pagination", {}).get("nextUrl")
         if next_url:
             url = next_url
         else:
+            _hit_cap = False
             break
 
-    logger.info(
-        f"[Permissions] Fetched {len(all_users)} users for project {clean_id} (live, uncached)"
-    )
+    if _hit_cap:
+        all_users.truncation_warning = (
+            f"⚠️ Results truncated: retrieved {len(all_users)} users across "
+            f"{max_pages} pages (safety limit). There may be more users in this project."
+        )
+        logger.warning(all_users.truncation_warning)
+
     return all_users
 
 
-def add_project_user(hub_id: str, project_id: str, email: str, products: Optional[list] = None) -> dict:
+def get_project_users(project_id: str, max_pages: int = _MAX_USER_PAGES) -> ResultList:
+    """List users in a project (requires Admin).
+
+    Thin wrapper around _paginate_project_users — returns simplified records
+    with sanitised names.
+    """
+    return _paginate_project_users(project_id, max_pages, include_permissions=False)
+
+
+def get_project_user_permissions(project_id: str) -> ResultList:
+    """Fetches all project members with full permission and role details.
+
+    NEVER cached — every call executes a live HTTP request to ACC to return
+    the absolute current truth.
+
+    Returns:
+        List of user dicts with keys: name, email, companyId, companyName,
+        roleIds, roleNames, products, accessLevels.
+    """
+    clean_id = _strip_b_prefix(project_id)
+    result = _paginate_project_users(project_id, _MAX_USER_PAGES, include_permissions=True)
+    logger.info(
+        f"[Permissions] Fetched {len(result)} users for project {clean_id} (live, uncached)"
+    )
+    return result
+
+
+def add_project_user(project_id: str, email: str, products: list[str] | None = None) -> dict[str, Any]:
     """
     Add a user to a project.
 
     Args:
-        hub_id: The Hub ID (needed to resolve admin User-Id).
         project_id: The project ID.
         email: User's email address.
         products: Product keys (e.g. ["docs"]). Defaults to ["docs"].
     """
-    account_id = _strip_b_prefix(hub_id)
     clean_project_id = _strip_b_prefix(project_id)
 
     if products is None:
         products = ["docs"]
 
-    user_id = _get_admin_user_id(account_id)
+    user_id = _get_admin_user_id()
 
     endpoint = f"https://developer.api.autodesk.com/construction/admin/v1/projects/{clean_project_id}/users"
     payload = {
@@ -787,7 +974,7 @@ def add_project_user(hub_id: str, project_id: str, email: str, products: Optiona
     return resp.json()
 
 
-def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
+def get_all_hub_users(hub_id: str, max_projects: int = _MAX_HUB_SCAN_PROJECTS) -> tuple[ResultList, list[str]]:
     """Aggregate users and their product entitlements across all projects in a hub.
 
     Scans up to *max_projects* projects, collects every user encountered, and
@@ -798,12 +985,33 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
           - users: List of dicts [{"email", "name", "products": [...]}]
           - skipped_projects: List of project names that failed (permission errors etc.)
     """
-    projects = get_projects(hub_id)[:max_projects]
+    all_hub_projects = get_projects(hub_id)
+    truncated_projects = len(all_hub_projects) > max_projects
+    projects = all_hub_projects[:max_projects]
     logger.info(f"[Hub Audit] Scanning {len(projects)} projects in hub {hub_id}")
 
-    user_map: Dict[str, Dict[str, Any]] = {}
+    user_map: dict[str, dict[str, Any]] = {}
 
-    skipped_projects: List[str] = []
+    skipped_projects: list[str] = []
+    warnings: list[str] = []
+
+    _proj_warn = getattr(all_hub_projects, "truncation_warning", "")
+
+    if truncated_projects:
+        # The scan cap was hit — this already implies the project list may also
+        # be truncated, so emit one combined message rather than two overlapping
+        # warnings.
+        w = (
+            f"⚠️ Results truncated: only scanned {max_projects} of "
+            f"{len(all_hub_projects)} projects in this hub. "
+            f"Some users may not be included."
+        )
+        logger.warning(w)
+        warnings.append(w)
+    elif _proj_warn:
+        # Project list hit the pagination cap but the scan cap was not reached —
+        # forward the warning from get_projects unchanged.
+        warnings.append(_proj_warn)
 
     for p in projects:
         pid = p.get("id", "")
@@ -832,16 +1040,20 @@ def get_all_hub_users(hub_id: str, max_projects: int = 20) -> tuple:
                 if key:
                     user_map[email]["products"].add(key)
 
-    result = []
+    result: ResultList = ResultList()
     for entry in user_map.values():
         entry["products"] = sorted(entry["products"])
         result.append(entry)
+    result.sort(key=lambda u: u["email"])
+
+    if warnings:
+        result.truncation_warning = "\n".join(warnings)
 
     logger.info(f"[Hub Audit] Found {len(result)} unique users across {len(projects)} projects")
-    return sorted(result, key=lambda u: u["email"]), skipped_projects
+    return result, skipped_projects
 
 
-def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
+def get_user_projects(account_id: str, user_name_or_email: str) -> dict:
     """
     Resolves a user by display name or email and returns every project they
     have access to within the account.
@@ -878,6 +1090,7 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
     query = user_name_or_email.strip()
 
     # --- Step 1: Resolve user → uid ----------------------------------------
+    _name_search_warning = ""
     if "@" in query:
         # Fast path: direct email search
         search_url = (
@@ -891,7 +1104,8 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
         target = query.lower()
         limit = 100
         offset = 0
-        for _ in range(20):  # safety cap: 2 000 users max
+        _hit_name_cap = True
+        for _ in range(_MAX_USER_SEARCH_PAGES):  # safety cap: 2 000 users max
             list_url = (
                 f"https://developer.api.autodesk.com/hq/v1/regions/eu"
                 f"/accounts/{clean_account_id}/users?limit={limit}&offset={offset}"
@@ -914,8 +1128,17 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
                 if name_match or email_match:
                     candidates.append(u)
             if len(page) < limit:
+                _hit_name_cap = False
                 break
             offset += limit
+
+        if _hit_name_cap:
+            _name_search_warning = (
+                f"⚠️ User search truncated: scanned {_MAX_USER_SEARCH_PAGES * limit:,} users "
+                f"({_MAX_USER_SEARCH_PAGES}-page safety limit). The matching user may exist beyond "
+                f"this range. Try searching by exact email instead."
+            )
+            logger.warning(_name_search_warning)
 
     if not candidates:
         raise ValueError(f"No ACC user found matching '{user_name_or_email}'")
@@ -942,42 +1165,71 @@ def get_user_projects(account_id: str, user_name_or_email: str) -> dict | str:
     # --- Step 2: Fetch projects assigned to this user -----------------------
     # Unified ACC construction/admin/v1 endpoint — supports both ACC and BIM 360.
     # Region is passed as a header instead of being embedded in the URL path.
-    proj_url = (
+    # Paginated with the same next_url pattern used by _paginate_project_users.
+    proj_base_url = (
         f"https://developer.api.autodesk.com/construction/admin/v1"
         f"/accounts/{clean_account_id}/users/{target_uid}/projects?limit=100"
     )
     try:
-        raw = _make_request(
-            "GET",
-            proj_url,
-            extra_headers={"Region": "EMEA"},
-        ).json()
-        # Unified endpoint returns projects inside a 'results' array.
-        raw_projects = raw.get("results", [])
+        projects: list[dict] = []
+        proj_url: Optional[str] = proj_base_url
+        _hit_proj_cap = True
 
-        projects = []
-        for p in raw_projects:
-            role = (
-                "Project Admin"
-                if p.get("access_level") == "project_admin"
-                else "Member"
+        for _ in range(_MAX_USER_PAGES):
+            raw = _make_request(
+                "GET",
+                proj_url,  # type: ignore[arg-type]
+                extra_headers={"Region": "EMEA"},
+            ).json()
+            # Unified endpoint returns projects inside a 'results' array.
+            for p in raw.get("results", []):
+                role = (
+                    "Project Admin"
+                    if p.get("access_level") == "project_admin"
+                    else "Member"
+                )
+                projects.append({"name": p.get("name", "—"), "role": role})
+
+            next_url = raw.get("pagination", {}).get("nextUrl")
+            if next_url:
+                proj_url = next_url
+            else:
+                _hit_proj_cap = False
+                break
+
+        _proj_truncation_warning = ""
+        if _hit_proj_cap:
+            _proj_truncation_warning = (
+                f"⚠️ Results truncated: retrieved {len(projects)} projects across "
+                f"{_MAX_USER_PAGES} pages (safety limit). There may be more project "
+                f"assignments. Try searching by exact email for a more specific result."
             )
-            projects.append({"name": p.get("name", "—"), "role": role})
+            logger.warning(_proj_truncation_warning)
 
         logger.info(
             f"[UserProjects] Found {len(projects)} projects for '{display_name}' (live, uncached)"
         )
-        return {"user_name": display_name, "user_email": email, "projects": projects}
+
+        warnings_out: list[str] = []
+        if _name_search_warning:
+            warnings_out.append(_name_search_warning)
+        if _proj_truncation_warning:
+            warnings_out.append(_proj_truncation_warning)
+
+        result_dict: dict = {"user_name": display_name, "user_email": email, "projects": projects}
+        if warnings_out:
+            result_dict["warning"] = "\n".join(warnings_out)
+        return result_dict
 
     except ValueError as api_err:
         logger.warning(
             f"[UserProjects] Could not fetch projects for id={target_uid}: {api_err}"
         )
-        return (
+        raise ValueError(
             f"User found (ID: {target_uid}), but Autodesk returned an error when "
             f"fetching their projects. They may not have any assigned projects, "
             f"or API access is restricted."
-        )
+        ) from api_err
 
 
 def create_folder(project_id: str, parent_folder_id: str, folder_name: str) -> dict:
@@ -1027,11 +1279,15 @@ def replicate_folders(
 ) -> str:
     """Recursively copies the folder structure from a source project to a destination project.
 
+    Source and destination projects may be in different hubs.  The caller
+    should pass the actual hub ID where the source project lives (obtained
+    from ``_resolve_project_id``).
+
     Only replicates folders (not files). Starts from the 'Project Files' root.
     Returns a short summary string (not the full folder list) to avoid content-filter issues.
 
     Args:
-        hub_id:             Hub ID (both projects must be in the same hub).
+        hub_id:             Hub ID of the source project.
         source_project_id:  Source project ID.
         dest_project_id:    Destination project ID.
         max_depth:          Maximum folder nesting depth (default 5).
@@ -1069,6 +1325,9 @@ def replicate_folders(
                 continue
 
             name = item.get("name", "Unnamed")
+            if _is_system_folder(name):
+                logger.debug("Skipping system folder during replication: %s", name)
+                continue
             full_path = f"{path}/{name}"
 
             try:
